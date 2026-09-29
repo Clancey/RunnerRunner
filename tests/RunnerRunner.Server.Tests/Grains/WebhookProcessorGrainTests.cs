@@ -547,6 +547,64 @@ public sealed class WebhookProcessorGrainTests
         Assert.Equal("in_progress", webhookEvent.Status);
     }
 
+    [Fact]
+    public async Task ProcessWebhook_GitHubInProgress_ResolvesTheQueuedEventTheTimeoutWatches()
+    {
+        // RunnerTimeoutService recycles a dynamic runner whose queued event isn't in_progress 10
+        // minutes after it started, so the in_progress webhook has to resolve it, even for a repo
+        // the backfill poll doesn't cover (this rule only names the org).
+        var id = OrleansTestIds.Create("github-progress-queued");
+        var secret = $"{id}-secret";
+        var jobId = NextJobId();
+        var rule = new ProvisioningRule
+        {
+            Id = $"{id}-rule",
+            Name = "org rule",
+            Type = ProvisioningType.Webhook,
+            Provider = RunnerProvider.GitHubActions,
+            WebhookSecret = secret,
+            AllowedOrgs = ["octo-org"]
+        };
+        await _store.Insert(rule);
+        var queued = new WebhookEvent
+        {
+            Id = $"{id}-queued-event",
+            Provider = nameof(RunnerProvider.GitHubActions),
+            Action = "queued",
+            JobId = jobId.ToString(),
+            Repository = "octo-org/octo-repo",
+            Status = "provisioned",
+            InstanceId = $"{id}-runner"
+        };
+        await _store.Insert(queued);
+        // The same job number in another repo is another job.
+        var otherRepo = new WebhookEvent
+        {
+            Id = $"{id}-other-repo-event",
+            Provider = nameof(RunnerProvider.GitHubActions),
+            Action = "queued",
+            JobId = jobId.ToString(),
+            Repository = "octo-org/other-repo",
+            Status = "provisioned"
+        };
+        await _store.Insert(otherRepo);
+
+        var body = BuildWorkflowJobPayload(
+            action: "in_progress",
+            jobId: jobId,
+            runId: jobId + 1,
+            repository: "octo-org/octo-repo",
+            labels: ["self-hosted", "macos"]);
+
+        var result = await Processor().ProcessWebhook("github", body, BodyBytes(body), SignGitHub(body, secret));
+
+        Assert.True(result.Success);
+        var resolved = await _store.Get<WebhookEvent>(queued.Id);
+        Assert.Equal("in_progress", resolved!.Status);
+        Assert.Equal($"{id}-runner", resolved.InstanceId);
+        Assert.Equal("provisioned", (await _store.Get<WebhookEvent>(otherRepo.Id))!.Status);
+    }
+
     private static string ComputeSignature(string body, string secret)
     {
         using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
