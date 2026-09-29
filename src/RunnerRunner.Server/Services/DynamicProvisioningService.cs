@@ -689,7 +689,13 @@ public class DynamicProvisioningService : BackgroundService
             var hosts = (await store.Query<Host>().ToList()).ToList();
             var instances = (await store.Query<RunnerInstance>().ToList()).ToList();
             var backendName = profile.ExecutionBackend.ToString().ToLowerInvariant();
-            var hostSelection = await SelectHostAsync(store, profile, rule, hosts, instances);
+            var hostSelection = await SelectHostAsync(
+                store,
+                profile,
+                rule,
+                hosts,
+                instances,
+                currentEvent.Labels);
 
             if (hostSelection.Host == null)
             {
@@ -726,7 +732,12 @@ public class DynamicProvisioningService : BackgroundService
                 now);
 
             var shortGuid = Guid.NewGuid().ToString("N")[..8];
-            var runnerName = $"{profile.Name}-jit-{shortGuid}";
+            // Profile names are free-text display strings (may contain spaces/symbols), but
+            // runnerName also becomes a Docker container name downstream, which only allows
+            // [a-zA-Z0-9][a-zA-Z0-9_.-]* — an unsanitized name there fails container creation
+            // instantly on every attempt, since profile names don't change between retries.
+            var runnerNamePrefix = RunnerMetadataBuilder.SanitizeRunnerNameComponent(profile.Name) ?? "runner";
+            var runnerName = $"{runnerNamePrefix}-jit-{shortGuid}";
 
             _logger.LogInformation(
                 "Selected HostWorker {HostName} for dynamic runner {RunnerName} (job {JobId}, recovery={Recovery})",
@@ -1067,12 +1078,14 @@ public class DynamicProvisioningService : BackgroundService
             return true;
         }
 
-        if (!string.IsNullOrWhiteSpace(linkedInstance.WebhookEventId)
-            && !string.Equals(linkedInstance.WebhookEventId, evt.Id, StringComparison.OrdinalIgnoreCase))
-        {
-            reason = "Provisioned runner record is linked to a different webhook event";
-            return true;
-        }
+        // Note: linkedInstance.WebhookEventId intentionally isn't compared against evt.Id here.
+        // TryBindExistingInstanceAsync binds duplicate "queued" events (webhook redelivery,
+        // GitHub poll backfill) to an already-provisioned instance without repointing
+        // WebhookEventId at the newer event, so a mismatch here doesn't mean the instance is
+        // stale — it's expected for every duplicate event bound to a shared instance. Treating
+        // it as staleness bounced those events back to "pending" on every recovery sweep,
+        // which re-entered the create-a-new-instance path whenever the shared instance
+        // transiently left the active-status set, producing multiple runner instances for one job.
 
         if (linkedInstance.Status is RunnerInstanceStatus.Stopped
             or RunnerInstanceStatus.Failed
@@ -1367,7 +1380,8 @@ public class DynamicProvisioningService : BackgroundService
         RunnerProfile profile,
         ProvisioningRule? rule,
         List<Host> hosts,
-        List<RunnerInstance> instances)
+        List<RunnerInstance> instances,
+        IReadOnlyCollection<string> requestedRunnerLabels)
     {
         var profilesById = (await store.Query<RunnerProfile>().ToList())
             .ToDictionary(p => p.Id, p => p, StringComparer.OrdinalIgnoreCase);
@@ -1379,7 +1393,8 @@ public class DynamicProvisioningService : BackgroundService
             hosts,
             profilesById,
             instances,
-            requireDispatchReadiness: true);
+            requireDispatchReadiness: true,
+            requestedRunnerLabels);
 
         if (analysis.SelectedHost != null)
             return new HostSelectionResult(analysis.SelectedHost, null, false);
