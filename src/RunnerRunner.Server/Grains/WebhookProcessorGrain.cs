@@ -238,6 +238,24 @@ public class WebhookProcessorGrain : Grain, IWebhookProcessorGrain
                 InstanceId = instanceId
             });
 
+            // The job's queued event is what RunnerTimeoutService watches: a dynamic runner whose
+            // event isn't in_progress 10 minutes after it started is recycled as "never picked up".
+            // Resolve it here, not only in the backfill poll, which covers just the repos a rule or
+            // credential lists: otherwise a job longer than 10 minutes on any other repo is killed.
+            var now = DateTime.UtcNow;
+            var queuedEvents = (await store.Query<WebhookEvent>().ToList())
+                .Where(e => e.Provider == providerName
+                    && e.JobId == jobId
+                    && e.Action == "queued"
+                    && !e.IsTerminal
+                    && string.Equals(e.Repository, repo, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            foreach (var queued in queuedEvents)
+            {
+                queued.MarkResolved("in_progress", now, instanceId ?? queued.InstanceId);
+                await store.Update(queued);
+            }
+
             _logger.LogInformation("Job {JobId} in progress, runner status updated via grain", jobId);
             return new WebhookProcessResult
             {
