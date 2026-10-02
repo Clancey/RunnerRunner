@@ -1163,6 +1163,10 @@ public class DynamicProvisioningService : BackgroundService
         // Expand $RR_* variable references
         ExpandVariableReferences(result);
 
+        // Declared after expansion so the recorded names map to the values the
+        // job actually receives.
+        Core.SecretEnvironment.Declare(result, selectedSets.SelectMany(s => s.SecretKeys));
+
         return result;
     }
 
