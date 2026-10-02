@@ -213,32 +213,59 @@ public class WebhookProcessorGrain : Grain, IWebhookProcessorGrain
         // Handle "in_progress"
         if (action == "in_progress")
         {
-            var instances = (await store.Query<RunnerInstance>().ToList())
-                .Where(i => i.ProvisioningMode == "dynamic" && i.JobId == jobId)
+            var allDynamic = (await store.Query<RunnerInstance>().ToList())
+                .Where(i => i.ProvisioningMode == "dynamic")
                 .ToList();
 
             // GitHub does not pin a JIT runner to the job it was minted for: any queued
-            // job whose labels match can claim it. When that happens the instance record
-            // still names the original job, so nothing here matches, the pickup-timeout
-            // reaper sees a runner that never started "its" job and recycles a machine
-            // that is mid-build, and completion cleanup later finds nothing to remove.
-            // Rebind the record to the job that actually landed.
-            if (instances.Count == 0 && !string.IsNullOrWhiteSpace(runnerName))
-            {
-                var adopted = (await store.Query<RunnerInstance>().ToList())
-                    .FirstOrDefault(i => i.ProvisioningMode == "dynamic"
-                        && string.Equals(i.RunnerName, runnerName, StringComparison.OrdinalIgnoreCase));
+            // job whose labels match can claim it. runner_name is the only authoritative
+            // statement of which runner is executing this job, so it must win over the
+            // provisioning-time binding -- not merely fill in when that binding is absent.
+            //
+            // When two jobs swap runners, both instances still exist and both still name
+            // their original job, so a presence check finds a match and keeps the wrong
+            // one. Completion of the first job then force-stops the runner that is
+            // mid-build on the second, which GitHub reports ten minutes later as
+            // "the self-hosted runner lost communication with the server".
+            var actual = string.IsNullOrWhiteSpace(runnerName)
+                ? null
+                : allDynamic.FirstOrDefault(i =>
+                    string.Equals(i.RunnerName, runnerName, StringComparison.OrdinalIgnoreCase));
 
-                if (adopted != null)
+            List<RunnerInstance> instances;
+            if (actual != null)
+            {
+                if (!string.Equals(actual.JobId, jobId, StringComparison.Ordinal))
                 {
                     _logger.LogWarning(
                         "Runner {RunnerName} was provisioned for job {ProvisionedJobId} but GitHub assigned it job {JobId}; rebinding the instance record",
-                        runnerName, adopted.JobId, jobId);
+                        runnerName, actual.JobId, jobId);
 
-                    adopted.JobId = jobId;
-                    await store.Update(adopted);
-                    instances.Add(adopted);
+                    actual.JobId = jobId;
+                    await store.Update(actual);
                 }
+
+                // Any other instance still claiming this job would be force-stopped by
+                // completion cleanup while it runs a different job. Release the claim;
+                // that instance is rebound by its own in_progress webhook.
+                foreach (var stale in allDynamic.Where(i =>
+                    i.Id != actual.Id && string.Equals(i.JobId, jobId, StringComparison.Ordinal)))
+                {
+                    _logger.LogWarning(
+                        "Instance {InstanceId} ({StaleRunner}) still claims job {JobId}, which is actually running on {RunnerName}; clearing the stale claim",
+                        stale.Id, stale.RunnerName, jobId, runnerName);
+
+                    stale.JobId = null;
+                    await store.Update(stale);
+                }
+
+                instances = new List<RunnerInstance> { actual };
+            }
+            else
+            {
+                instances = allDynamic
+                    .Where(i => string.Equals(i.JobId, jobId, StringComparison.Ordinal))
+                    .ToList();
             }
 
             string? instanceId = null;

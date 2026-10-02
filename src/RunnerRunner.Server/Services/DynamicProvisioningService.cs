@@ -1517,7 +1517,7 @@ public class DynamicProvisioningService : BackgroundService
         }
     }
 
-    private async void HandleJobCompleted(string jobId, string conclusion)
+    private async void HandleJobCompleted(string jobId, string conclusion, string runnerName)
     {
         try
         {
@@ -1538,7 +1538,7 @@ public class DynamicProvisioningService : BackgroundService
                 await store.Update(queuedEvent);
             }
 
-            await CleanupDynamicRunnersForJobAsync(store, jobId, $"Job completed ({conclusion})", removeRecords: true);
+            await CleanupDynamicRunnersForJobAsync(store, jobId, $"Job completed ({conclusion})", removeRecords: true, runnerName);
             TriggerQueueSweep();
         }
         catch (Exception ex)
@@ -1551,11 +1551,48 @@ public class DynamicProvisioningService : BackgroundService
         IDocumentStore store,
         string jobId,
         string reason,
-        bool removeRecords)
+        bool removeRecords,
+        string? completedRunnerName = null)
     {
-        var instances = (await store.Query<RunnerInstance>().ToList())
-            .Where(i => i.ProvisioningMode == "dynamic" && i.JobId == jobId)
+        var dynamicInstances = (await store.Query<RunnerInstance>().ToList())
+            .Where(i => i.ProvisioningMode == "dynamic")
             .ToList();
+
+        // A JIT runner is not pinned to the job it was minted for, so the instance whose
+        // JobId matches is frequently *not* the runner that ran this job -- it is an idle
+        // runner that may have just been handed a different job. Stopping it kills that
+        // job, which GitHub reports ten minutes later as "the self-hosted runner lost
+        // communication with the server". The completed webhook names the runner that
+        // actually executed this job, so prefer that over the provisioning-time binding.
+        List<RunnerInstance> instances;
+        if (!string.IsNullOrWhiteSpace(completedRunnerName))
+        {
+            instances = dynamicInstances
+                .Where(i => string.Equals(i.RunnerName, completedRunnerName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var mismatched = dynamicInstances
+                .Where(i => string.Equals(i.JobId, jobId, StringComparison.Ordinal)
+                    && !string.Equals(i.RunnerName, completedRunnerName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            foreach (var spared in mismatched)
+            {
+                _logger.LogWarning(
+                    "Not stopping runner {SparedRunner}: it was provisioned for job {JobId} but {ActualRunner} ran it, so {SparedRunner} may be executing another job",
+                    spared.RunnerName, jobId, completedRunnerName, spared.RunnerName);
+
+                // Release the claim so later sweeps do not treat it as this job's runner.
+                spared.JobId = null;
+                await store.Update(spared);
+            }
+        }
+        else
+        {
+            instances = dynamicInstances
+                .Where(i => string.Equals(i.JobId, jobId, StringComparison.Ordinal))
+                .ToList();
+        }
 
         if (!instances.Any())
         {
