@@ -74,6 +74,9 @@ public class WebhookProcessorGrain : Grain, IWebhookProcessorGrain
         var imageTagOverrideRejectedReason = magic.ImageTagOverrideRejectedReason;
         var workflowName = workflowJob.TryGetProperty("workflow_name", out var wn)
             ? wn.GetString() ?? "" : "";
+        var runnerName = workflowJob.TryGetProperty("runner_name", out var rnEl)
+            && rnEl.ValueKind == System.Text.Json.JsonValueKind.String
+            ? rnEl.GetString() ?? "" : "";
         var repo = json.GetProperty("repository").GetProperty("full_name").GetString() ?? "";
         var githubInstallationId = ExtractGitHubInstallationId(provider, json);
 
@@ -213,6 +216,30 @@ public class WebhookProcessorGrain : Grain, IWebhookProcessorGrain
             var instances = (await store.Query<RunnerInstance>().ToList())
                 .Where(i => i.ProvisioningMode == "dynamic" && i.JobId == jobId)
                 .ToList();
+
+            // GitHub does not pin a JIT runner to the job it was minted for: any queued
+            // job whose labels match can claim it. When that happens the instance record
+            // still names the original job, so nothing here matches, the pickup-timeout
+            // reaper sees a runner that never started "its" job and recycles a machine
+            // that is mid-build, and completion cleanup later finds nothing to remove.
+            // Rebind the record to the job that actually landed.
+            if (instances.Count == 0 && !string.IsNullOrWhiteSpace(runnerName))
+            {
+                var adopted = (await store.Query<RunnerInstance>().ToList())
+                    .FirstOrDefault(i => i.ProvisioningMode == "dynamic"
+                        && string.Equals(i.RunnerName, runnerName, StringComparison.OrdinalIgnoreCase));
+
+                if (adopted != null)
+                {
+                    _logger.LogWarning(
+                        "Runner {RunnerName} was provisioned for job {ProvisionedJobId} but GitHub assigned it job {JobId}; rebinding the instance record",
+                        runnerName, adopted.JobId, jobId);
+
+                    adopted.JobId = jobId;
+                    await store.Update(adopted);
+                    instances.Add(adopted);
+                }
+            }
 
             string? instanceId = null;
             foreach (var inst in instances)

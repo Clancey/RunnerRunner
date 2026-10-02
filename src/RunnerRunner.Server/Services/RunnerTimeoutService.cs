@@ -15,7 +15,7 @@ public class RunnerTimeoutService : BackgroundService
     private static readonly TimeSpan PendingTimeout = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan StartingTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan DynamicPickupTimeout = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan DynamicRunningTimeout = TimeSpan.FromHours(2);
+    private static readonly TimeSpan DefaultDynamicRunningTimeout = TimeSpan.FromHours(6);
     private static readonly TimeSpan StoppingTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan HealthCheckStaleTimeout = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan DynamicTerminalRetention = TimeSpan.FromMinutes(10);
@@ -37,14 +37,30 @@ public class RunnerTimeoutService : BackgroundService
     private readonly IServiceProvider _services;
     private readonly IHostCommandDispatcher _hostCommands;
 
+    /// <summary>
+    /// Backstop for dynamic runners whose completion webhook was lost. It must stay above
+    /// the longest job the pool can legitimately run: a runner that trips this is killed
+    /// and its workspace deleted, so a value below a real job's timeout destroys healthy
+    /// builds mid-step and reports it as a build failure. Crashed runners are caught far
+    /// sooner by <see cref="HealthCheckStaleTimeout"/>, so this only needs to be generous.
+    /// </summary>
+    private readonly TimeSpan _dynamicRunningTimeout;
+
     public RunnerTimeoutService(
         ILogger<RunnerTimeoutService> logger,
         IServiceProvider services,
-        IHostCommandDispatcher hostCommands)
+        IHostCommandDispatcher hostCommands,
+        IConfiguration configuration)
     {
         _logger = logger;
         _services = services;
         _hostCommands = hostCommands;
+
+        var configuredMinutes = configuration.GetValue(
+            "DynamicProvisioning:RunningTimeoutMinutes",
+            (int)DefaultDynamicRunningTimeout.TotalMinutes);
+
+        _dynamicRunningTimeout = TimeSpan.FromMinutes(Math.Max(1, configuredMinutes));
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -190,6 +206,18 @@ public class RunnerTimeoutService : BackgroundService
                 && now - instance.StartedAt.Value > DynamicPickupTimeout
                 && !string.Equals(eventStatus, "in_progress", StringComparison.OrdinalIgnoreCase))
             {
+                // The linked event describes the job this runner was minted for, which is
+                // not necessarily the job GitHub gave it. If the instance has since been
+                // rebound to a different job, the runner is busy building and must not be
+                // recycled -- the linked event gets re-provisioned onto a new runner instead.
+                if (WasAdoptedByAnotherJob(instance, linkedEvent))
+                {
+                    _logger.LogInformation(
+                        "Dynamic runner {RunnerName} ({Id}) did not pick up job {EventJobId} because GitHub assigned it job {JobId}; leaving it running",
+                        instance.RunnerName, instance.Id, linkedEvent?.JobId, instance.JobId);
+                    return;
+                }
+
                 _logger.LogWarning(
                     "Dynamic runner {RunnerName} ({Id}) never picked up its queued job after {Elapsed}; recycling it",
                     instance.RunnerName, instance.Id, now - instance.StartedAt.Value);
@@ -212,7 +240,7 @@ public class RunnerTimeoutService : BackgroundService
         // Dynamic runner running too long without completion webhook
         if (instance.ProvisioningMode == "dynamic"
             && instance.StartedAt != null
-            && now - instance.StartedAt.Value > DynamicRunningTimeout)
+            && now - instance.StartedAt.Value > _dynamicRunningTimeout)
         {
             _logger.LogWarning(
                 "Dynamic runner {RunnerName} ({Id}) timed out after {Elapsed} with no completion webhook",
@@ -320,6 +348,24 @@ public class RunnerTimeoutService : BackgroundService
             "Re-queued webhook event {EventId} after runner failure for instance {InstanceId}",
             linkedEvent!.Id,
             instance.Id);
+    }
+
+    /// <summary>
+    /// True when GitHub handed this runner a different job than the one it was
+    /// provisioned for. JIT runners are not pinned to a job, so any queued job whose
+    /// labels match can claim one. Such a runner is actively building and must never be
+    /// recycled by the pickup timeout, even though "its" job never started.
+    /// </summary>
+    internal static bool WasAdoptedByAnotherJob(RunnerInstance instance, WebhookEvent? linkedEvent)
+    {
+        if (linkedEvent == null
+            || string.IsNullOrWhiteSpace(instance.JobId)
+            || string.IsNullOrWhiteSpace(linkedEvent.JobId))
+        {
+            return false;
+        }
+
+        return !string.Equals(instance.JobId, linkedEvent.JobId, StringComparison.OrdinalIgnoreCase);
     }
 
     internal static bool PrepareLinkedEventRetry(WebhookEvent? linkedEvent, DateTime now, string reason)

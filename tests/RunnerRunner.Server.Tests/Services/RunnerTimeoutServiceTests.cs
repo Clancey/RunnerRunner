@@ -1,4 +1,5 @@
 using System.Reflection;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using RunnerRunner.Core.Hub;
@@ -140,7 +141,8 @@ public class RunnerTimeoutServiceTests
         var service = new RunnerTimeoutService(
             NullLogger<RunnerTimeoutService>.Instance,
             services,
-            hostCommands);
+            hostCommands,
+            new ConfigurationBuilder().Build());
 
         await InvokeScanForTimeoutsAsync(service);
 
@@ -201,5 +203,43 @@ public class RunnerTimeoutServiceTests
 
         Assert.NotNull(method);
         return (bool)method!.Invoke(null, [evt, now])!;
+    }
+
+    // Regression: run 35545917495. Runner Macos-jit-6d85e2e1 was minted for the iOS job
+    // 106183357904, but GitHub handed it to build 106183357880. Because the linked iOS
+    // event never reached "in_progress", the pickup timeout recycled the runner 10 minutes
+    // in -- killing a build mid-step and deleting its workspace.
+    [Fact]
+    public void WasAdoptedByAnotherJob_TrueWhenGitHubAssignedADifferentJob()
+    {
+        var instance = new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-6d85e2e1", JobId = "106183357880" };
+        var linkedEvent = new WebhookEvent { Id = "evt-1", JobId = "106183357904", Status = "provisioned" };
+
+        Assert.True(RunnerTimeoutService.WasAdoptedByAnotherJob(instance, linkedEvent));
+    }
+
+    [Fact]
+    public void WasAdoptedByAnotherJob_FalseWhenRunnerHoldsItsOwnJob()
+    {
+        var instance = new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-6d85e2e1", JobId = "106183357904" };
+        var linkedEvent = new WebhookEvent { Id = "evt-1", JobId = "106183357904", Status = "provisioned" };
+
+        Assert.False(RunnerTimeoutService.WasAdoptedByAnotherJob(instance, linkedEvent));
+    }
+
+    [Fact]
+    public void WasAdoptedByAnotherJob_FalseWhenNothingToCompare()
+    {
+        var instance = new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-6d85e2e1", JobId = "106183357904" };
+
+        // A genuinely idle runner must still be recyclable, otherwise a runner that really
+        // did fail to start would be held forever.
+        Assert.False(RunnerTimeoutService.WasAdoptedByAnotherJob(instance, null));
+        Assert.False(RunnerTimeoutService.WasAdoptedByAnotherJob(
+            new RunnerInstance { Id = "inst-2", RunnerName = "Macos-jit-idle", JobId = "" },
+            new WebhookEvent { Id = "evt-2", JobId = "106183357904" }));
+        Assert.False(RunnerTimeoutService.WasAdoptedByAnotherJob(
+            instance,
+            new WebhookEvent { Id = "evt-3", JobId = "" }));
     }
 }
