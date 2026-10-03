@@ -242,7 +242,10 @@ public class WebhookProcessorGrain : Grain, IWebhookProcessorGrain
                         runnerName, actual.JobId, jobId);
 
                     actual.JobId = jobId;
+                    actual.ClaimReleasedAt = null;
                     await store.Update(actual);
+                    await GrainFactory.GetGrain<IRunnerInstanceGrain>(actual.Id)
+                        .SetJobClaim(jobId, $"provider assigned job {jobId} to {runnerName}");
                 }
 
                 // Any other instance still claiming this job would be force-stopped by
@@ -256,7 +259,10 @@ public class WebhookProcessorGrain : Grain, IWebhookProcessorGrain
                         stale.Id, stale.RunnerName, jobId, runnerName);
 
                     stale.JobId = null;
+                    stale.ClaimReleasedAt = DateTime.UtcNow;
                     await store.Update(stale);
+                    await GrainFactory.GetGrain<IRunnerInstanceGrain>(stale.Id)
+                        .SetJobClaim(null, $"job {jobId} is running on {runnerName}");
                 }
 
                 instances = new List<RunnerInstance> { actual };
@@ -288,6 +294,7 @@ public class WebhookProcessorGrain : Grain, IWebhookProcessorGrain
                 WorkflowName = workflowName,
                 Labels = labels,
                 Status = "in_progress",
+                AssignedRunnerName = string.IsNullOrWhiteSpace(runnerName) ? null : runnerName,
                 MatchedProfileId = instances.FirstOrDefault()?.ProfileId,
                 InstanceId = instanceId
             });
@@ -306,6 +313,11 @@ public class WebhookProcessorGrain : Grain, IWebhookProcessorGrain
                 .ToList();
             foreach (var queued in queuedEvents)
             {
+                // Stamp the runner the provider actually chose. RunnerTimeoutService uses
+                // this queued event to decide whether a runner may be stopped, and the
+                // provisioning-time job claim is not trustworthy evidence of that.
+                if (!string.IsNullOrWhiteSpace(runnerName))
+                    queued.AssignedRunnerName = runnerName;
                 queued.MarkResolved("in_progress", now, instanceId ?? queued.InstanceId);
                 await store.Update(queued);
             }

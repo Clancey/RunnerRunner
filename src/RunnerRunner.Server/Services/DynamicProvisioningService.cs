@@ -219,6 +219,13 @@ public class DynamicProvisioningService : BackgroundService
                     ? conclusionProp.GetString()
                     : null;
 
+                // The provider names the runner it actually assigned. Without this the
+                // completion path falls back to matching on the provisioning-time job
+                // claim, which can stop a runner that is building something else.
+                var jobRunnerName = job.TryGetProperty("runner_name", out var runnerNameProp)
+                    ? runnerNameProp.GetString()
+                    : null;
+
                 var existingEventsForJob = (await store.Query<WebhookEvent>().ToList())
                     .Where(e => e.Provider == RunnerProvider.GitHubActions.ToString()
                         && e.Repository.Equals(repo, StringComparison.OrdinalIgnoreCase)
@@ -230,6 +237,8 @@ public class DynamicProvisioningService : BackgroundService
                     var now = DateTime.UtcNow;
                     foreach (var existingEvent in existingEventsForJob.Where(e => e.Action == "queued" && e.Status != "in_progress"))
                     {
+                        if (!string.IsNullOrWhiteSpace(jobRunnerName))
+                            existingEvent.AssignedRunnerName = jobRunnerName;
                         existingEvent.MarkResolved("in_progress", now, existingEvent.InstanceId);
                         await store.Update(existingEvent);
                     }
@@ -242,6 +251,8 @@ public class DynamicProvisioningService : BackgroundService
                     var now = DateTime.UtcNow;
                     foreach (var existingEvent in existingEventsForJob.Where(e => e.Action == "queued" && e.Status != "completed"))
                     {
+                        if (!string.IsNullOrWhiteSpace(jobRunnerName))
+                            existingEvent.AssignedRunnerName = jobRunnerName;
                         existingEvent.MarkResolved("completed", now, existingEvent.InstanceId);
                         await store.Update(existingEvent);
                     }
@@ -250,7 +261,8 @@ public class DynamicProvisioningService : BackgroundService
                         store,
                         jobId,
                         $"Job completed ({jobConclusion ?? "unknown"})",
-                        removeRecords: true);
+                        removeRecords: true,
+                        completedRunnerName: jobRunnerName);
 
                     continue;
                 }
@@ -1584,7 +1596,10 @@ public class DynamicProvisioningService : BackgroundService
 
                 // Release the claim so later sweeps do not treat it as this job's runner.
                 spared.JobId = null;
+                spared.ClaimReleasedAt = DateTime.UtcNow;
                 await store.Update(spared);
+                await _grainFactory.GetGrain<IRunnerInstanceGrain>(spared.Id)
+                    .SetJobClaim(null, $"job {jobId} completed on {completedRunnerName}");
             }
         }
         else

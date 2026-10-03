@@ -84,6 +84,12 @@ public class RunnerInstanceGrainState
 
     [Id(22)] public string? ImageTagOverride { get; set; }
     [Id(23)] public string? RunnerDefinitionId { get; set; }
+
+    /// <summary>
+    /// Set when this instance's job claim was released because the provider assigned that
+    /// job to a different runner. See <see cref="RunnerInstance.ClaimReleasedAt"/>.
+    /// </summary>
+    [Id(24)] public DateTime? ClaimReleasedAt { get; set; }
 }
 
 [GenerateSerializer]

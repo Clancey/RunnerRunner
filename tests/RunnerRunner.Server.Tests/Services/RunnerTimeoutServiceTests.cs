@@ -210,36 +210,84 @@ public class RunnerTimeoutServiceTests
     // event never reached "in_progress", the pickup timeout recycled the runner 10 minutes
     // in -- killing a build mid-step and deleting its workspace.
     [Fact]
-    public void WasAdoptedByAnotherJob_TrueWhenGitHubAssignedADifferentJob()
+    public void ClassifyLinkedJob_DifferentWhenGitHubAssignedAnotherJob()
     {
-        var instance = new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-6d85e2e1", JobId = "106183357880" };
+        var instance = new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-6d85e2e1", JobId = "106183357888" };
         var linkedEvent = new WebhookEvent { Id = "evt-1", JobId = "106183357904", Status = "provisioned" };
 
-        Assert.True(RunnerTimeoutService.WasAdoptedByAnotherJob(instance, linkedEvent));
+        Assert.Equal(
+            RunnerTimeoutService.LinkedJobBinding.Different,
+            RunnerTimeoutService.ClassifyLinkedJob(instance, linkedEvent));
     }
 
     [Fact]
-    public void WasAdoptedByAnotherJob_FalseWhenRunnerHoldsItsOwnJob()
+    public void ClassifyLinkedJob_SameWhenRunnerStillHoldsThatClaim()
     {
         var instance = new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-6d85e2e1", JobId = "106183357904" };
         var linkedEvent = new WebhookEvent { Id = "evt-1", JobId = "106183357904", Status = "provisioned" };
 
-        Assert.False(RunnerTimeoutService.WasAdoptedByAnotherJob(instance, linkedEvent));
+        Assert.Equal(
+            RunnerTimeoutService.LinkedJobBinding.Same,
+            RunnerTimeoutService.ClassifyLinkedJob(instance, linkedEvent));
     }
 
     [Fact]
-    public void WasAdoptedByAnotherJob_FalseWhenNothingToCompare()
+    public void ClassifyLinkedJob_UnknownWhenThereIsNothingToCompare()
     {
-        var instance = new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-6d85e2e1", JobId = "106183357904" };
+        // A released claim must classify as Unknown, never as "idle". Observed in
+        // production: the webhook processor cleared Macos-jit-dbd36386's stale claim after
+        // GitHub gave job 110937915464 to a different runner, the completion path correctly
+        // declined to stop it, and the event-resolved reaper then stopped it anyway seven
+        // seconds later because a null JobId could not prove adoption. Absence of a claim is
+        // not evidence that the runner is doing nothing.
+        var linkedEvent = new WebhookEvent { Id = "evt-1", JobId = "110937915464", Status = "completed" };
 
-        // A genuinely idle runner must still be recyclable, otherwise a runner that really
-        // did fail to start would be held forever.
-        Assert.False(RunnerTimeoutService.WasAdoptedByAnotherJob(instance, null));
-        Assert.False(RunnerTimeoutService.WasAdoptedByAnotherJob(
-            new RunnerInstance { Id = "inst-2", RunnerName = "Macos-jit-idle", JobId = "" },
-            new WebhookEvent { Id = "evt-2", JobId = "106183357904" }));
-        Assert.False(RunnerTimeoutService.WasAdoptedByAnotherJob(
-            instance,
-            new WebhookEvent { Id = "evt-3", JobId = "" }));
+        Assert.Equal(
+            RunnerTimeoutService.LinkedJobBinding.Unknown,
+            RunnerTimeoutService.ClassifyLinkedJob(
+                new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-dbd36386", JobId = null },
+                linkedEvent));
+        Assert.Equal(
+            RunnerTimeoutService.LinkedJobBinding.Unknown,
+            RunnerTimeoutService.ClassifyLinkedJob(
+                new RunnerInstance { Id = "inst-2", RunnerName = "Macos-jit-dbd36386", JobId = "" },
+                linkedEvent));
+        Assert.Equal(
+            RunnerTimeoutService.LinkedJobBinding.Unknown,
+            RunnerTimeoutService.ClassifyLinkedJob(
+                new RunnerInstance { Id = "inst-3", RunnerName = "Macos-jit-dbd36386", JobId = "110937915464" },
+                null));
+        Assert.Equal(
+            RunnerTimeoutService.LinkedJobBinding.Unknown,
+            RunnerTimeoutService.ClassifyLinkedJob(
+                new RunnerInstance { Id = "inst-4", RunnerName = "Macos-jit-dbd36386", JobId = "110937915464" },
+                new WebhookEvent { Id = "evt-2", JobId = "" }));
+    }
+
+    [Fact]
+    public void ClassifyLinkedJob_PrefersTheRunnerTheProviderActuallyAssigned()
+    {
+        // The stale claim still names this job because the runner's own in_progress
+        // webhook has not arrived yet. Comparing job IDs alone would say "Same" and stop a
+        // runner that is mid-build; the assigned runner name settles it.
+        var linkedEvent = new WebhookEvent
+        {
+            Id = "evt-1",
+            JobId = "110937915464",
+            Status = "completed",
+            AssignedRunnerName = "Macos-jit-7e8b7047"
+        };
+
+        Assert.Equal(
+            RunnerTimeoutService.LinkedJobBinding.Different,
+            RunnerTimeoutService.ClassifyLinkedJob(
+                new RunnerInstance { Id = "inst-1", RunnerName = "Macos-jit-dbd36386", JobId = "110937915464" },
+                linkedEvent));
+
+        Assert.Equal(
+            RunnerTimeoutService.LinkedJobBinding.Same,
+            RunnerTimeoutService.ClassifyLinkedJob(
+                new RunnerInstance { Id = "inst-2", RunnerName = "macos-jit-7E8B7047", JobId = null },
+                linkedEvent));
     }
 }
