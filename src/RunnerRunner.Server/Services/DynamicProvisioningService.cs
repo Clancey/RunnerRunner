@@ -50,6 +50,7 @@ public class DynamicProvisioningService : BackgroundService
     private readonly TimeSpan _retrySweepInterval;
     private readonly TimeSpan _pendingTimeout;
     private readonly TimeSpan _githubPollInterval;
+    private readonly double _minimumFreeDiskGb;
     private DateTime _lastGitHubPollAt = DateTime.MinValue;
 
     public DynamicProvisioningService(
@@ -75,6 +76,7 @@ public class DynamicProvisioningService : BackgroundService
         _retrySweepInterval = TimeSpan.FromSeconds(Math.Max(5, _configuration.GetValue("DynamicProvisioning:PendingRetrySeconds", 15)));
         _pendingTimeout = TimeSpan.FromMinutes(Math.Max(1, _configuration.GetValue("DynamicProvisioning:PendingTimeoutMinutes", 10)));
         _githubPollInterval = TimeSpan.FromSeconds(Math.Max(30, _configuration.GetValue("DynamicProvisioning:GitHubPollSeconds", 180)));
+        _minimumFreeDiskGb = CapacityPlanningService.ResolveMinimumFreeDiskGb(_configuration);
     }
 
     public override Task StartAsync(CancellationToken cancellationToken)
@@ -707,7 +709,8 @@ public class DynamicProvisioningService : BackgroundService
                 rule,
                 hosts,
                 instances,
-                currentEvent.Labels);
+                currentEvent.Labels,
+                _minimumFreeDiskGb);
 
             if (hostSelection.Host == null)
             {
@@ -1397,7 +1400,8 @@ public class DynamicProvisioningService : BackgroundService
         ProvisioningRule? rule,
         List<Host> hosts,
         List<RunnerInstance> instances,
-        IReadOnlyCollection<string> requestedRunnerLabels)
+        IReadOnlyCollection<string> requestedRunnerLabels,
+        double minimumFreeDiskGb)
     {
         var profilesById = (await store.Query<RunnerProfile>().ToList())
             .ToDictionary(p => p.Id, p => p, StringComparer.OrdinalIgnoreCase);
@@ -1410,7 +1414,8 @@ public class DynamicProvisioningService : BackgroundService
             profilesById,
             instances,
             requireDispatchReadiness: true,
-            requestedRunnerLabels);
+            requestedRunnerLabels,
+            minimumFreeDiskGb);
 
         if (analysis.SelectedHost != null)
             return new HostSelectionResult(analysis.SelectedHost, null, false);

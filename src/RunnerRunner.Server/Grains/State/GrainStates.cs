@@ -36,6 +36,9 @@ public class HostGrainState
     [Id(18)] public int? ObservedRunningTartVMs { get; set; }
     [Id(19)] public DateTime? ObservedResourceUsageAt { get; set; }
     [Id(20)] public bool IsDraining { get; set; }
+    [Id(21)] public long? ObservedFreeDiskBytes { get; set; }
+    [Id(22)] public long? ObservedTotalDiskBytes { get; set; }
+    [Id(23)] public DateTime? ObservedDiskUsageAt { get; set; }
 }
 
 [GenerateSerializer]

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Orleans.Runtime;
@@ -380,7 +381,14 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
         ProvisioningRuleRunnerResolver.AddMaterializedRunnerProfiles(profilesById, [ruleModel]);
         profilesById[profile.Id] = profile;
 
-        var analysis = CapacityPlanningService.AnalyzeHostSelection(profile, ruleModel, hosts, profilesById, instances);
+        var analysis = CapacityPlanningService.AnalyzeHostSelection(
+            profile,
+            ruleModel,
+            hosts,
+            profilesById,
+            instances,
+            minimumFreeDiskGb: CapacityPlanningService.ResolveMinimumFreeDiskGb(
+                _serviceProvider.GetService<IConfiguration>()));
         var backendName = profile.ExecutionBackend.ToString().ToLowerInvariant();
         var host = analysis.Candidates
             .Where(candidate => candidate.CanRunNow)
