@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using RunnerRunner.HostWorker.Services;
 
 namespace RunnerRunner.HostWorker.Tests.Services;
@@ -107,5 +108,30 @@ public class HostMaintenanceServiceTests : IDisposable
         var cutoff = DateTime.UtcNow.AddDays(-7);
 
         Assert.True(HostMaintenanceService.EffectiveLastWriteUtc(new FileInfo(file), cutoff, 4) < cutoff);
+    }
+
+    [Fact]
+    public void CacheRoots_BindFromNumberedEnvironmentVariableKeys()
+    {
+        // M4ini is Clancey's daily driver and overrides the cache roots through its LaunchAgent
+        // plist so its signed Xcode Archives survive. If numbered env keys did not bind, the
+        // override would silently fall back to the defaults and delete those archives.
+        var environment = new Dictionary<string, string?>
+        {
+            ["HostWorker__Maintenance__CacheRoots__0"] = "/Users/clancey/Library/Developer/Xcode/DerivedData",
+            ["HostWorker__Maintenance__CacheRoots__1"] = "/Users/clancey/Library/Caches/godot"
+        };
+
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(environment.ToDictionary(
+                kv => kv.Key.Replace("__", ":"),
+                kv => kv.Value))
+            .Build();
+
+        var roots = configuration.GetSection("HostWorker:Maintenance:CacheRoots").Get<string[]>();
+
+        Assert.NotNull(roots);
+        Assert.Equal(2, roots!.Length);
+        Assert.DoesNotContain(roots, r => r.Contains("Archives", StringComparison.OrdinalIgnoreCase));
     }
 }
