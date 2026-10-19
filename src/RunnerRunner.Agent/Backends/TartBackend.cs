@@ -224,7 +224,7 @@ public class TartBackend : IRunnerBackend
         return null;
     }
 
-    private async Task SetupRunnerViaSsh(
+    internal async Task SetupRunnerViaSsh(
         string vmName, string vmIp, string sshUser, string? sshPassword,
         RunnerStartRequest request, CancellationToken ct)
     {
@@ -412,7 +412,8 @@ public class TartBackend : IRunnerBackend
         "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" +
         (passwordAuthentication ? " -o BatchMode=no -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no" : "");
 
-    private Task SshExec(
+    // Virtual so tests can run guest scripts in a sandbox through the real transport.
+    internal virtual Task SshExec(
         string sshUser, string vmIp, string? sshPassword, string script, CancellationToken ct,
         TimeSpan? timeout = null)
     {
