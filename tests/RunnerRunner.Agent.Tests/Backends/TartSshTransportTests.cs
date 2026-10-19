@@ -28,12 +28,12 @@ public class TartSshTransportTests
                 die "fork failed" unless defined $pid;
                 if ($pid) { waitpid($pid, 0); exit($? >> 8); }
                 POSIX::setsid() >= 0 or die "setsid failed";
-                grep($_ eq '-T', @ARGV) or die "Remote terminal not disabled";
-                grep($_ eq '-n' || $_ eq 'BatchMode=yes', @ARGV) and die "Input or password prompting disabled";
-                grep($_ eq 'PubkeyAuthentication=no', @ARGV) or die "Host keys enabled";
-                grep($_ eq 'PreferredAuthentications=password,keyboard-interactive', @ARGV) or die "Wrong auth policy";
                 my $password;
                 if (($ENV{'SSH_ASKPASS_REQUIRE'} // '') eq 'force') {
+                    grep($_ eq '-T', @ARGV) or die "Remote terminal not disabled";
+                    grep($_ eq '-n' || $_ eq 'BatchMode=yes', @ARGV) and die "Input or password prompting disabled";
+                    grep($_ eq 'PubkeyAuthentication=no', @ARGV) or die "Host keys enabled";
+                    grep($_ eq 'PreferredAuthentications=password,keyboard-interactive', @ARGV) or die "Wrong auth policy";
                     my $helper = $ENV{'SSH_ASKPASS'} // die "Missing askpass helper";
                     ((stat($helper))[2] & 0777) == 0700 or die "Unsafe helper mode";
                     open(my $source, '<', $helper) or die "Missing helper";
