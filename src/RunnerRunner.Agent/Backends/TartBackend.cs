@@ -250,7 +250,8 @@ public class TartBackend : IRunnerBackend
         {
             var preFragment = InitStepShellBuilder.BuildLinuxFragment(preSteps, "PreRunner");
             _logger.LogInformation("Running {Count} pre-runner init step(s) in Tart VM {VM}", preSteps.Count, vmName);
-            await SshExec(sshUser, vmIp, sshPassword, "set +e; " + preFragment + " exit 0", ct);
+            await SshExec(sshUser, vmIp, sshPassword, "set +e; " + preFragment + " exit 0", ct,
+                TimeSpan.FromMinutes(15) + TimeSpan.FromSeconds(preSteps.Sum(s => (long)Math.Max(1, s.TimeoutSeconds))));
         }
 
         // Export env vars into the SSH session
@@ -380,7 +381,7 @@ public class TartBackend : IRunnerBackend
         var postSteps = request.InitSteps.Where(s => s.Phase == Core.Models.InitStepPhase.PostExit).ToList();
         if (postSteps.Count == 0)
         {
-            var runScript = $"{preamble} && nohup {runnerCmd} > /tmp/runner.log 2>&1 &";
+            var runScript = BuildDetachedRunnerScript(preamble, runnerCmd);
             await SshExec(sshUser, vmIp, sshPassword, runScript, ct);
             return;
         }
@@ -404,20 +405,72 @@ public class TartBackend : IRunnerBackend
         await SshExec(sshUser, vmIp, sshPassword, launchWrapper, ct);
     }
 
-    private async Task SshExec(string sshUser, string vmIp, string? sshPassword, string script, CancellationToken ct)
+    internal static string BuildDetachedRunnerScript(string preamble, string runnerCmd) =>
+        $"{preamble} && {{ nohup {runnerCmd} </dev/null > /tmp/runner.log 2>&1 & }}";
+
+    internal static string BuildSshOptions(bool passwordAuthentication) =>
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" +
+        (passwordAuthentication ? " -o BatchMode=no -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no" : "");
+
+    private Task SshExec(
+        string sshUser, string vmIp, string? sshPassword, string script, CancellationToken ct,
+        TimeSpan? timeout = null)
     {
-        _logger.LogDebug("SSH exec on {User}@{Ip}: {Script}",
-            sshUser, vmIp, script.Length > 200 ? script[..200] + "..." : script);
+        _logger.LogDebug("SSH exec on {User}@{Ip}", sshUser, vmIp);
 
-        var sshOpts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15";
-        ProcessStartInfo psi;
+        return ExecuteSshAsync(sshUser, vmIp, sshPassword, script, ct,
+            timeout ?? TimeSpan.FromMinutes(15), logger: _logger);
+    }
 
-        if (!string.IsNullOrEmpty(sshPassword))
+    internal static async Task ExecuteSshAsync(
+        string sshUser, string vmIp, string? sshPassword, string script, CancellationToken ct,
+        TimeSpan timeout, string sshExecutable = "/usr/bin/ssh", ILogger? logger = null)
+    {
+        logger ??= Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+        string? helper = null;
+        try
         {
-            var sshpassPath = ResolveToolPath("sshpass", "/opt/homebrew/bin/sshpass", "/usr/local/bin/sshpass");
-            if (!string.IsNullOrWhiteSpace(sshpassPath))
+            var passwordAuthentication = !string.IsNullOrEmpty(sshPassword);
+            ProcessStartInfo psi;
+            if (passwordAuthentication)
             {
-                var fullCommand = $"{sshpassPath} -p '{EscapeShell(sshPassword)}' ssh {sshOpts} {sshUser}@{vmIp} bash -s";
+                if (OperatingSystem.IsWindows())
+                    throw new PlatformNotSupportedException("Tart password authentication requires a Unix host");
+
+                helper = Path.Combine(Path.GetTempPath(), $"rr-ssh-askpass-{Guid.NewGuid():N}");
+                await using (var file = new FileStream(helper, new FileStreamOptions
+                {
+                    Mode = FileMode.CreateNew,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                }))
+                {
+                    await file.WriteAsync("#!/bin/sh\nprintf '%s\\n' \"$RR_SSH_PASSWORD\"\n"u8.ToArray(), ct);
+                }
+
+                psi = new ProcessStartInfo
+                {
+                    FileName = sshExecutable,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    RedirectStandardInput = true
+                };
+                foreach (var option in BuildSshOptions(true).Split(' '))
+                    psi.ArgumentList.Add(option);
+                psi.ArgumentList.Add("-T");
+                psi.ArgumentList.Add($"{sshUser}@{vmIp}");
+                psi.ArgumentList.Add("bash");
+                psi.ArgumentList.Add("-s");
+                psi.Environment["SSH_ASKPASS"] = helper;
+                psi.Environment["SSH_ASKPASS_REQUIRE"] = "force";
+                psi.Environment["DISPLAY"] = "rr:0";
+                psi.Environment["RR_SSH_PASSWORD"] = sshPassword;
+            }
+            else
+            {
+                var fullCommand = $"ssh {BuildSshOptions(false)} {sshUser}@{vmIp} bash -s";
                 psi = new ProcessStartInfo
                 {
                     FileName = "/bin/bash",
@@ -428,74 +481,92 @@ public class TartBackend : IRunnerBackend
                     RedirectStandardInput = true
                 };
             }
-            else
+
+            var path = psi.Environment.TryGetValue("PATH", out var existingPath) ? existingPath ?? "" : "";
+            if (!path.Contains("/opt/homebrew"))
+                psi.Environment["PATH"] = $"/opt/homebrew/bin:/opt/homebrew/sbin:{path}";
+
+            await RunSshProcessAsync(psi, script, timeout, ct, logger);
+        }
+        finally
+        {
+            if (helper != null)
             {
-                var expectPath = ResolveToolPath("expect", "/usr/bin/expect", "/opt/homebrew/bin/expect", "/usr/local/bin/expect");
-                if (string.IsNullOrWhiteSpace(expectPath))
-                    throw new InvalidOperationException("Neither sshpass nor expect is available for password-based Tart SSH setup.");
-
-                var expectScript =
-                    $"set timeout 60; " +
-                    $"spawn ssh {sshOpts} {sshUser}@{vmIp} bash -s; " +
-                    "expect { " +
-                    "\"*assword:*\" { send -- \"$env(RR_SSH_PASSWORD)\\r\"; exp_continue } " +
-                    "timeout { } " +
-                    "eof { catch wait result; exit [lindex $result 3] } " +
-                    "}; " +
-                    "send -- \"$env(RR_SSH_SCRIPT)\\n\"; " +
-                    "send -- \"\\004\"; " +
-                    "expect eof; " +
-                    "catch wait result; " +
-                    "exit [lindex $result 3]";
-
-                psi = new ProcessStartInfo
+                try
                 {
-                    FileName = expectPath,
-                    Arguments = $"-c \"{expectScript.Replace("\"", "\\\"")}\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
-                psi.Environment["RR_SSH_PASSWORD"] = sshPassword;
-                psi.Environment["RR_SSH_SCRIPT"] = script;
+                    File.Delete(helper);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to remove SSH askpass helper");
+                }
             }
         }
-        else
+    }
+
+    internal static async Task RunSshProcessAsync(
+        ProcessStartInfo psi, string script, TimeSpan timeout, CancellationToken ct, ILogger logger)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(timeout);
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start SSH process");
+        var stdout = process.StandardOutput.ReadToEndAsync(deadline.Token);
+        var stderr = process.StandardError.ReadToEndAsync(deadline.Token);
+        try
         {
-            var fullCommand = $"ssh {sshOpts} {sshUser}@{vmIp} bash -s";
-            psi = new ProcessStartInfo
+            IOException? inputFailure = null;
+            try
             {
-                FileName = "/bin/bash",
-                Arguments = $"-lc \"{fullCommand.Replace("\"", "\\\"")}\"",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                RedirectStandardInput = true
-            };
+                await process.StandardInput.WriteLineAsync(script.AsMemory(), deadline.Token).WaitAsync(deadline.Token);
+                await process.StandardInput.FlushAsync(deadline.Token).WaitAsync(deadline.Token);
+            }
+            catch (IOException ex)
+            {
+                // A rejected connection can close stdin before consuming the script.
+                inputFailure = ex;
+            }
+            process.StandardInput.BaseStream.Close();
+            await process.WaitForExitAsync(deadline.Token);
+            var output = await stdout.WaitAsync(deadline.Token);
+            var error = await stderr.WaitAsync(deadline.Token);
+            if (process.ExitCode != 0)
+                throw new InvalidOperationException(
+                    $"SSH command failed with exit code {process.ExitCode}: {output}\n{error}".Trim());
+            if (inputFailure != null)
+                throw new IOException("SSH exited before accepting the complete script", inputFailure);
         }
-
-        // Add homebrew to PATH
-        var path = psi.Environment.TryGetValue("PATH", out var existingPath) ? existingPath ?? "" : "";
-        if (!path.Contains("/opt/homebrew"))
-            psi.Environment["PATH"] = $"/opt/homebrew/bin:/opt/homebrew/sbin:{path}";
-
-        var process = Process.Start(psi)!;
-
-        if (psi.RedirectStandardInput)
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && deadline.IsCancellationRequested)
         {
-            await process.StandardInput.WriteAsync(script);
-            await process.StandardInput.WriteAsync(Environment.NewLine);
-            process.StandardInput.Close();
+            throw new TimeoutException($"SSH command exceeded its {timeout} execution deadline", ex);
         }
-
-        var stdout = await process.StandardOutput.ReadToEndAsync(ct);
-        var stderr = await process.StandardError.ReadToEndAsync(ct);
-        await process.WaitForExitAsync(ct);
-
-        var output = string.IsNullOrEmpty(stderr) ? stdout : $"{stdout}\n{stderr}";
-
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException($"SSH command failed with exit code {process.ExitCode}: {output.Trim()}");
+        finally
+        {
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to terminate or reap SSH process");
+            }
+            // Close the pipe directly: disposing an unflushed writer can block again.
+            process.StandardInput.BaseStream.Close();
+            deadline.Cancel();
+            try
+            {
+                await Task.WhenAll(stdout, stderr).WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to finish draining SSH output");
+            }
+        }
     }
 
     private static string EscapeShell(string value) =>
