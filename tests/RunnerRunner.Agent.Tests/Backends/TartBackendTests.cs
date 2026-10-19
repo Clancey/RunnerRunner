@@ -8,6 +8,16 @@ public class TartBackendTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
+    public void PasswordAuthentication_DoesNotOfferHostSshKeys(bool passwordAuthentication)
+    {
+        var options = TartBackend.BuildSshOptions(passwordAuthentication);
+        Assert.Equal(passwordAuthentication, options.Contains("PubkeyAuthentication=no"));
+        Assert.Equal(passwordAuthentication, options.Contains("PreferredAuthentications=password,keyboard-interactive"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
     public async Task DetachedRunner_ReleasesSshPipesAndPreservesPreambleFailure(bool validPreamble)
     {
         if (OperatingSystem.IsWindows())

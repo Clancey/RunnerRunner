@@ -407,12 +407,16 @@ public class TartBackend : IRunnerBackend
     internal static string BuildDetachedRunnerScript(string preamble, string runnerCmd) =>
         $"{preamble} && {{ nohup {runnerCmd} </dev/null > /tmp/runner.log 2>&1 & }}";
 
+    internal static string BuildSshOptions(bool passwordAuthentication) =>
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" +
+        (passwordAuthentication ? " -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no" : "");
+
     private async Task SshExec(string sshUser, string vmIp, string? sshPassword, string script, CancellationToken ct)
     {
         _logger.LogDebug("SSH exec on {User}@{Ip}: {Script}",
             sshUser, vmIp, script.Length > 200 ? script[..200] + "..." : script);
 
-        var sshOpts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15";
+        var sshOpts = BuildSshOptions(!string.IsNullOrEmpty(sshPassword));
         ProcessStartInfo psi;
 
         if (!string.IsNullOrEmpty(sshPassword))
