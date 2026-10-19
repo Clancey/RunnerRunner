@@ -254,9 +254,7 @@ public class TartBackend : IRunnerBackend
                 TimeSpan.FromMinutes(15) + TimeSpan.FromSeconds(preSteps.Sum(s => (long)Math.Max(1, s.TimeoutSeconds))));
         }
 
-        // Export env vars into the SSH session
-        var envExports = string.Join(" ", request.EnvironmentVariables
-            .Select(kv => $"export {kv.Key}='{EscapeShell(kv.Value)}'"));
+        var envExports = BuildEnvExports(request.EnvironmentVariables, _logger);
 
         // Determine runner version and download URL
         var version = request.RunnerAgentVersion ?? "2.333.1";
@@ -308,7 +306,7 @@ public class TartBackend : IRunnerBackend
 
             var runnerCmd = $"./run.sh --jitconfig \"$JIT_CONFIG\"";
             var preamble = $"cd {runnerDir} && JIT_CONFIG=$(cat /tmp/jitconfig.txt)";
-            await LaunchRunnerWithPostStepsAsync(sshUser, vmIp, sshPassword, preamble, runnerCmd, request, ct);
+            await LaunchRunnerWithPostStepsAsync(sshUser, vmIp, sshPassword, envExports, preamble, runnerCmd, request, ct);
 
             // Wait a moment, then check the log for confirmation
             await Task.Delay(5000, ct);
@@ -332,8 +330,8 @@ public class TartBackend : IRunnerBackend
             await SshExec(sshUser, vmIp, sshPassword, configScript, ct);
 
             await LaunchRunnerWithPostStepsAsync(
-                sshUser, vmIp, sshPassword,
-                $"{envExports} && cd {runnerDir}", "./run.sh", request, ct);
+                sshUser, vmIp, sshPassword, envExports,
+                $"cd {runnerDir}", "./run.sh", request, ct);
         }
 
         _logger.LogInformation("Runner started in Tart VM for {RunnerName}", request.RunnerName);
@@ -363,8 +361,8 @@ public class TartBackend : IRunnerBackend
         await SshExec(sshUser, vmIp, sshPassword, registerScript, ct);
 
         await LaunchRunnerWithPostStepsAsync(
-            sshUser, vmIp, sshPassword,
-            $"{envExports} && cd {runnerDir}", "./act_runner daemon", request, ct);
+            sshUser, vmIp, sshPassword, envExports,
+            $"cd {runnerDir}", "./act_runner daemon", request, ct);
 
         _logger.LogInformation("Gitea runner started in Tart VM");
     }
@@ -372,23 +370,28 @@ public class TartBackend : IRunnerBackend
     /// <summary>
     /// Writes a wrapper script on the VM that runs the given runner command then
     /// executes PostExit init steps, and launches it via nohup. If there are no
-    /// post steps, falls back to direct nohup of the runner command.
+    /// post steps, falls back to direct nohup of the runner command. Either way the
+    /// runner inherits <paramref name="envExports"/> from the SSH session, so env
+    /// values are never written into the wrapper file.
     /// </summary>
     private async Task LaunchRunnerWithPostStepsAsync(
-        string sshUser, string vmIp, string? sshPassword,
+        string sshUser, string vmIp, string? sshPassword, string envExports,
         string preamble, string runnerCmd, RunnerStartRequest request, CancellationToken ct)
     {
         var postSteps = request.InitSteps.Where(s => s.Phase == Core.Models.InitStepPhase.PostExit).ToList();
         if (postSteps.Count == 0)
         {
-            var runScript = BuildDetachedRunnerScript(preamble, runnerCmd);
+            var runScript = BuildDetachedRunnerScript($"{envExports} && {preamble}", runnerCmd);
             await SshExec(sshUser, vmIp, sshPassword, runScript, ct);
             return;
         }
 
+        const string wrapperPath = "/tmp/rr-runner-wrapper.sh";
         var postFragment = InitStepShellBuilder.BuildLinuxFragment(postSteps, "PostExit");
         var wrapperBody = new System.Text.StringBuilder();
         wrapperBody.AppendLine("#!/usr/bin/env bash");
+        // PostExit step env is embedded below; unlink now (bash keeps reading via its open fd).
+        wrapperBody.AppendLine("rm -f \"$0\"");
         wrapperBody.AppendLine("set +e");
         wrapperBody.AppendLine(preamble.Replace(" && ", "\n"));
         wrapperBody.AppendLine(runnerCmd);
@@ -398,15 +401,41 @@ public class TartBackend : IRunnerBackend
         wrapperBody.AppendLine("exit $rr_rc");
 
         var encoded = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(wrapperBody.ToString()));
-        var writeWrapper = $"echo '{encoded}' | base64 -d > /tmp/rr-runner-wrapper.sh && chmod +x /tmp/rr-runner-wrapper.sh";
+        var writeWrapper =
+            $"rm -f {wrapperPath} && (umask 077 && echo '{encoded}' | base64 -d > {wrapperPath}) && chmod 700 {wrapperPath}";
         await SshExec(sshUser, vmIp, sshPassword, writeWrapper, ct);
 
-        var launchWrapper = "nohup /tmp/rr-runner-wrapper.sh > /tmp/runner.log 2>&1 &";
-        await SshExec(sshUser, vmIp, sshPassword, launchWrapper, ct);
+        await SshExec(sshUser, vmIp, sshPassword, BuildDetachedRunnerScript(envExports, wrapperPath), ct);
     }
 
     internal static string BuildDetachedRunnerScript(string preamble, string runnerCmd) =>
         $"{preamble} && {{ nohup {runnerCmd} </dev/null > /tmp/runner.log 2>&1 & }}";
+
+    /// <summary>
+    /// Builds a single bash command that exports <paramref name="vars"/> into the
+    /// current shell, or <c>true</c> when there is nothing to export, so callers can
+    /// always chain it with <c>&amp;&amp;</c>. Names bash cannot export are skipped
+    /// (logged by name only) because bash would otherwise echo name=value to stderr.
+    /// </summary>
+    internal static string BuildEnvExports(IReadOnlyDictionary<string, string> vars, ILogger logger)
+    {
+        var assignments = new List<string>();
+        foreach (var (name, value) in vars)
+        {
+            if (!IsShellVariableName(name))
+            {
+                logger.LogWarning("Not exporting environment variable {Name} to Tart VM: not a valid shell variable name", name);
+                continue;
+            }
+            assignments.Add($"{name}='{EscapeShell(value)}'");
+        }
+        return assignments.Count == 0 ? "true" : "export " + string.Join(" ", assignments);
+    }
+
+    private static bool IsShellVariableName(string name) =>
+        name.Length > 0
+        && (char.IsAsciiLetter(name[0]) || name[0] == '_')
+        && name.All(c => char.IsAsciiLetterOrDigit(c) || c == '_');
 
     internal static string BuildSshOptions(bool passwordAuthentication) =>
         "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" +
