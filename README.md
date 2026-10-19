@@ -520,8 +520,22 @@ The scripts under `deploy/` that build locally and copy artifacts over SSH are i
 | Backend | Platform | How It Works |
 |---|---|---|
 | **Docker** | Linux, Windows | Spins up a container per runner instance. Image provides the runner environment. Registration happens in the container's entrypoint. |
-| **Tart** | macOS | Clones an OCI VM image, configures via shared directory `.env` file, starts the VM. Used for macOS CI (Xcode builds, iOS testing). |
+| **Tart** | macOS | Clones a local or OCI VM image and bootstraps the runner over SSH. Used for macOS CI (Xcode builds, iOS testing). |
 | **Native** | Any | Runs the runner agent binary directly as a child process. Multiple runners share the host OS. Best for bare-metal macOS. |
+
+Tart password authentication uses the host's `/usr/bin/ssh` with forced
+`SSH_ASKPASS`, not `sshpass` or `expect`. Each connection gets an owner-only
+temporary helper; the password is supplied only in the child environment and
+the bootstrap script travels over stdin without a terminal. Public-key offers
+are disabled when a guest password is configured. Key-based authentication
+keeps the host's existing SSH configuration.
+
+SSH operations have a 15-minute deadline, extended by the configured
+pre-runner init-step timeout budgets for that phase. A timeout terminates the
+local SSH process tree and fails provisioning rather than retrying a possibly
+executed command. It does not undo remote side effects or stop a detached
+runner. Runner launch backgrounds only the runner, so SSH can return while the
+runner remains active and preamble failures still reach the host.
 
 ## Environment Variable Composition
 
