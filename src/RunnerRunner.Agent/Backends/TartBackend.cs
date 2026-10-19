@@ -410,7 +410,7 @@ public class TartBackend : IRunnerBackend
 
     internal static string BuildSshOptions(bool passwordAuthentication) =>
         "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" +
-        (passwordAuthentication ? " -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no" : "");
+        (passwordAuthentication ? " -o BatchMode=no -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no" : "");
 
     private Task SshExec(
         string sshUser, string vmIp, string? sshPassword, string script, CancellationToken ct,

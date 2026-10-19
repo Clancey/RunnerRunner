@@ -13,6 +13,7 @@ public class TartBackendTests
         var options = TartBackend.BuildSshOptions(passwordAuthentication);
         Assert.Equal(passwordAuthentication, options.Contains("PubkeyAuthentication=no"));
         Assert.Equal(passwordAuthentication, options.Contains("PreferredAuthentications=password,keyboard-interactive"));
+        Assert.Equal(passwordAuthentication, options.Contains("BatchMode=no -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes"));
     }
 
     [Theory]
