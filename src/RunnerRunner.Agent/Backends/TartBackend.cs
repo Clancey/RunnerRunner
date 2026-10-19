@@ -380,7 +380,7 @@ public class TartBackend : IRunnerBackend
         var postSteps = request.InitSteps.Where(s => s.Phase == Core.Models.InitStepPhase.PostExit).ToList();
         if (postSteps.Count == 0)
         {
-            var runScript = $"{preamble} && nohup {runnerCmd} > /tmp/runner.log 2>&1 &";
+            var runScript = BuildDetachedRunnerScript(preamble, runnerCmd);
             await SshExec(sshUser, vmIp, sshPassword, runScript, ct);
             return;
         }
@@ -403,6 +403,9 @@ public class TartBackend : IRunnerBackend
         var launchWrapper = "nohup /tmp/rr-runner-wrapper.sh > /tmp/runner.log 2>&1 &";
         await SshExec(sshUser, vmIp, sshPassword, launchWrapper, ct);
     }
+
+    internal static string BuildDetachedRunnerScript(string preamble, string runnerCmd) =>
+        $"{preamble} && {{ nohup {runnerCmd} </dev/null > /tmp/runner.log 2>&1 & }}";
 
     private async Task SshExec(string sshUser, string vmIp, string? sshPassword, string script, CancellationToken ct)
     {
