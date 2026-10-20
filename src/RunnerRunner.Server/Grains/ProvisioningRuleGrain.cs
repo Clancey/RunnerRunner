@@ -210,7 +210,10 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
                 this.GetPrimaryKeyString(), aliveCount, desired, toProvision);
 
             for (var i = 0; i < toProvision; i++)
-                await ProvisionRunner();
+            {
+                if (await ProvisionRunner() == null)
+                    break;
+            }
         }
         else if (aliveCount > desired)
         {
@@ -233,7 +236,10 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
                 this.GetPrimaryKeyString(), aliveCount, minReady, toProvision);
 
             for (var i = 0; i < toProvision; i++)
-                await ProvisionRunner();
+            {
+                if (await ProvisionRunner() == null)
+                    break;
+            }
         }
     }
 
@@ -259,7 +265,10 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
                 this.GetPrimaryKeyString(), idleCount, minReady, toProvision);
 
             for (var i = 0; i < toProvision; i++)
-                await ProvisionRunner();
+            {
+                if (await ProvisionRunner() == null)
+                    break;
+            }
         }
     }
 

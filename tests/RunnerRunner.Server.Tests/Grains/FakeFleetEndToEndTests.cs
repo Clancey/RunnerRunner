@@ -5,6 +5,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Orleans.Runtime;
 using RunnerRunner.Core.Hub;
 using RunnerRunner.Core.Models;
 using RunnerRunner.Server.Grains.Interfaces;
@@ -444,7 +445,7 @@ public sealed class FakeFleetEndToEndTests
         var profileId = $"{id}-profile";
         await CreatePooledHostsAsync(pool, disconnectedHostId, connectedHostId);
         await CreateProfileAsync(profileId, "static-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux", "fleet-static-linux"]);
-        var rule = await CreateStaticRuleGrainAsync($"{id}-rule", profileId, pool);
+        var rule = await CreateRuleGrainAsync($"{id}-rule", profileId, pool);
         _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: false);
 
         try
@@ -477,7 +478,7 @@ public sealed class FakeFleetEndToEndTests
         var profileId = $"{id}-profile";
         await CreatePooledHostsAsync(pool, disconnectedHostId);
         await CreateProfileAsync(profileId, "static-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux", "fleet-static-linux"]);
-        var rule = await CreateStaticRuleGrainAsync($"{id}-rule", profileId, pool);
+        var rule = await CreateRuleGrainAsync($"{id}-rule", profileId, pool);
         _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: false);
 
         try
@@ -491,6 +492,75 @@ public sealed class FakeFleetEndToEndTests
         {
             await rule.Disable();
             _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(ProvisioningType.Static)]
+    [InlineData(ProvisioningType.ScaleSet)]
+    [InlineData(ProvisioningType.Webhook)]
+    public async Task RuleGrain_DisconnectedHostStopsRefillAfterFirstPlacementAttempt(ProvisioningType type)
+    {
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-refill-disc");
+        var hostId = $"{id}-host";
+        var profileId = $"{id}-profile";
+        await CreatePooledHostsAsync(hostId, hostId);
+        await CreateProfileAsync(profileId, "refill-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux"]);
+        _fixture.HostCommands.SetHostConnected(hostId, connected: false);
+        var rule = await CreateRuleGrainAsync($"{id}-rule", profileId, hostId, type, runnerCount: 100);
+
+        try
+        {
+            RequestContext.Set(RecordingHostCommandDispatcher.ConnectionCheckScopeKey, hostId);
+            await rule.Reconcile();
+
+            Assert.Equal(1, _fixture.HostCommands.GetConnectionCheckCount(hostId));
+            Assert.Empty((await rule.GetState()).ManagedInstanceIds);
+            Assert.DoesNotContain(_fixture.HostCommands.Commands, command => command.HostId == hostId && command.Kind == HostCommandKind.DeployRunner);
+
+            await rule.Reconcile();
+            Assert.Equal(2, _fixture.HostCommands.GetConnectionCheckCount(hostId));
+        }
+        finally
+        {
+            RequestContext.Remove(RecordingHostCommandDispatcher.ConnectionCheckScopeKey);
+            await rule.Disable();
+            _fixture.HostCommands.SetHostConnected(hostId, connected: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(ProvisioningType.Static)]
+    [InlineData(ProvisioningType.ScaleSet)]
+    [InlineData(ProvisioningType.Webhook)]
+    public async Task RuleGrain_RefillsAllMissingRunnersWhenCapacityAvailable(ProvisioningType type)
+    {
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-refill-ready");
+        var hostId = $"{id}-host";
+        var profileId = $"{id}-profile";
+        var host = await CreateHostAsync(hostId, HostPlatform.Linux, ExecutionBackend.Docker);
+        await host.SetResourceLimits(maxDocker: 3, maxTart: 0, maxNative: 0);
+        var document = (await _store.Get<Host>(hostId))!;
+        document.MaxDockerContainers = 3;
+        await _store.Update(document);
+        await CreateProfileAsync(profileId, "refill-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux"]);
+        var rule = await CreateRuleGrainAsync($"{id}-rule", profileId, hostId, type, runnerCount: 3);
+
+        try
+        {
+            await rule.Reconcile();
+
+            var instanceIds = (await rule.GetState()).ManagedInstanceIds;
+            Assert.Equal(3, instanceIds.Count);
+            Assert.Equal(3, _fixture.HostCommands.Commands.Count(command => command.HostId == hostId && command.Kind == HostCommandKind.DeployRunner));
+            foreach (var instanceId in instanceIds)
+                FindDeployCommand(hostId, instanceId);
+        }
+        finally
+        {
+            await rule.Disable();
         }
     }
 
@@ -651,16 +721,26 @@ public sealed class FakeFleetEndToEndTests
         }
     }
 
-    private async Task<IProvisioningRuleGrain> CreateStaticRuleGrainAsync(string ruleId, string profileId, string pool)
+    private async Task<IProvisioningRuleGrain> CreateRuleGrainAsync(
+        string ruleId,
+        string profileId,
+        string pool,
+        ProvisioningType type = ProvisioningType.Static,
+        int runnerCount = 1)
     {
+        var profile = await _store.Get<RunnerProfile>(profileId);
+        Assert.NotNull(profile);
         var rule = _grainFactory.GetGrain<IProvisioningRuleGrain>(ruleId);
         await rule.SetConfig(new ProvisioningRuleConfig
         {
-            Name = "static docker",
+            Name = "fleet docker",
             ProfileId = profileId,
-            Type = ProvisioningType.Static,
+            Type = type,
             Enabled = true,
-            DesiredCount = 1,
+            DesiredCount = runnerCount,
+            MinReady = runnerCount,
+            MaxInstances = runnerCount,
+            RunnerDefinitions = type == ProvisioningType.Webhook ? [RunnerDefinition.FromProfile(profile)] : [],
             RequiredHostLabels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["pool"] = pool

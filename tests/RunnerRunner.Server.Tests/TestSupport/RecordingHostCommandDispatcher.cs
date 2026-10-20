@@ -1,3 +1,4 @@
+using Orleans.Runtime;
 using RunnerRunner.Core.Hub;
 using RunnerRunner.Server.Services;
 
@@ -5,9 +6,12 @@ namespace RunnerRunner.Server.Tests.TestSupport;
 
 internal sealed class RecordingHostCommandDispatcher : IHostCommandDispatcher
 {
+    public const string ConnectionCheckScopeKey = "test.connection-check-host";
+
     private readonly object _gate = new();
     private readonly List<DispatchedHostCommand> _commands = [];
     private readonly HashSet<string> _disconnectedHosts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _connectionCheckCounts = new(StringComparer.OrdinalIgnoreCase);
 
     public IReadOnlyList<DispatchedHostCommand> Commands
     {
@@ -30,7 +34,18 @@ internal sealed class RecordingHostCommandDispatcher : IHostCommandDispatcher
     public bool CanDispatchToHost(string hostId)
     {
         lock (_gate)
+        {
+            // Count explicit grain calls without including independently scheduled reminder turns.
+            if (StringComparer.OrdinalIgnoreCase.Equals(RequestContext.Get(ConnectionCheckScopeKey) as string, hostId))
+                _connectionCheckCounts[hostId] = _connectionCheckCounts.GetValueOrDefault(hostId) + 1;
             return !_disconnectedHosts.Contains(hostId);
+        }
+    }
+
+    public int GetConnectionCheckCount(string hostId)
+    {
+        lock (_gate)
+            return _connectionCheckCounts.GetValueOrDefault(hostId);
     }
 
     public void SetHostConnected(string hostId, bool connected)
