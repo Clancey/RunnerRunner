@@ -148,18 +148,26 @@ public class OrchestrationEngine : BackgroundService
             }
         }
 
-        // Clean up instances that are stopped/crashed
-        var staleInstances = instances.Where(i =>
-            i.Status is RunnerInstanceStatus.Stopped or RunnerInstanceStatus.Failed or RunnerInstanceStatus.Crashed
-            && i.StoppedAt.HasValue
-            && i.StoppedAt.Value < DateTime.UtcNow.AddMinutes(-5));
-
-        foreach (var stale in staleInstances)
+        foreach (var stale in instances.Where(i => IsRemovableStaleInstance(i, DateTime.UtcNow)))
         {
             await store.Remove<RunnerInstance>(stale.Id);
             _logger.LogDebug("Cleaned up stale instance {Id} ({RunnerName})", stale.Id, stale.RunnerName);
         }
     }
+
+    /// <summary>
+    /// A stopped/failed/crashed record may be forgotten only once the host has reported its
+    /// resource gone. A terminal status alone (e.g. set while the host was unreachable) says
+    /// nothing about the resource, and a forgotten record turns a live runner into an orphan.
+    /// Dynamic records are left to <see cref="RunnerTimeoutService"/>, which also asks the
+    /// provider.
+    /// </summary>
+    internal static bool IsRemovableStaleInstance(RunnerInstance instance, DateTime nowUtc) =>
+        instance.Status is RunnerInstanceStatus.Stopped or RunnerInstanceStatus.Failed or RunnerInstanceStatus.Crashed
+        && instance.ProvisioningMode != "dynamic"
+        && instance.StoppedAt.HasValue
+        && instance.StoppedAt.Value < nowUtc.AddMinutes(-5)
+        && RunnerTimeoutService.HostReportedGone(instance);
 
     private async Task DeployRunnerAsync(
         IDocumentStore store,
@@ -308,11 +316,7 @@ public class OrchestrationEngine : BackgroundService
         var runnerGrain = _grainFactory.GetGrain<IRunnerInstanceGrain>(instance.Id);
         await runnerGrain.MarkStopping();
 
-        await _hostCommands.DispatchStopRunnerAsync(instance.HostId, new StopRunnerCommand
-        {
-            InstanceId = instance.Id,
-            InstanceHandle = instance.ContainerId ?? instance.VmName ?? instance.ProcessId?.ToString()
-        });
+        await _hostCommands.DispatchStopRunnerAsync(instance.HostId, StopRunnerCommand.ForInstance(instance.Id, instance.ContainerId, instance.VmName, instance.ProcessId));
 
         _logger.LogInformation("Stop command sent for {RunnerName}", instance.RunnerName);
     }

@@ -1,6 +1,8 @@
+using System.Collections.Concurrent;
 using Shiny.DocumentDb;
 using RunnerRunner.Core.Hub;
 using RunnerRunner.Core.Models;
+using RunnerRunner.Server.Grains;
 using Host = RunnerRunner.Core.Models.Host;
 
 namespace RunnerRunner.Server.Services;
@@ -24,6 +26,11 @@ public class RunnerTimeoutService : BackgroundService
     private static readonly TimeSpan IgnoredWebhookRetention = TimeSpan.FromDays(2);
     private static readonly TimeSpan RetryAfterRunnerFailureDelay = TimeSpan.FromSeconds(10);
 
+    // How long a provider answer that blocks a stop (Busy, Unknown) is reused. The scan runs
+    // every 30s and each lookup costs up to two GitHub API calls per runner; a busy runner
+    // stays busy for minutes, and acting on Idle is never delayed because Idle is not cached.
+    private static readonly TimeSpan ProviderActivityCacheDuration = TimeSpan.FromMinutes(2);
+
     // "pending" (WebhookEvent.ScheduleRetry's default status) is one of the open-ended queue
     // statuses that WebhookEvent.EnsureLifecycleWindow/ScheduleRetry deliberately never expire
     // (they're for legitimate no-fixed-SLA waits like FIFO/capacity ordering). Requeuing a linked
@@ -36,13 +43,15 @@ public class RunnerTimeoutService : BackgroundService
     private readonly ILogger<RunnerTimeoutService> _logger;
     private readonly IServiceProvider _services;
     private readonly IHostCommandDispatcher _hostCommands;
+    private readonly ConcurrentDictionary<string, (ProviderRunnerActivity Activity, DateTime CheckedAt)> _blockingActivity =
+        new(StringComparer.Ordinal);
 
     /// <summary>
     /// Backstop for dynamic runners whose completion webhook was lost. It must stay above
     /// the longest job the pool can legitimately run: a runner that trips this is killed
     /// and its workspace deleted, so a value below a real job's timeout destroys healthy
-    /// builds mid-step and reports it as a build failure. Crashed runners are caught far
-    /// sooner by <see cref="HealthCheckStaleTimeout"/>, so this only needs to be generous.
+    /// builds mid-step and reports it as a build failure. Runners that really exited are
+    /// caught far sooner by the host reporting them gone, so this only needs to be generous.
     /// </summary>
     private readonly TimeSpan _dynamicRunningTimeout;
 
@@ -98,6 +107,7 @@ public class RunnerTimeoutService : BackgroundService
     {
         using var scope = _services.CreateScope();
         var store = scope.ServiceProvider.GetRequiredService<IDocumentStore>();
+        var registrations = scope.ServiceProvider.GetService<RunnerRegistrationCleanupService>();
 
         var instances = (await store.Query<RunnerInstance>().ToList()).ToList();
         var now = DateTime.UtcNow;
@@ -109,34 +119,51 @@ public class RunnerTimeoutService : BackgroundService
             switch (instance.Status)
             {
                 case RunnerInstanceStatus.Pending:
-                    await CheckPendingTimeout(store, instance, now);
+                    if (await CheckPendingTimeout(store, instance, now))
+                        continue;
                     break;
                 case RunnerInstanceStatus.Starting:
-                    await CheckStartingTimeout(store, instance, now);
+                    if (await CheckStartingTimeout(store, instance, now))
+                        continue;
                     break;
                 case RunnerInstanceStatus.Running:
-                    await CheckRunningTimeouts(store, instance, now);
+                    if (await CheckRunningTimeouts(store, registrations, instance, now, ct))
+                        continue;
                     break;
                 case RunnerInstanceStatus.Stopping:
                     await CheckStoppingTimeout(store, instance, now);
                     break;
             }
 
-            await CleanupExpiredDynamicRecord(store, instance, now);
+            await CleanupExpiredDynamicRecord(store, registrations, instance, now, ct);
+        }
+
+        var knownIds = instances.Select(i => i.Id).ToHashSet(StringComparer.Ordinal);
+        foreach (var cachedId in _blockingActivity.Keys)
+        {
+            if (!knownIds.Contains(cachedId))
+                _blockingActivity.TryRemove(cachedId, out _);
         }
 
         await CleanupExpiredWebhookEvents(store, now, ct);
     }
 
-    private async Task CheckPendingTimeout(IDocumentStore store, RunnerInstance instance, DateTime now)
+    /// <returns>True when the instance's record was removed or must be left as it is.</returns>
+    private async Task<bool> CheckPendingTimeout(IDocumentStore store, RunnerInstance instance, DateTime now)
     {
         var referenceTime = instance.DeployedAt ?? instance.CreatedAt;
         if (now - referenceTime <= PendingTimeout)
-            return;
+            return false;
 
         _logger.LogWarning(
             "Runner {RunnerName} ({Id}) timed out in Pending state after {Elapsed}",
             instance.RunnerName, instance.Id, now - referenceTime);
+
+        // A dynamic runner is stopped before it is failed and its job requeued: if the stop
+        // cannot be sent, a replacement would race a runner that may yet come up and take a
+        // job. The record stays Pending and the next scan retries.
+        if (instance.ProvisioningMode == "dynamic" && !await TrySendStopRunner(store, instance))
+            return true;
 
         instance.Status = RunnerInstanceStatus.Failed;
         instance.StatusMessage = "Deploy timeout - HostWorker did not acknowledge";
@@ -149,20 +176,26 @@ public class RunnerTimeoutService : BackgroundService
                 instance,
                 now,
                 "Runner deployment timed out before the host acknowledged it; retrying provisioning");
-            await TrySendStopRunner(store, instance);
             await store.Remove<RunnerInstance>(instance.Id);
+            return true;
         }
+
+        return false;
     }
 
-    private async Task CheckStartingTimeout(IDocumentStore store, RunnerInstance instance, DateTime now)
+    /// <returns>True when the instance's record was removed or must be left as it is.</returns>
+    private async Task<bool> CheckStartingTimeout(IDocumentStore store, RunnerInstance instance, DateTime now)
     {
         var referenceTime = instance.StartedAt ?? instance.DeployedAt;
         if (referenceTime == null || now - referenceTime.Value <= StartingTimeout)
-            return;
+            return false;
 
         _logger.LogWarning(
             "Runner {RunnerName} ({Id}) timed out in Starting state after {Elapsed}",
             instance.RunnerName, instance.Id, now - referenceTime.Value);
+
+        if (instance.ProvisioningMode == "dynamic" && !await TrySendStopRunner(store, instance))
+            return true;
 
         instance.Status = RunnerInstanceStatus.Failed;
         instance.StatusMessage = "Registration timeout — runner did not connect to provider";
@@ -175,12 +208,20 @@ public class RunnerTimeoutService : BackgroundService
                 instance,
                 now,
                 "Runner registration timed out before it connected to the provider; retrying provisioning");
-            await TrySendStopRunner(store, instance);
             await store.Remove<RunnerInstance>(instance.Id);
+            return true;
         }
+
+        return false;
     }
 
-    private async Task CheckRunningTimeouts(IDocumentStore store, RunnerInstance instance, DateTime now)
+    /// <returns>True when the instance's record was removed.</returns>
+    private async Task<bool> CheckRunningTimeouts(
+        IDocumentStore store,
+        RunnerRegistrationCleanupService? registrations,
+        RunnerInstance instance,
+        DateTime now,
+        CancellationToken ct)
     {
         if (instance.ProvisioningMode == "dynamic"
             && !string.IsNullOrWhiteSpace(instance.WebhookEventId))
@@ -207,19 +248,30 @@ public class RunnerTimeoutService : BackgroundService
                         "Dynamic runner {RunnerName} ({Id}) is not bound to resolved event job {EventJobId} (claim: {JobId}); leaving it running",
                         instance.RunnerName, instance.Id, linkedEvent?.JobId, instance.JobId ?? "released");
                 }
+                else if (await GetProviderActivityAsync(registrations, store, instance, ct) is var resolvedActivity
+                    && !ProviderAllowsRecycle(resolvedActivity))
+                {
+                    // A matching claim is RunnerRunner's belief, and it goes stale whenever the
+                    // webhook that would release it is lost. The provider knows whether the
+                    // runner is building; if it is, or cannot be asked, the stop waits.
+                    _logger.LogInformation(
+                        "Dynamic runner {RunnerName} ({Id}) is bound to resolved event job {EventJobId}, but the provider reports it {Activity}; leaving it running",
+                        instance.RunnerName, instance.Id, linkedEvent?.JobId, resolvedActivity);
+                }
                 else
                 {
                     _logger.LogWarning(
                         "Dynamic runner {RunnerName} ({Id}) is still active after its event resolved with status {EventStatus}",
                         instance.RunnerName, instance.Id, eventStatus);
 
+                    if (!await TrySendStopRunner(store, instance))
+                        return false;
+
                     instance.Status = RunnerInstanceStatus.Failed;
                     instance.StatusMessage = $"Dynamic runner cleanup after event resolved: {eventStatus}";
                     await store.Update(instance);
-
-                    await TrySendStopRunner(store, instance);
                     await store.Remove<RunnerInstance>(instance.Id);
-                    return;
+                    return true;
                 }
             }
             else if (instance.StartedAt != null
@@ -237,11 +289,24 @@ public class RunnerTimeoutService : BackgroundService
                         "Dynamic runner {RunnerName} ({Id}) did not pick up job {EventJobId} and no longer holds that claim (now {JobId}); leaving it running",
                         instance.RunnerName, instance.Id, linkedEvent?.JobId, instance.JobId ?? "released");
                 }
+                else if (await GetProviderActivityAsync(registrations, store, instance, ct) is var pickupActivity
+                    && !ProviderAllowsRecycle(pickupActivity))
+                {
+                    // Without webhooks the claim never moves, so "never picked up" really means
+                    // "RunnerRunner never heard". GitHub hands a waiting JIT runner any job its
+                    // labels match; stopping it here killed those jobs mid-step.
+                    _logger.LogInformation(
+                        "Dynamic runner {RunnerName} ({Id}) has not been seen picking up job {EventJobId}, but the provider reports it {Activity}; leaving it running",
+                        instance.RunnerName, instance.Id, linkedEvent?.JobId, pickupActivity);
+                }
                 else
                 {
                     _logger.LogWarning(
                         "Dynamic runner {RunnerName} ({Id}) never picked up its queued job after {Elapsed}; recycling it",
                         instance.RunnerName, instance.Id, now - instance.StartedAt.Value);
+
+                    if (!await TrySendStopRunner(store, instance))
+                        return false;
 
                     instance.Status = RunnerInstanceStatus.Failed;
                     instance.StatusMessage = "Dynamic runner pickup timeout — job never started on provider";
@@ -252,9 +317,8 @@ public class RunnerTimeoutService : BackgroundService
                         instance,
                         now,
                         "Runner came online but never picked up the queued job; provisioning will be retried");
-                    await TrySendStopRunner(store, instance);
                     await store.Remove<RunnerInstance>(instance.Id);
-                    return;
+                    return true;
                 }
             }
         }
@@ -264,9 +328,30 @@ public class RunnerTimeoutService : BackgroundService
             && instance.StartedAt != null
             && now - instance.StartedAt.Value > _dynamicRunningTimeout)
         {
+            var activity = await GetProviderActivityAsync(registrations, store, instance, ct);
+            if (activity == ProviderRunnerActivity.Busy)
+            {
+                _logger.LogWarning(
+                    "Dynamic runner {RunnerName} ({Id}) passed the {Timeout} backstop, but the provider reports it is still running a job; leaving it running",
+                    instance.RunnerName, instance.Id, _dynamicRunningTimeout);
+                return false;
+            }
+
+            if (activity == ProviderRunnerActivity.Unknown
+                && !IsPastUnknownActivityCeiling(instance.StartedAt.Value, now))
+            {
+                _logger.LogWarning(
+                    "Dynamic runner {RunnerName} ({Id}) passed the {Timeout} backstop, but the provider cannot say whether it is running a job; leaving it running until {Ceiling} have passed",
+                    instance.RunnerName, instance.Id, _dynamicRunningTimeout, UnknownActivityCeiling);
+                return false;
+            }
+
             _logger.LogWarning(
-                "Dynamic runner {RunnerName} ({Id}) timed out after {Elapsed} with no completion webhook",
-                instance.RunnerName, instance.Id, now - instance.StartedAt.Value);
+                "Dynamic runner {RunnerName} ({Id}) timed out after {Elapsed} with no completion webhook (provider: {Activity})",
+                instance.RunnerName, instance.Id, now - instance.StartedAt.Value, activity);
+
+            if (!await TrySendStopRunner(store, instance))
+                return false;
 
             instance.Status = RunnerInstanceStatus.Failed;
             instance.StatusMessage = "Dynamic runner timeout — no completion webhook received";
@@ -277,35 +362,86 @@ public class RunnerTimeoutService : BackgroundService
                 instance,
                 now,
                 "Runner exceeded the dynamic execution timeout before the job completed; provisioning will be retried if the provider still shows it queued");
-            await TrySendStopRunner(store, instance);
             await store.Remove<RunnerInstance>(instance.Id);
-            return;
+            return true;
         }
 
+        // Stale health means the server stopped hearing from the host (it slept, or the link
+        // dropped), not that the runner exited: the VM or process keeps building meanwhile.
+        // Only the host reporting the runner gone, or the provider reporting it idle or
+        // deregistered (the recycle paths above), may end it.
         var lastSeenAt = instance.LastHealthCheck ?? instance.StartedAt;
         if (lastSeenAt != null
             && now - lastSeenAt.Value > HealthCheckStaleTimeout)
         {
-            _logger.LogWarning(
-                "Runner {RunnerName} ({Id}) has stale health check (last seen: {LastHealth})",
-                instance.RunnerName, instance.Id, lastSeenAt.Value);
-
-            instance.Status = RunnerInstanceStatus.Crashed;
-            instance.StatusMessage = "Health check stale — runner may have crashed";
-            await store.Update(instance);
-
-            if (instance.ProvisioningMode == "dynamic")
+            var message = $"{RunnerInstanceGrain.HealthStaleMessagePrefix} since {lastSeenAt.Value:u} — awaiting host confirmation";
+            if (!string.Equals(instance.StatusMessage, message, StringComparison.Ordinal))
             {
-                await TryRequeueLinkedWebhookEvent(
-                    store,
-                    instance,
-                    now,
-                    "Runner health checks went stale before the job was picked up; provisioning will be retried");
-                await TrySendStopRunner(store, instance);
-                await store.Remove<RunnerInstance>(instance.Id);
+                _logger.LogWarning(
+                    "Runner {RunnerName} ({Id}) has stale health check (last seen: {LastHealth}); leaving it running until the host confirms it exited",
+                    instance.RunnerName, instance.Id, lastSeenAt.Value);
+
+                instance.StatusMessage = message;
+                await store.Update(instance);
             }
         }
+
+        return false;
     }
+
+    private async Task<ProviderRunnerActivity> GetProviderActivityAsync(
+        RunnerRegistrationCleanupService? registrations,
+        IDocumentStore store,
+        RunnerInstance instance,
+        CancellationToken ct)
+    {
+        if (registrations == null)
+            return ProviderRunnerActivity.NotSupported;
+
+        var now = DateTime.UtcNow;
+        if (_blockingActivity.TryGetValue(instance.Id, out var cached)
+            && now - cached.CheckedAt < ProviderActivityCacheDuration)
+        {
+            return cached.Activity;
+        }
+
+        ProviderRunnerActivity activity;
+        try
+        {
+            activity = await registrations.GetProviderRunnerActivityAsync(store, instance, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Could not determine provider activity for runner {RunnerName}", instance.RunnerName);
+            activity = ProviderRunnerActivity.Unknown;
+        }
+
+        if (activity is ProviderRunnerActivity.Busy or ProviderRunnerActivity.Unknown)
+            _blockingActivity[instance.Id] = (activity, now);
+        else
+            _blockingActivity.TryRemove(instance.Id, out _);
+
+        return activity;
+    }
+
+    /// <summary>
+    /// A job-specific recycle stops a runner RunnerRunner believes is idle. It may only do so
+    /// when the provider agrees, or when the provider cannot be asked about single runners.
+    /// </summary>
+    internal static bool ProviderAllowsRecycle(ProviderRunnerActivity activity) =>
+        activity is ProviderRunnerActivity.Idle
+            or ProviderRunnerActivity.NotRegistered
+            or ProviderRunnerActivity.NotSupported;
+
+    /// <summary>
+    /// How long a runner the provider cannot answer about (Unknown) is left alone. Busy is
+    /// never stopped; Unknown is usually a GitHub outage or a credential problem, so it waits
+    /// well past any job the backstop allows before giving up on the runner.
+    /// </summary>
+    private TimeSpan UnknownActivityCeiling => _dynamicRunningTimeout * 2;
+
+    private bool IsPastUnknownActivityCeiling(DateTime startedAt, DateTime now) =>
+        now - startedAt > UnknownActivityCeiling;
 
     private async Task CheckStoppingTimeout(IDocumentStore store, RunnerInstance instance, DateTime now)
     {
@@ -324,31 +460,37 @@ public class RunnerTimeoutService : BackgroundService
     }
 
     /// <summary>
-    /// Best-effort attempt to send a StopRunner command to the HostWorker hosting this instance.
+    /// Sends a StopRunner command to the HostWorker hosting this instance.
     /// </summary>
-    private async Task TrySendStopRunner(IDocumentStore store, RunnerInstance instance)
+    /// <returns>
+    /// False when the command could not be sent (the host is not connected; there is no
+    /// outbox), or there is no host record to send it to. The caller must then keep the
+    /// record: forgetting it leaves the runner registered and running with no record, and
+    /// reconciliation later cleans it up as an orphan -- by then possibly mid-way through a
+    /// job GitHub gave it. True means the command was handed to the host's stream, not that
+    /// the host stopped the runner.
+    /// </returns>
+    private async Task<bool> TrySendStopRunner(IDocumentStore store, RunnerInstance instance)
     {
         try
         {
             var host = (await store.Query<Host>().ToList()).FirstOrDefault(h => h.Id == instance.HostId);
             if (host == null)
             {
-                _logger.LogDebug("No host found for instance {Id}, skipping StopRunner", instance.Id);
-                return;
+                _logger.LogWarning("No host record {HostId} for instance {RunnerName} ({Id}); cannot send StopRunner, keeping its record", instance.HostId, instance.RunnerName, instance.Id);
+                return false;
             }
 
-            await _hostCommands.DispatchStopRunnerAsync(host.Id, new StopRunnerCommand
-            {
-                InstanceId = instance.Id,
-                InstanceHandle = instance.ContainerId ?? instance.VmName ?? instance.ProcessId?.ToString()
-            });
+            await _hostCommands.DispatchStopRunnerAsync(host.Id, StopRunnerCommand.ForInstance(instance.Id, instance.ContainerId, instance.VmName, instance.ProcessId));
 
             _logger.LogInformation("Sent StopRunner for timed-out instance {RunnerName} ({Id})",
                 instance.RunnerName, instance.Id);
+            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to send StopRunner for instance {Id}", instance.Id);
+            _logger.LogWarning(ex, "Failed to send StopRunner for instance {RunnerName} ({Id}); keeping its record to retry", instance.RunnerName, instance.Id);
+            return false;
         }
     }
 
@@ -456,7 +598,12 @@ public class RunnerTimeoutService : BackgroundService
         return true;
     }
 
-    private static async Task CleanupExpiredDynamicRecord(IDocumentStore store, RunnerInstance instance, DateTime now)
+    private async Task CleanupExpiredDynamicRecord(
+        IDocumentStore store,
+        RunnerRegistrationCleanupService? registrations,
+        RunnerInstance instance,
+        DateTime now,
+        CancellationToken ct)
     {
         if (instance.ProvisioningMode != "dynamic"
             || instance.Status is not (RunnerInstanceStatus.Stopped or RunnerInstanceStatus.Failed or RunnerInstanceStatus.Crashed))
@@ -465,9 +612,65 @@ public class RunnerTimeoutService : BackgroundService
         }
 
         var terminalAt = instance.StoppedAt ?? instance.LastHealthCheck ?? instance.StartedAt ?? instance.DeployedAt ?? instance.CreatedAt;
-        if (now - terminalAt > DynamicTerminalRetention)
+        if (HostReportedGone(instance))
+        {
+            if (now - terminalAt > DynamicTerminalRetention)
+                await store.Remove<RunnerInstance>(instance.Id);
+            return;
+        }
+
+        // Either the host's reports keep listing this runner's VM/container/process as running,
+        // or the server has not heard from the host since (stale health). Neither says the
+        // resource is gone: forgetting the record would turn it into an "orphan" and have it
+        // cleaned up. Keep the record until the provider confirms the runner is not working,
+        // then stop it by handle.
+        var terminalSince = GetTerminalSince(instance);
+        if (now - (terminalSince ?? terminalAt) <= DynamicTerminalRetention)
+            return;
+
+        var hostReportsIt = HostStillReportsActive(instance, terminalSince, now);
+
+        var activity = await GetProviderActivityAsync(registrations, store, instance, ct);
+        var startedAt = instance.StartedAt ?? instance.DeployedAt ?? instance.CreatedAt;
+        if (!ProviderAllowsRecycle(activity)
+            && !(activity == ProviderRunnerActivity.Unknown && IsPastUnknownActivityCeiling(startedAt, now)))
+        {
+            _logger.LogInformation(
+                "Keeping {Status} record for runner {RunnerName} ({Id}): the host {HostView} and the provider reports it {Activity}",
+                instance.Status, instance.RunnerName, instance.Id,
+                hostReportsIt ? "still reports it running" : "has not reported it gone", activity);
+            return;
+        }
+
+        _logger.LogWarning(
+            "Runner {RunnerName} ({Id}) is {Status}, the host {HostView}, and the provider reports it {Activity}; stopping it",
+            instance.RunnerName, instance.Id, instance.Status,
+            hostReportsIt ? "still reports it running" : "has not reported it gone", activity);
+        if (await TrySendStopRunner(store, instance))
             await store.Remove<RunnerInstance>(instance.Id);
     }
+
+    /// <summary>
+    /// True when the host affirmatively reported this runner's resource gone (see
+    /// <see cref="RunnerInstance.HostReportedGoneAt"/>) and has not reported it running since.
+    /// </summary>
+    internal static bool HostReportedGone(RunnerInstance instance) =>
+        instance.HostReportedGoneAt is { } gone
+        && (instance.LastHealthCheck is not { } seen || seen < gone);
+
+    private static DateTime? GetTerminalSince(RunnerInstance instance) =>
+        instance.StoppedAt
+        ?? instance.StatusHistory?.LastOrDefault(e => e.Status == instance.Status)?.Timestamp;
+
+    /// <summary>
+    /// Reconciliation refreshes <see cref="RunnerInstance.LastHealthCheck"/> for every record
+    /// whose resource the host reports active, whatever the record's status. A refresh after
+    /// the record went terminal means the host still runs it.
+    /// </summary>
+    private static bool HostStillReportsActive(RunnerInstance instance, DateTime? terminalSince, DateTime now) =>
+        instance.LastHealthCheck is { } seen
+        && now - seen <= HealthCheckStaleTimeout
+        && (terminalSince is null || seen > terminalSince.Value);
 
     private async Task CleanupExpiredWebhookEvents(IDocumentStore store, DateTime now, CancellationToken ct)
     {

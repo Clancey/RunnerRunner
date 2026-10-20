@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Shiny.DocumentDb;
 using RunnerRunner.Core.Hub;
 using RunnerRunner.Core.Models;
@@ -26,6 +27,22 @@ public class ReconciliationService : IHostedService, IDisposable
     // (observed live: ~3.5 minutes for a native macOS runner under host load).
     private static readonly TimeSpan PendingDeployGracePeriod = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan StartingDeployGracePeriod = TimeSpan.FromMinutes(5);
+
+    // A resource the host reports running but RunnerRunner has no record of is cleaned up only
+    // after it has been reported that way continuously for this long. Records disappear for
+    // reasons that say nothing about the resource: a recycle path removed the record right
+    // after asking the host to stop it (that stop is still in flight), or a record was
+    // overwritten while the server could not see the host. Cleaning up on the first report
+    // killed live jobs in both cases.
+    internal static readonly TimeSpan RunningOrphanGracePeriod = TimeSpan.FromMinutes(10);
+
+    // A running orphan the provider cannot answer about (Unknown) is left alone this long,
+    // counted from the first report that listed it. Matches RunnerTimeoutService's default
+    // ceiling (twice the 6h dynamic backstop).
+    internal static readonly TimeSpan OrphanUnknownActivityCeiling = TimeSpan.FromHours(12);
+
+    // host|backend|resource -> first report that listed it as a running orphan.
+    private readonly ConcurrentDictionary<string, DateTime> _runningOrphanFirstSeen = new(StringComparer.Ordinal);
 
     private readonly ILogger<ReconciliationService> _logger;
     private readonly IServiceProvider _services;
@@ -67,121 +84,262 @@ public class ReconciliationService : IHostedService, IDisposable
             var store = scope.ServiceProvider.GetRequiredService<IDocumentStore>();
             var registrationCleanup = scope.ServiceProvider.GetRequiredService<RunnerRegistrationCleanupService>();
 
-            var reportHostId = report.HostId;
-            var hosts = (await store.Query<Host>().ToList())
-                .Where(h => h.Id == reportHostId || h.Name == reportHostId)
-                .ToList();
-            if (hosts.Count == 0)
-            {
-                _logger.LogWarning("No host found for reconciliation report from {Host}", reportHostId);
-                return;
-            }
-            var hostId = hosts.First().Id;
-
-            // Load all runner instances for this host
-            var dbInstances = (await store.Query<RunnerInstance>().ToList())
-                .Where(i => i.HostId == hostId)
-                .ToList();
-
-            // Find stale DB records (in DB but NOT in report)
-            foreach (var instance in dbInstances)
-            {
-                if (instance.Status is not (RunnerInstanceStatus.Running
-                    or RunnerInstanceStatus.Starting
-                    or RunnerInstanceStatus.Pending))
-                    continue;
-
-                var matchedRunner = report.Runners.FirstOrDefault(r => MatchesRunner(instance, r));
-
-                if (matchedRunner == null)
-                {
-                    if (IsWithinDeployGracePeriod(instance.Status, instance.DeployedAt ?? instance.CreatedAt, DateTime.UtcNow))
-                        continue;
-
-                    var newStatus = instance.Status == RunnerInstanceStatus.Running
-                        ? RunnerInstanceStatus.Crashed
-                        : RunnerInstanceStatus.Stopped;
-
-                    instance.Status = newStatus;
-                    instance.StatusMessage = "Host no longer reported the runner";
-                    instance.StoppedAt = DateTime.UtcNow;
-                    await store.Update(instance);
-
-                    await TryRecoverDynamicRunnerAsync(
-                        store,
-                        registrationCleanup,
-                        instance,
-                        "Runner disappeared from the host before the queued job started; provisioning will be retried");
-
-                    _logger.LogWarning(
-                        "Marking stale runner {Name} as {Status} — not found on host",
-                        instance.RunnerName, newStatus);
-                }
-                else if (!IsRunnerStillActive(matchedRunner))
-                {
-                    instance.Status = RunnerInstanceStatus.Stopped;
-                    instance.StatusMessage = $"Host reported runner exited ({matchedRunner.Status})";
-                    instance.StoppedAt = DateTime.UtcNow;
-                    await store.Update(instance);
-
-                    _logger.LogInformation(
-                        "Marking runner {Name} as stopped — host reported it exited (status: {HostStatus})",
-                        instance.RunnerName, matchedRunner.Status);
-
-                    await TryRecoverDynamicRunnerAsync(
-                        store,
-                        registrationCleanup,
-                        instance,
-                        $"Runner exited on the host before the queued job started ({matchedRunner.Status}); provisioning will be retried");
-                    await SendCleanupCommandAsync(hostId, matchedRunner);
-                }
-            }
-
-            // Find orphans on host (in report but NOT in DB)
-            foreach (var runner in report.Runners)
-            {
-                var hasMatch = dbInstances.Any(i => MatchesRunner(i, runner));
-
-                if (!hasMatch)
-                {
-                    _logger.LogWarning(
-                        "Sending cleanup for orphaned {Backend} resource {Resource} on host {Host} (running: {Running}, status: {Status})",
-                        runner.Backend,
-                        runner.ContainerId ?? runner.VmName ?? runner.ProcessId?.ToString() ?? runner.RunnerName,
-                        reportHostId,
-                        runner.IsRunning,
-                        runner.Status);
-
-                    var command = new CleanupOrphanCommand
-                    {
-                        Backend = runner.Backend,
-                        ContainerId = runner.ContainerId,
-                        VmName = runner.VmName,
-                        ProcessId = runner.ProcessId,
-                        InstanceDir = runner.InstanceDir
-                    };
-
-                    await _hostCommands.DispatchCleanupOrphanAsync(hostId, command);
-                }
-            }
-
-            // Update health for matched runners
-            foreach (var instance in dbInstances)
-            {
-                var matched = report.Runners.FirstOrDefault(r => MatchesRunner(instance, r));
-
-                if (matched != null && IsRunnerStillActive(matched))
-                {
-                    instance.LastHealthCheck = DateTime.UtcNow;
-                    await store.Update(instance);
-                }
-            }
+            await ProcessReportAsync(report, store, registrationCleanup, DateTime.UtcNow);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error processing reconciliation report from {Host}", report.HostId);
         }
     }
+
+    internal async Task ProcessReportAsync(
+        ReconciliationReport report,
+        IDocumentStore store,
+        RunnerRegistrationCleanupService registrationCleanup,
+        DateTime nowUtc)
+    {
+        var reportHostId = report.HostId;
+        var hosts = (await store.Query<Host>().ToList())
+            .Where(h => h.Id == reportHostId || h.Name == reportHostId)
+            .ToList();
+        if (hosts.Count == 0)
+        {
+            _logger.LogWarning("No host found for reconciliation report from {Host}", reportHostId);
+            return;
+        }
+        var hostId = hosts.First().Id;
+
+        // Load all runner instances for this host
+        var dbInstances = (await store.Query<RunnerInstance>().ToList())
+            .Where(i => i.HostId == hostId)
+            .ToList();
+
+        // Find stale DB records (in DB but NOT in report)
+        foreach (var instance in dbInstances)
+        {
+            if (instance.Status is not (RunnerInstanceStatus.Running
+                or RunnerInstanceStatus.Starting
+                or RunnerInstanceStatus.Pending))
+                continue;
+
+            var matchedRunner = report.Runners.FirstOrDefault(r => MatchesRunner(instance, r));
+
+            if (matchedRunner == null)
+            {
+                if (IsWithinDeployGracePeriod(instance.Status, instance.DeployedAt ?? instance.CreatedAt, nowUtc))
+                    continue;
+
+                if (CouldNotSee(instance, report))
+                {
+                    _logger.LogDebug(
+                        "Runner {Name} is missing from host {Host}'s report, but the report cannot show whether it exited (backend not listed, or a HostWorker that predates backend availability); leaving it {Status}",
+                        instance.RunnerName, reportHostId, instance.Status);
+                    continue;
+                }
+
+                var newStatus = instance.Status == RunnerInstanceStatus.Running
+                    ? RunnerInstanceStatus.Crashed
+                    : RunnerInstanceStatus.Stopped;
+
+                instance.Status = newStatus;
+                instance.StatusMessage = "Host no longer reported the runner";
+                instance.StoppedAt = nowUtc;
+                instance.HostReportedGoneAt = nowUtc;
+                await store.Update(instance);
+
+                await TryRecoverDynamicRunnerAsync(
+                    store,
+                    registrationCleanup,
+                    instance,
+                    "Runner disappeared from the host before the queued job started; provisioning will be retried");
+
+                _logger.LogWarning(
+                    "Marking stale runner {Name} as {Status} — not found on host",
+                    instance.RunnerName, newStatus);
+            }
+            else if (!IsRunnerStillActive(matchedRunner))
+            {
+                instance.Status = RunnerInstanceStatus.Stopped;
+                instance.StatusMessage = $"Host reported runner exited ({matchedRunner.Status})";
+                instance.StoppedAt = nowUtc;
+                instance.HostReportedGoneAt = nowUtc;
+                await store.Update(instance);
+
+                _logger.LogInformation(
+                    "Marking runner {Name} as stopped — host reported it exited (status: {HostStatus})",
+                    instance.RunnerName, matchedRunner.Status);
+
+                await TryRecoverDynamicRunnerAsync(
+                    store,
+                    registrationCleanup,
+                    instance,
+                    $"Runner exited on the host before the queued job started ({matchedRunner.Status}); provisioning will be retried");
+                await SendCleanupCommandAsync(hostId, matchedRunner);
+            }
+        }
+
+        // Find orphans on host (in report but NOT in DB)
+        List<WebhookEvent>? inProgressEvents = null;
+        var runningOrphanKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var runner in report.Runners)
+        {
+            if (dbInstances.Any(i => MatchesRunner(i, runner)))
+                continue;
+
+            var resource = DescribeResource(runner);
+
+            if (!IsRunnerStillActive(runner))
+            {
+                _logger.LogWarning(
+                    "Sending cleanup for orphaned {Backend} resource {Resource} on host {Host} (running: {Running}, status: {Status})",
+                    runner.Backend, resource, reportHostId, runner.IsRunning, runner.Status);
+                await SendCleanupCommandAsync(hostId, runner);
+                continue;
+            }
+
+            var key = $"{hostId}|{runner.Backend}|{resource}";
+            runningOrphanKeys.Add(key);
+            var firstSeen = _runningOrphanFirstSeen.GetOrAdd(key, nowUtc);
+            if (nowUtc - firstSeen < RunningOrphanGracePeriod)
+            {
+                if (firstSeen == nowUtc)
+                {
+                    _logger.LogInformation(
+                        "Host {Host} reports {Backend} resource {Resource} ({RunnerName}) running with no matching record; cleaning it up only if that persists for {Grace}",
+                        reportHostId, runner.Backend, resource, runner.RunnerName, RunningOrphanGracePeriod);
+                }
+                continue;
+            }
+
+            try
+            {
+                inProgressEvents ??= (await store.Query<WebhookEvent>().ToList())
+                    .Where(e => string.Equals(e.Status, "in_progress", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrWhiteSpace(e.AssignedRunnerName))
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                // Without the job lookup we cannot rule out that this runner is building a
+                // job, so leave it for the next report rather than guess.
+                _logger.LogWarning(ex,
+                    "Not cleaning up {Backend} resource {Resource} on host {Host} yet: could not check whether runner {RunnerName} is on a job",
+                    runner.Backend, resource, reportHostId, runner.RunnerName);
+                continue;
+            }
+            var liveJob = inProgressEvents.FirstOrDefault(e =>
+                string.Equals(e.AssignedRunnerName, runner.RunnerName, StringComparison.OrdinalIgnoreCase));
+            if (liveJob != null)
+            {
+                _logger.LogWarning(
+                    "Not cleaning up {Backend} resource {Resource} on host {Host}: it has no record, but runner {RunnerName} is running job {JobId}",
+                    runner.Backend, resource, reportHostId, runner.RunnerName, liveJob.JobId);
+                continue;
+            }
+
+            // No local record of a job is not evidence the runner is idle: webhooks get lost.
+            // Only the provider saying it is idle or gone (or, for a provider that cannot say,
+            // a long enough wait) justifies destroying a resource the host reports running.
+            ProviderRunnerActivity? activity;
+            try
+            {
+                activity = await registrationCleanup.GetOrphanRunnerActivityAsync(store, runner);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex,
+                    "Not cleaning up {Backend} resource {Resource} on host {Host}: could not ask the provider about runner {RunnerName}",
+                    runner.Backend, resource, reportHostId, runner.RunnerName);
+                continue;
+            }
+
+            if (activity is not { } known)
+            {
+                _logger.LogWarning(
+                    "Not cleaning up {Backend} resource {Resource} on host {Host}: no profile or credential could be resolved for runner {RunnerName}",
+                    runner.Backend, resource, reportHostId, runner.RunnerName);
+                continue;
+            }
+
+            if (!RunnerTimeoutService.ProviderAllowsRecycle(known)
+                && !(known == ProviderRunnerActivity.Unknown && nowUtc - firstSeen > OrphanUnknownActivityCeiling))
+            {
+                _logger.LogWarning(
+                    "Not cleaning up {Backend} resource {Resource} on host {Host}: it has no record, but the provider reports runner {RunnerName} {Activity}",
+                    runner.Backend, resource, reportHostId, runner.RunnerName, known);
+                continue;
+            }
+
+            _logger.LogWarning(
+                "Sending cleanup for orphaned {Backend} resource {Resource} on host {Host} (running: {Running}, status: {Status}, orphaned since {FirstSeen:u}, provider: {Activity})",
+                runner.Backend, resource, reportHostId, runner.IsRunning, runner.Status, firstSeen, known);
+            await SendCleanupCommandAsync(hostId, runner);
+            _runningOrphanFirstSeen.TryRemove(key, out _);
+        }
+
+        // Forget resources this host no longer reports as running orphans, so a later
+        // orphan reusing a name or PID starts its grace period from scratch.
+        var hostPrefix = hostId + "|";
+        foreach (var key in _runningOrphanFirstSeen.Keys)
+        {
+            if (key.StartsWith(hostPrefix, StringComparison.Ordinal) && !runningOrphanKeys.Contains(key))
+                _runningOrphanFirstSeen.TryRemove(key, out _);
+        }
+
+        // Update health for matched runners, and record that the host no longer runs the
+        // resource of a record that already ended (RunnerTimeoutService forgets those only
+        // on that evidence, never on stale health).
+        foreach (var instance in dbInstances)
+        {
+            var matched = report.Runners.FirstOrDefault(r => MatchesRunner(instance, r));
+
+            if (matched != null && IsRunnerStillActive(matched))
+            {
+                instance.LastHealthCheck = nowUtc;
+                await store.Update(instance);
+            }
+            else if (instance.Status is RunnerInstanceStatus.Stopped or RunnerInstanceStatus.Failed or RunnerInstanceStatus.Crashed
+                && !RunnerTimeoutService.HostReportedGone(instance)
+                && !CouldNotSee(instance, report))
+            {
+                instance.HostReportedGoneAt = nowUtc;
+                await store.Update(instance);
+            }
+        }
+    }
+
+    /// <summary>
+    /// True when <paramref name="report"/> cannot show whether <paramref name="instance"/>'s
+    /// resource is gone: its backend could not be listed, or the sender predates
+    /// <see cref="ReconciliationReport.UnavailableBackends"/> and so cannot say.
+    /// </summary>
+    internal static bool CouldNotSee(RunnerInstance instance, ReconciliationReport report) =>
+        !report.ReportsBackendAvailability || WasNotListed(instance, report.UnavailableBackends);
+
+    /// <summary>
+    /// The handle that names <paramref name="runner"/> to its backend. Docker reports
+    /// <see cref="DiscoveredRunnerInfo.ContainerId"/> as an empty string (not null) for
+    /// Tart and native resources, so a null-coalescing chain stops there.
+    /// </summary>
+    internal static string DescribeResource(DiscoveredRunnerInfo runner) => runner.Backend switch
+    {
+        ExecutionBackend.Docker when !string.IsNullOrWhiteSpace(runner.ContainerId) => runner.ContainerId,
+        ExecutionBackend.Tart when !string.IsNullOrWhiteSpace(runner.VmName) => runner.VmName,
+        ExecutionBackend.Native when runner.ProcessId.HasValue => runner.ProcessId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        _ => FirstNonBlank(runner.ContainerId, runner.VmName, runner.ProcessId?.ToString(System.Globalization.CultureInfo.InvariantCulture), runner.RunnerName, runner.InstanceId) ?? "(unidentified)"
+    };
+
+    private static string? FirstNonBlank(params string?[] values) =>
+        values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+
+    internal static CleanupOrphanCommand BuildCleanupCommand(DiscoveredRunnerInfo runner) => new()
+    {
+        Backend = runner.Backend,
+        ContainerId = string.IsNullOrWhiteSpace(runner.ContainerId) ? null : runner.ContainerId,
+        VmName = string.IsNullOrWhiteSpace(runner.VmName) ? null : runner.VmName,
+        ProcessId = runner.ProcessId,
+        InstanceDir = string.IsNullOrWhiteSpace(runner.InstanceDir) ? null : runner.InstanceDir
+    };
 
     /// <summary>
     /// True if an instance in <paramref name="status"/>, deployed/created at <paramref name="referenceTime"/>,
@@ -220,6 +378,24 @@ public class ReconciliationService : IHostedService, IDisposable
             && string.Equals(runner.RunnerName, instance.RunnerName, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// True when the host said it could not list the backend that runs <paramref name="instance"/>,
+    /// so the runner's absence from the report says nothing about whether it exited. An
+    /// instance with no handle yet could be on any backend.
+    /// </summary>
+    internal static bool WasNotListed(RunnerInstance instance, IReadOnlyCollection<ExecutionBackend>? unavailableBackends)
+    {
+        if (unavailableBackends is not { Count: > 0 })
+            return false;
+
+        ExecutionBackend? backend =
+            !string.IsNullOrWhiteSpace(instance.ContainerId) ? ExecutionBackend.Docker
+            : !string.IsNullOrWhiteSpace(instance.VmName) ? ExecutionBackend.Tart
+            : instance.ProcessId.HasValue ? ExecutionBackend.Native
+            : null;
+        return backend is not { } known || unavailableBackends.Contains(known);
+    }
+
     internal static bool IsRunnerStillActive(DiscoveredRunnerInfo runner) =>
         runner.IsRunning || string.Equals(runner.Status, "running", StringComparison.OrdinalIgnoreCase);
 
@@ -248,17 +424,6 @@ public class ReconciliationService : IHostedService, IDisposable
         await registrationCleanup.TryRemoveRunnerAsync(store, instance);
     }
 
-    private async Task SendCleanupCommandAsync(string hostId, DiscoveredRunnerInfo runner)
-    {
-        var command = new CleanupOrphanCommand
-        {
-            Backend = runner.Backend,
-            ContainerId = runner.ContainerId,
-            VmName = runner.VmName,
-            ProcessId = runner.ProcessId,
-            InstanceDir = runner.InstanceDir
-        };
-
-        await _hostCommands.DispatchCleanupOrphanAsync(hostId, command);
-    }
+    private Task SendCleanupCommandAsync(string hostId, DiscoveredRunnerInfo runner) =>
+        _hostCommands.DispatchCleanupOrphanAsync(hostId, BuildCleanupCommand(runner));
 }

@@ -1252,11 +1252,7 @@
             var runnerGrain = GrainFactory.GetGrain<IRunnerInstanceGrain>(inst.Id);
             await runnerGrain.MarkStopping();
 
-            await HostCommandDispatcher.DispatchStopRunnerAsync(hostId, new StopRunnerCommand
-            {
-                InstanceId = inst.Id,
-                InstanceHandle = inst.ContainerId ?? inst.VmName ?? inst.ProcessId?.ToString()
-            });
+            await HostCommandDispatcher.DispatchStopRunnerAsync(hostId, StopRunnerCommand.ForInstance(inst.Id, inst.ContainerId, inst.VmName, inst.ProcessId));
         }
     }
 

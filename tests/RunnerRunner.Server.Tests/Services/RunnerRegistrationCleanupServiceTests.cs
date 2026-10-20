@@ -1,8 +1,13 @@
+using System.Net;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using RunnerRunner.Core.Interfaces;
 using RunnerRunner.Core.Models;
+using RunnerRunner.Server.Providers;
 using RunnerRunner.Server.Services;
+using RunnerRunner.Server.Tests.TestSupport;
+using Shiny.DocumentDb;
 
 namespace RunnerRunner.Server.Tests.Services;
 
@@ -206,5 +211,296 @@ public class RunnerRegistrationCleanupServiceTests
 
         Assert.Contains("MAUI-Linux-jit-c1e37630", names);
         Assert.DoesNotContain("external-runner", names);
+    }
+
+    private const string ProbedRunner = "FashionPact-Linux-jit-383f99c0";
+
+    // Clancey/FashionPactPos is a personal-account repository: the runner is registered on
+    // the repository and there is no org runner endpoint to fall back to.
+    [Theory]
+    [InlineData(true, ProviderRunnerActivity.Busy)]
+    [InlineData(false, ProviderRunnerActivity.Idle)]
+    public async Task GetProviderRunnerActivity_ReadsBusyFromTheRepositoryTheRunnerWasMintedFor(bool busy, ProviderRunnerActivity expected)
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, RunnersJson((ProbedRunner, busy)));
+        var (service, store, instance) = await ActivityScenarioAsync(api);
+
+        var activity = await service.GetProviderRunnerActivityAsync(store, instance);
+
+        Assert.Equal(expected, activity);
+        var request = Assert.Single(api.Requests);
+        Assert.Equal($"/repos/Clancey/FashionPactPos/actions/runners?name={ProbedRunner}&per_page=100", request.PathAndQuery);
+    }
+
+    [Fact]
+    public async Task GetProviderRunnerActivity_PersonalAccountWithNoRepositoryRegistration_IsNotRegistered()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, RunnersJson())
+            .RespondJson(IsOrgLookup, """{"message":"Not Found"}""", HttpStatusCode.NotFound)
+            .RespondJson(IsOwnerLookup, """{"login":"Clancey","type":"User"}""");
+        var (service, store, instance) = await ActivityScenarioAsync(api);
+
+        Assert.Equal(ProviderRunnerActivity.NotRegistered, await service.GetProviderRunnerActivityAsync(store, instance));
+    }
+
+    // An org can also answer 404 on its runner list (for example when the credential cannot
+    // see org runners). Reading that as "no such runner" let a recycle stop a busy org runner.
+    [Fact]
+    public async Task GetProviderRunnerActivity_OrgRunnerListNotFoundForAnOrganization_IsUnknown()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, RunnersJson())
+            .RespondJson(IsOrgLookup, """{"message":"Not Found"}""", HttpStatusCode.NotFound)
+            .RespondJson(IsOwnerLookup, """{"login":"Clancey","type":"Organization"}""");
+        var (service, store, instance) = await ActivityScenarioAsync(api);
+
+        Assert.Equal(ProviderRunnerActivity.Unknown, await service.GetProviderRunnerActivityAsync(store, instance));
+    }
+
+    [Fact]
+    public async Task GetProviderRunnerActivity_OwnerTypeCannotBeLookedUp_IsUnknown()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, RunnersJson())
+            .RespondJson(IsOrgLookup, """{"message":"Not Found"}""", HttpStatusCode.NotFound)
+            .RespondJson(IsOwnerLookup, """{"message":"boom"}""", HttpStatusCode.InternalServerError);
+        var (service, store, instance) = await ActivityScenarioAsync(api);
+
+        Assert.Equal(ProviderRunnerActivity.Unknown, await service.GetProviderRunnerActivityAsync(store, instance));
+    }
+
+    // JitConfigService falls back to the credential's default repository when the event's
+    // repository and org reject the registration, so the runner can live there.
+    [Fact]
+    public async Task GetProviderRunnerActivity_RunnerRegisteredOnTheCredentialsDefaultRepository_IsFound()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, RunnersJson())
+            .RespondJson(IsOrgLookup, """{"message":"Not Found"}""", HttpStatusCode.NotFound)
+            .RespondJson(
+                request => request.RequestUri!.AbsolutePath == "/repos/Clancey/Other/actions/runners",
+                RunnersJson((ProbedRunner, true)));
+        var (service, store, instance) = await ActivityScenarioAsync(api, credentialRepo: "Clancey/Other");
+
+        Assert.Equal(ProviderRunnerActivity.Busy, await service.GetProviderRunnerActivityAsync(store, instance));
+    }
+
+    [Fact]
+    public async Task GetProviderRunnerActivity_OrgRegisteredRunner_IsFoundInTheOrg()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, RunnersJson())
+            .RespondJson(IsOrgLookup, RunnersJson((ProbedRunner, true)));
+        var (service, store, instance) = await ActivityScenarioAsync(api);
+
+        Assert.Equal(ProviderRunnerActivity.Busy, await service.GetProviderRunnerActivityAsync(store, instance));
+    }
+
+    [Fact]
+    public async Task GetProviderRunnerActivity_OnlyAnExactNameMatchCounts()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, RunnersJson((ProbedRunner + "-old", true)))
+            .RespondJson(IsOrgLookup, """{"message":"Not Found"}""", HttpStatusCode.NotFound)
+            .RespondJson(IsOwnerLookup, """{"login":"Clancey","type":"User"}""");
+        var (service, store, instance) = await ActivityScenarioAsync(api);
+
+        Assert.Equal(ProviderRunnerActivity.NotRegistered, await service.GetProviderRunnerActivityAsync(store, instance));
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.InternalServerError, false)]
+    [InlineData(HttpStatusCode.Forbidden, false)]
+    [InlineData(HttpStatusCode.InternalServerError, true)]
+    public async Task GetProviderRunnerActivity_WhenGitHubCannotBeAsked_IsUnknownNeverIdle(HttpStatusCode status, bool failOrgLookup)
+    {
+        var api = new FakeProviderHttpApi();
+        if (failOrgLookup)
+        {
+            api.RespondJson(IsRepoLookup, RunnersJson())
+                .RespondJson(IsOrgLookup, """{"message":"boom"}""", status);
+        }
+        else
+        {
+            api.RespondJson(IsRepoLookup, """{"message":"boom"}""", status);
+        }
+        var (service, store, instance) = await ActivityScenarioAsync(api);
+
+        Assert.Equal(ProviderRunnerActivity.Unknown, await service.GetProviderRunnerActivityAsync(store, instance));
+    }
+
+    [Fact]
+    public async Task GetProviderRunnerActivity_CredentialWithABareRepositoryName_ChecksThatRepository()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, RunnersJson((ProbedRunner, true)));
+        var (service, store, instance) = await ActivityScenarioAsync(
+            api,
+            credentialRepo: "FashionPactPos",
+            webhookRepository: null);
+
+        Assert.Equal(ProviderRunnerActivity.Busy, await service.GetProviderRunnerActivityAsync(store, instance));
+        Assert.StartsWith("/repos/Clancey/FashionPactPos/actions/runners?", Assert.Single(api.Requests).PathAndQuery);
+    }
+
+    [Fact]
+    public async Task GetProviderRunnerActivity_NonGitHubProfile_IsNotSupported()
+    {
+        var store = TestDocumentStore.Create();
+        await store.Insert(new RunnerProfile { Id = "azdo", Name = "azdo", Provider = RunnerProvider.AzureDevOps });
+        var service = new RunnerRegistrationCleanupService([], NullLogger<RunnerRegistrationCleanupService>.Instance);
+
+        var activity = await service.GetProviderRunnerActivityAsync(
+            store,
+            new RunnerInstance { Id = "i", RunnerName = "agent-1", ProfileId = "azdo" });
+
+        Assert.Equal(ProviderRunnerActivity.NotSupported, activity);
+    }
+
+    // A GitHub App installed on several owners: the org lookup for the event's owner must use
+    // the event's installation. It used to fall back to the credential's default installation
+    // (another owner), whose token cannot see the Clancey org's runners.
+    [Fact]
+    public async Task GetProviderRunnerActivity_OrgLookup_UsesTheEventsAppInstallation()
+    {
+        using var rsa = System.Security.Cryptography.RSA.Create(2048);
+        var api = new FakeProviderHttpApi()
+            .Respond(
+                r => r.Method == HttpMethod.Post && r.RequestUri!.AbsolutePath.StartsWith("/app/installations/", StringComparison.Ordinal),
+                r =>
+                {
+                    var id = r.RequestUri!.AbsolutePath.Split('/')[3];
+                    var expires = DateTimeOffset.UtcNow.AddMinutes(30).ToString("O");
+                    return FakeProviderHttpApi.JsonResponse(
+                        "{\"token\":\"inst-" + id + "\",\"expires_at\":\"" + expires + "\"}",
+                        HttpStatusCode.Created);
+                })
+            .RespondJson(IsRepoLookup, RunnersJson())
+            .Respond(IsOrgLookup, r => r.Headers.Authorization?.Parameter == "inst-222"
+                ? FakeProviderHttpApi.JsonResponse(RunnersJson((ProbedRunner, true)))
+                : FakeProviderHttpApi.JsonResponse("{\"message\":\"Not Found\"}", HttpStatusCode.NotFound))
+            .RespondJson(IsOwnerLookup, "{\"login\":\"Clancey\",\"type\":\"Organization\"}");
+        var store = TestDocumentStore.Create();
+        await store.Insert(new ProviderCredential
+        {
+            Id = "cred-app",
+            Name = "multi-app",
+            Provider = RunnerProvider.GitHubActions,
+            GitHubAuthType = GitHubAuthType.GitHubApp,
+            GitHubAppId = "98765",
+            GitHubAppPrivateKey = rsa.ExportPkcs8PrivateKeyPem(),
+            GitHubAppInstallations =
+            [
+                new GitHubAppInstallation { Owner = "other-org", InstallationId = "111", IsDefault = true },
+                new GitHubAppInstallation { Owner = "Clancey", InstallationId = "222" }
+            ]
+        });
+        await store.Insert(new RunnerProfile
+        {
+            Id = "fp-linux",
+            Name = "FashionPact-Linux",
+            Provider = RunnerProvider.GitHubActions,
+            ProviderCredentialId = "cred-app"
+        });
+        await store.Insert(new WebhookEvent
+        {
+            Id = "evt-118618052121",
+            Action = "queued",
+            Status = "provisioned",
+            Repository = "Clancey/FashionPactPos",
+            JobId = "118618052121",
+            GitHubInstallationId = "222",
+            Provider = RunnerProvider.GitHubActions.ToString()
+        });
+        var instance = new RunnerInstance
+        {
+            Id = "inst-383f99c0",
+            RunnerName = ProbedRunner,
+            ProfileId = "fp-linux",
+            WebhookEventId = "evt-118618052121",
+            JobId = "118618052121",
+            ProvisioningMode = "dynamic"
+        };
+        var provider = new GitHubActionsProvider(
+            api,
+            new GitHubAuthenticationService(api, NullLogger<GitHubAuthenticationService>.Instance),
+            NullLogger<GitHubActionsProvider>.Instance);
+        var service = new RunnerRegistrationCleanupService([provider], NullLogger<RunnerRegistrationCleanupService>.Instance);
+
+        Assert.Equal(ProviderRunnerActivity.Busy, await service.GetProviderRunnerActivityAsync(store, instance));
+        var orgLookups = api.Requests.Where(r => r.Uri?.AbsolutePath == "/orgs/Clancey/actions/runners").ToList();
+        Assert.NotEmpty(orgLookups);
+        Assert.All(orgLookups, r => Assert.Equal("inst-222", r.Authorization?.Parameter));
+    }
+
+    private static bool IsRepoLookup(HttpRequestMessage request) =>
+        request.Method == HttpMethod.Get
+        && request.RequestUri!.AbsolutePath == "/repos/Clancey/FashionPactPos/actions/runners";
+
+    private static bool IsOwnerLookup(HttpRequestMessage request) =>
+        request.Method == HttpMethod.Get
+        && request.RequestUri!.AbsolutePath == "/users/Clancey";
+
+    private static bool IsOrgLookup(HttpRequestMessage request) =>
+        request.Method == HttpMethod.Get
+        && request.RequestUri!.AbsolutePath == "/orgs/Clancey/actions/runners";
+
+    private static string RunnersJson(params (string Name, bool Busy)[] runners)
+    {
+        var items = runners.Select((r, i) =>
+            $$"""{"id":{{i + 1}},"name":"{{r.Name}}","os":"Linux","status":"online","busy":{{(r.Busy ? "true" : "false")}}}""");
+        return $$"""{"total_count":{{runners.Length}},"runners":[{{string.Join(",", items)}}]}""";
+    }
+
+    private static async Task<(RunnerRegistrationCleanupService Service, IDocumentStore Store, RunnerInstance Instance)> ActivityScenarioAsync(
+        FakeProviderHttpApi api,
+        string? credentialRepo = null,
+        string? webhookRepository = "Clancey/FashionPactPos")
+    {
+        var store = TestDocumentStore.Create();
+        await store.Insert(new ProviderCredential
+        {
+            Id = "cred-gh",
+            Name = "github",
+            Provider = RunnerProvider.GitHubActions,
+            GitHubOrg = "Clancey",
+            GitHubRepo = credentialRepo,
+            GitHubToken = "ghp_test"
+        });
+        await store.Insert(new RunnerProfile
+        {
+            Id = "fp-linux",
+            Name = "FashionPact-Linux",
+            Provider = RunnerProvider.GitHubActions,
+            ProviderCredentialId = "cred-gh"
+        });
+        await store.Insert(new WebhookEvent
+        {
+            Id = "evt-118618052121",
+            Action = "queued",
+            Status = "provisioned",
+            Repository = webhookRepository,
+            JobId = "118618052121",
+            Provider = RunnerProvider.GitHubActions.ToString()
+        });
+
+        var instance = new RunnerInstance
+        {
+            Id = "inst-383f99c0",
+            RunnerName = ProbedRunner,
+            ProfileId = "fp-linux",
+            WebhookEventId = "evt-118618052121",
+            JobId = "118618052121",
+            ProvisioningMode = "dynamic"
+        };
+
+        var provider = new GitHubActionsProvider(
+            api,
+            new GitHubAuthenticationService(api, NullLogger<GitHubAuthenticationService>.Instance),
+            NullLogger<GitHubActionsProvider>.Instance);
+        var service = new RunnerRegistrationCleanupService([provider], NullLogger<RunnerRegistrationCleanupService>.Instance);
+        return (service, store, instance);
     }
 }

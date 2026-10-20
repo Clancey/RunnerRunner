@@ -23,5 +23,6 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="RunnerRunner.Agent.Tests" />
+    <InternalsVisibleTo Include="RunnerRunner.HostWorker.Tests" />
   </ItemGroup>
 </Project>

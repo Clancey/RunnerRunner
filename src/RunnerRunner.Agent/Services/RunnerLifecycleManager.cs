@@ -152,10 +152,18 @@ public class RunnerLifecycleManager
             {
                 health = await runner.Backend.GetHealthAsync(runner.InstanceHandle, ct);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Health check failed for runner {RunnerName} ({InstanceId})", runner.RunnerName, instanceId);
-                health = new RunnerHealthStatus { IsRunning = false, Status = "health_check_failed" };
+                // Backends answer "not running" for a VM/container/process that is gone, so an
+                // exception only means the backend could not be asked (Docker API error, a
+                // `tart` launch failure). Reporting that as an exit makes the server end and
+                // deregister a runner that may be mid-job; keep tracking it and say unknown.
+                _logger.LogWarning(ex, "Health check failed for runner {RunnerName} ({InstanceId}); reporting its state as unknown", runner.RunnerName, instanceId);
+                health = new RunnerHealthStatus { IsRunning = true, Status = "health_check_failed" };
             }
 
             if (!health.IsRunning)

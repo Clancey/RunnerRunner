@@ -121,6 +121,34 @@ public class StopRunnerCommand
     public string InstanceId { get; set; } = "";
     [Id(1)]
     public string? InstanceHandle { get; set; }
+
+    /// <summary>
+    /// The backend that owns <see cref="InstanceHandle"/>. When the HostWorker no longer
+    /// tracks the instance it can only stop by handle, and the handle alone is ambiguous:
+    /// a native PID is also a syntactically valid Tart VM name.
+    /// </summary>
+    [Id(2)]
+    public ExecutionBackend? Backend { get; set; }
+
+    /// <summary>
+    /// Builds a stop command for an instance record, naming the backend that owns its
+    /// handle. The handle precedence matches what the HostWorker reports when a runner starts.
+    /// </summary>
+    public static StopRunnerCommand ForInstance(
+        string instanceId,
+        string? containerId,
+        string? vmName,
+        int? processId)
+    {
+        if (!string.IsNullOrWhiteSpace(containerId))
+            return new StopRunnerCommand { InstanceId = instanceId, InstanceHandle = containerId, Backend = ExecutionBackend.Docker };
+        if (!string.IsNullOrWhiteSpace(vmName))
+            return new StopRunnerCommand { InstanceId = instanceId, InstanceHandle = vmName, Backend = ExecutionBackend.Tart };
+        if (processId.HasValue)
+            return new StopRunnerCommand { InstanceId = instanceId, InstanceHandle = processId.Value.ToString(), Backend = ExecutionBackend.Native };
+
+        return new StopRunnerCommand { InstanceId = instanceId };
+    }
 }
 
 [GenerateSerializer]
@@ -515,6 +543,20 @@ public class ReconciliationReport
     public required string HostId { get; set; }
     [Id(1)]
     public List<DiscoveredRunnerInfo> Runners { get; set; } = [];
+    /// <summary>
+    /// Backends whose resources could not be listed for this report. Their runners are
+    /// absent from <see cref="Runners"/> because the host could not look, not because they
+    /// are gone, so the server must not treat that absence as an exit.
+    /// </summary>
+    [Id(2)]
+    public List<ExecutionBackend> UnavailableBackends { get; set; } = [];
+    /// <summary>
+    /// True when the sender fills in <see cref="UnavailableBackends"/>. A HostWorker built
+    /// before that field existed sends an empty list even when discovery failed, so the
+    /// server must not read a runner's absence from such a report as an exit.
+    /// </summary>
+    [Id(3)]
+    public bool ReportsBackendAvailability { get; set; }
 }
 
 /// <summary>

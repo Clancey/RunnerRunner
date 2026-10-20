@@ -239,24 +239,33 @@ public class RunnerLifecycleManagerTests
         Assert.Equal(["handle-stop-fails"], backend.StopRequests);
     }
 
+    // A backend that cannot be asked (Docker API error, `tart` failing to launch) says nothing
+    // about the runner. Reporting it exited made the HostWorker publish RunnerExited, and the
+    // server then marked the runner crashed and deregistered it while its job kept running.
     [Fact]
-    public async Task CollectRunnerHealth_WhenBackendThrows_ReturnsFailedSnapshotAndRemovesRunner()
+    public async Task CollectRunnerHealth_WhenBackendThrows_KeepsTrackingAndReportsStateUnknown()
     {
         var manager = new RunnerLifecycleManager(_logger);
         var backend = new FakeRunnerBackend
         {
-            StartHandler = _ => new RunnerInstanceInfo { InstanceHandle = "handle-health-fails", RunnerName = "health-fails" },
-            HealthAsyncHandler = (_, _) => throw new TimeoutException("health timed out")
+            BackendType = ExecutionBackend.Tart,
+            StartHandler = _ => new RunnerInstanceInfo { InstanceHandle = "rr-FashionPact-macOS-VM-jit-44578a61", RunnerName = "FashionPact-macOS-VM-jit-44578a61" },
+            HealthAsyncHandler = (_, _) => throw new TimeoutException("tart ip timed out")
         };
         await manager.StartRunnerAsync(
-            new DeployRunnerCommand { InstanceId = "health-fails-1", ProfileId = "p1", RunnerName = "health-fails" },
+            new DeployRunnerCommand { InstanceId = "02b717c2", ProfileId = "p1", RunnerName = "FashionPact-macOS-VM-jit-44578a61" },
             backend);
 
-        var snapshots = await manager.CollectRunnerHealthAsync();
-
-        var snapshot = Assert.Single(snapshots);
-        Assert.False(snapshot.Health.IsRunning);
+        var snapshot = Assert.Single(await manager.CollectRunnerHealthAsync());
+        Assert.True(snapshot.Health.IsRunning);
         Assert.Equal("health_check_failed", snapshot.Health.Status);
+        Assert.True(manager.RunningInstances.ContainsKey("02b717c2"));
+
+        // Once the backend answers again, the real state is reported.
+        backend.HealthAsyncHandler = null;
+        backend.HealthByHandle["rr-FashionPact-macOS-VM-jit-44578a61"] = new RunnerHealthStatus { IsRunning = false, Status = "stopped" };
+        var after = Assert.Single(await manager.CollectRunnerHealthAsync());
+        Assert.False(after.Health.IsRunning);
         Assert.Empty(manager.RunningInstances);
     }
 }

@@ -395,6 +395,48 @@ public sealed class GrainStateTests
             && evt.InstanceId == instanceId);
     }
 
+    // Reproduces the 11:51:21 step of the M4ini kill on 2026-10-20. Once a dynamic instance
+    // goes terminal its grain state is purged. Host events that arrive afterwards (here:
+    // the next health report and a "crashed: stopped" for the same instance) reactivated
+    // the blank grain, which rewrote the instance document with HostId "" and RunnerName "".
+    // Reconciliation filters records by host, so the Tart VM and native PID the host still
+    // ran no longer had a record and were cleaned up as orphans one second later.
+    [Fact]
+    public async Task RunnerInstanceGrain_CallsAfterDynamicPurge_DoNotBlankTheInstanceDocument()
+    {
+        var hostId = OrleansTestIds.Create("host");
+        var profileId = OrleansTestIds.Create("profile");
+        var instanceId = OrleansTestIds.Create("runner");
+
+        var host = _grainFactory.GetGrain<IHostGrain>(hostId);
+        await host.Register("M4ini", HostPlatform.MacOS, "arm64", "1.0.0");
+
+        var profile = _grainFactory.GetGrain<IProfileGrain>(profileId);
+        await profile.SetProfile(new RunnerProfile
+        {
+            Id = profileId,
+            Name = "FashionPact-macOS-VM",
+            ExecutionBackend = ExecutionBackend.Tart
+        });
+
+        var runner = _grainFactory.GetGrain<IRunnerInstanceGrain>(instanceId);
+        await runner.Initialize(hostId, profileId, "FashionPact-macOS-VM-jit-44578a61", "dynamic", jobId: "118535576689");
+        await runner.MarkStarting("Deploying");
+        await runner.MarkRunning(vmName: "rr-FashionPact-macOS-VM-jit-44578a61", statusMessage: "Running");
+        await runner.MarkCrashed("Health check stale — runner may have crashed");
+
+        await runner.UpdateHealth();
+        await runner.MarkCrashed("stopped");
+        await runner.MarkStopped();
+
+        var document = await _fixture.DocumentStore.Get<RunnerInstance>(instanceId);
+        Assert.NotNull(document);
+        Assert.Equal(hostId, document!.HostId);
+        Assert.Equal("FashionPact-macOS-VM-jit-44578a61", document.RunnerName);
+        Assert.Equal("rr-FashionPact-macOS-VM-jit-44578a61", document.VmName);
+        Assert.Equal(RunnerInstanceStatus.Crashed, document.Status);
+    }
+
     private static long CreatePositiveLong()
     {
         var value = BitConverter.ToInt64(Guid.NewGuid().ToByteArray());

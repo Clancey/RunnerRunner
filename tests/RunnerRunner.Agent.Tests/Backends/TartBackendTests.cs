@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Microsoft.Extensions.Logging.Abstractions;
 using RunnerRunner.Agent.Backends;
 
 namespace RunnerRunner.Agent.Tests.Backends;
@@ -116,4 +117,77 @@ public class TartBackendTests
         Assert.Contains(vms, vm => vm.Name == "rr-lower" && vm.IsRunning);
         Assert.Contains(vms, vm => vm.Name == "rr-upper" && !vm.IsRunning);
     }
+
+    // Reproduces M4ini 2026-10-20 12:37:36Z: after a DarkWake the guest's address was not yet
+    // back in the host's ARP cache, so `tart ip --resolver=arp` failed for
+    // rr-FashionPact-macOS-VM-jit-b848a12a while `tart list` still showed it running and
+    // GitHub showed job 118626348797 in progress on it. The failure was reported as
+    // "stopped", and the server marked instance 8aefd1a6 "crashed: stopped". At 11:51:21 the
+    // same report was followed one second later by cleanup of the live VM.
+    [Fact]
+    public async Task GetHealth_IpLookupFailsWhileVmIsRunning_ReportsRunning()
+    {
+        const string vm = "rr-FashionPact-macOS-VM-jit-b848a12a";
+        var calls = new List<string>();
+        var backend = CreateBackend(calls, args => args switch
+        {
+            _ when args.StartsWith("ip ", StringComparison.Ordinal) => (1, $"no IP address found for {vm}"),
+            "list --format json" => (0, $$"""[{"Name":"{{vm}}","State":"running"},{"Name":"ghcr.io/cirruslabs/macos","State":"stopped"}]"""),
+            _ => throw new InvalidOperationException($"unexpected tart {args}")
+        });
+
+        var health = await backend.GetHealthAsync(vm);
+
+        Assert.True(health.IsRunning);
+        Assert.Equal("running", health.Status);
+        Assert.Equal([$"ip {vm} --resolver=arp", "list --format json"], calls);
+    }
+
+    [Fact]
+    public async Task GetHealth_IpAndListBothFail_ReportsUnknownRatherThanStopped()
+    {
+        var backend = CreateBackend([], args => args.StartsWith("ip ", StringComparison.Ordinal)
+            ? (1, "no IP address found")
+            : (1, "tart: could not open VM storage"));
+
+        var health = await backend.GetHealthAsync("rr-vm");
+
+        Assert.True(health.IsRunning);
+        Assert.Equal("unknown", health.Status);
+    }
+
+    [Theory]
+    [InlineData("""[{"Name":"rr-vm","State":"stopped"}]""", "stopped")]
+    [InlineData("""[{"Name":"rr-other","State":"running"}]""", "not_found")]
+    public async Task GetHealth_IpLookupFailsAndVmIsNotRunning_ReportsItGone(string listOutput, string expectedStatus)
+    {
+        var backend = CreateBackend([], args => args.StartsWith("ip ", StringComparison.Ordinal)
+            ? (1, "no IP address found")
+            : (0, listOutput));
+
+        var health = await backend.GetHealthAsync("rr-vm");
+
+        Assert.False(health.IsRunning);
+        Assert.Equal(expectedStatus, health.Status);
+    }
+
+    [Fact]
+    public async Task GetHealth_IpLookupSucceeds_ReportsRunningWithoutListing()
+    {
+        var calls = new List<string>();
+        var backend = CreateBackend(calls, _ => (0, "192.168.64.12"));
+
+        var health = await backend.GetHealthAsync("rr-vm");
+
+        Assert.True(health.IsRunning);
+        Assert.Equal(["ip rr-vm --resolver=arp"], calls);
+    }
+
+    private static TartBackend CreateBackend(List<string> calls, Func<string, (int ExitCode, string Output)> tart)
+        => new(NullLogger<TartBackend>.Instance, (command, arguments, _) =>
+        {
+            Assert.Equal("tart", command);
+            calls.Add(arguments);
+            return Task.FromResult(tart(arguments));
+        });
 }

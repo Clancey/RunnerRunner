@@ -12,6 +12,17 @@ using Shiny.DocumentDb;
 
 namespace RunnerRunner.Server.Grains;
 
+/// <summary>
+/// Optional timing overrides for <see cref="RunnerInstanceGrain"/>. Production uses the
+/// defaults; register an instance in DI to shorten them (tests).
+/// </summary>
+public sealed class RunnerInstanceGrainOptions
+{
+    public TimeSpan HealthStaleTimeout { get; set; } = TimeSpan.FromMinutes(3);
+
+    public TimeSpan DynamicJobTimeout { get; set; } = TimeSpan.FromHours(2);
+}
+
 // TODO: Add host-affinity grain placement so this grain activates on the silo
 // whose "hostId" metadata matches the runner's assigned host. This enables
 // local backend execution (Docker/Tart/Native) without process-local service lookups.
@@ -27,6 +38,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
     private IGrainTimer? _dynamicTimer;
     private IGrainTimer? _stopTimer;
     private IGrainTimer? _healthTimer;
+    private bool _loggedPurgedCall;
+
+    internal const string HealthStaleMessagePrefix = "Health check stale";
 
     public RunnerInstanceGrain(
         [PersistentState("runner", "PersistentStore")]
@@ -82,6 +96,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task MarkDeployed()
     {
+        if (IgnoreIfPurged(nameof(MarkDeployed)))
+            return;
+
         _state.State.DeployedAt = DateTime.UtcNow;
         RecordStatusTransition(_state.State.Status, "Deployed to host", "grain_call");
         await _state.WriteStateAsync();
@@ -96,6 +113,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task MarkStarting(string? statusMessage = null)
     {
+        if (IgnoreIfPurged(nameof(MarkStarting)))
+            return;
+
         var wasActive = IsConsumingHostCapacity(_state.State.Status);
         _state.State.Status = RunnerInstanceStatus.Starting;
         if (statusMessage != null)
@@ -114,6 +134,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task MarkRunning(string? containerId = null, string? vmName = null, int? processId = null, string? statusMessage = null)
     {
+        if (IgnoreIfPurged(nameof(MarkRunning)))
+            return;
+
         var wasActive = IsConsumingHostCapacity(_state.State.Status);
         _state.State.Status = RunnerInstanceStatus.Running;
         _state.State.ContainerId = containerId;
@@ -143,6 +166,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task MarkStopping()
     {
+        if (IgnoreIfPurged(nameof(MarkStopping)))
+            return;
+
         _state.State.Status = RunnerInstanceStatus.Stopping;
         RecordStatusTransition(RunnerInstanceStatus.Stopping, "Stopping", "grain_call");
         await _state.WriteStateAsync();
@@ -157,6 +183,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task MarkStopped()
     {
+        if (IgnoreIfPurged(nameof(MarkStopped)))
+            return;
+
         var wasActive = IsConsumingHostCapacity(_state.State.Status);
         _state.State.Status = RunnerInstanceStatus.Stopped;
         _state.State.StoppedAt = DateTime.UtcNow;
@@ -176,6 +205,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task MarkFailed(string error)
     {
+        if (IgnoreIfPurged(nameof(MarkFailed)))
+            return;
+
         var wasActive = IsConsumingHostCapacity(_state.State.Status);
         _state.State.Status = RunnerInstanceStatus.Failed;
         _state.State.ErrorMessage = error;
@@ -195,6 +227,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task MarkCrashed(string reason)
     {
+        if (IgnoreIfPurged(nameof(MarkCrashed)))
+            return;
+
         var wasActive = IsConsumingHostCapacity(_state.State.Status);
         _state.State.Status = RunnerInstanceStatus.Crashed;
         _state.State.ErrorMessage = reason;
@@ -214,9 +249,14 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task UpdateHealth(string? statusMessage = null)
     {
+        if (IgnoreIfPurged(nameof(UpdateHealth)))
+            return;
+
         _state.State.LastHealthCheck = DateTime.UtcNow;
         if (statusMessage != null)
             _state.State.StatusMessage = statusMessage;
+        else if (_state.State.StatusMessage?.StartsWith(HealthStaleMessagePrefix, StringComparison.Ordinal) == true)
+            _state.State.StatusMessage = "Running";
 
         await _state.WriteStateAsync();
 
@@ -228,6 +268,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task UpdateStatusMessage(string message)
     {
+        if (IgnoreIfPurged(nameof(UpdateStatusMessage)))
+            return;
+
         _state.State.StatusMessage = message;
         await _state.WriteStateAsync();
         await PublishStatusChange();
@@ -236,6 +279,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     public async Task SetJobClaim(string? jobId, string reason)
     {
+        if (IgnoreIfPurged(nameof(SetJobClaim)))
+            return;
+
         var normalized = string.IsNullOrWhiteSpace(jobId) ? null : jobId;
         if (string.Equals(_state.State.JobId, normalized, StringComparison.Ordinal))
             return;
@@ -285,13 +331,20 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
         }
     }
 
-    private async Task OnDynamicJobTimeout(CancellationToken ct)
+    private Task OnDynamicJobTimeout(CancellationToken ct)
     {
         if (_state.State.Status == RunnerInstanceStatus.Running && IsDynamic())
         {
-            _logger.LogWarning("Runner instance {InstanceId} dynamic job timeout", this.GetPrimaryKeyString());
-            await MarkFailed("Dynamic runner timeout — no completion webhook received within 2 hours");
+            // No completion webhook says nothing about whether the job is still running: jobs
+            // outlive this window and webhooks get lost. Failing here purged the grain and the
+            // host's live resource was then cleaned up as an orphan. RunnerTimeoutService owns
+            // ending long-running dynamic runners, and asks the provider before it does.
+            _logger.LogWarning(
+                "Runner instance {InstanceId} has been running {Timeout} without a completion webhook; leaving it to RunnerTimeoutService",
+                this.GetPrimaryKeyString(), DynamicJobTimeout);
         }
+
+        return Task.CompletedTask;
     }
 
     private async Task OnStopTimeout(CancellationToken ct)
@@ -307,13 +360,30 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
     {
         var lastSeenAt = _state.State.LastHealthCheck ?? _state.State.StartedAt;
 
-        if (_state.State.Status == RunnerInstanceStatus.Running
-            && lastSeenAt.HasValue
-            && (DateTime.UtcNow - lastSeenAt.Value).TotalMinutes >= 3)
+        if (_state.State.Status != RunnerInstanceStatus.Running
+            || !lastSeenAt.HasValue
+            || DateTime.UtcNow - lastSeenAt.Value < HealthStaleTimeout)
         {
-            _logger.LogWarning("Runner instance {InstanceId} health check stale", this.GetPrimaryKeyString());
-            await MarkCrashed("Health check stale — runner may have crashed");
+            return;
         }
+
+        // Missing health reports mean the server cannot see the runner, not that the runner
+        // died: a sleeping host or a dropped tunnel stops reports while the VM/process keeps
+        // building. Marking it crashed here purges the grain, after which the host's live
+        // resource looks like an orphan and gets cleaned up mid-job. Only the host reporting
+        // the runner exited (or the provider reporting it idle/gone) may end it.
+        var message = $"{HealthStaleMessagePrefix} since {lastSeenAt.Value:u} — awaiting host confirmation";
+        _logger.LogWarning(
+            "Runner instance {InstanceId} health check stale (last seen {LastSeen:u}); keeping it Running until the host confirms it exited",
+            this.GetPrimaryKeyString(), lastSeenAt.Value);
+
+        if (string.Equals(_state.State.StatusMessage, message, StringComparison.Ordinal))
+            return;
+
+        _state.State.StatusMessage = message;
+        await _state.WriteStateAsync();
+        await PublishStatusChange();
+        await SyncToDocumentDb();
     }
 
     // --- Timer management ---
@@ -352,7 +422,7 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
             null,
             new GrainTimerCreationOptions
             {
-                DueTime = TimeSpan.FromHours(2),
+                DueTime = DynamicJobTimeout,
                 Period = Timeout.InfiniteTimeSpan
             });
     }
@@ -378,9 +448,40 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
             null,
             new GrainTimerCreationOptions
             {
-                DueTime = TimeSpan.FromMinutes(3),
+                DueTime = HealthStaleTimeout,
                 Period = Timeout.InfiniteTimeSpan
             });
+    }
+
+    private TimeSpan HealthStaleTimeout =>
+        _serviceProvider.GetService<RunnerInstanceGrainOptions>()?.HealthStaleTimeout ?? TimeSpan.FromMinutes(3);
+
+    private TimeSpan DynamicJobTimeout =>
+        _serviceProvider.GetService<RunnerInstanceGrainOptions>()?.DynamicJobTimeout ?? TimeSpan.FromHours(2);
+
+    /// <summary>
+    /// A dynamic instance's state is cleared once it reaches a terminal status. Any later
+    /// call (a late health report, a duplicate stop) re-activates a blank grain; writing
+    /// that through would overwrite the instance's document with an empty host and runner
+    /// name, which makes reconciliation treat the still-running resource as an orphan.
+    /// </summary>
+    private bool IsPurged =>
+        string.IsNullOrEmpty(_state.State.HostId) && string.IsNullOrEmpty(_state.State.RunnerName);
+
+    private bool IgnoreIfPurged(string operation)
+    {
+        if (!IsPurged)
+            return false;
+
+        if (!_loggedPurgedCall)
+        {
+            _loggedPurgedCall = true;
+            _logger.LogWarning(
+                "Ignoring {Operation} for runner instance {InstanceId}: its grain state was already purged",
+                operation, this.GetPrimaryKeyString());
+        }
+
+        return true;
     }
 
     private static void CancelTimer(ref IGrainTimer? timer)
@@ -439,6 +540,9 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
 
     private async Task SyncToDocumentDb()
     {
+        if (IsPurged)
+            return;
+
         try
         {
             using var scope = _serviceProvider.CreateScope();

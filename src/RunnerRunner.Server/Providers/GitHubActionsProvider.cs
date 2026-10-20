@@ -118,6 +118,80 @@ public class GitHubActionsProvider : IRunnerProviderPlugin
         listResponse.EnsureSuccessStatusCode();
 
         var json = await listResponse.Content.ReadFromJsonAsync<JsonElement>(ct);
+        return ParseRunnerRegistrations(json);
+    }
+
+    /// <summary>
+    /// Looks up a single runner registration by exact name in one explicit scope: the
+    /// repository when <paramref name="repository"/> is set, otherwise the owner's org.
+    /// Returns null when that scope has no runner with the name; throws when GitHub
+    /// cannot be asked (the caller must treat that as unknown, never as idle).
+    /// </summary>
+    internal async Task<GitHubRunnerRegistration?> FindRunnerRegistrationAsync(
+        ProviderCredential credential,
+        string? repository,
+        string? owner,
+        string runnerName,
+        CancellationToken ct = default,
+        string? installationId = null)
+    {
+        var apiUrl = credential.GitHubApiUrl?.TrimEnd('/') ?? "https://api.github.com";
+        string listUrl;
+        if (!string.IsNullOrWhiteSpace(repository))
+        {
+            var parts = repository.Trim().Trim('/').Split('/', 2);
+            if (parts.Length != 2)
+                throw new ArgumentException($"'{repository}' is not an owner/repo name.", nameof(repository));
+            listUrl = $"{apiUrl}/repos/{parts[0]}/{parts[1]}/actions/runners";
+        }
+        else if (!string.IsNullOrWhiteSpace(owner))
+        {
+            listUrl = $"{apiUrl}/orgs/{owner.Trim()}/actions/runners";
+        }
+        else
+        {
+            throw new ArgumentException("A repository or owner scope is required.", nameof(owner));
+        }
+
+        using var request = await _gitHubAuth.CreateRequestAsync(
+            HttpMethod.Get,
+            $"{listUrl}?name={Uri.EscapeDataString(runnerName)}&per_page=100",
+            credential,
+            installationId: installationId,
+            repository: repository,
+            ct: ct);
+        var response = await _httpFactory.CreateClient().SendAsync(request, ct);
+        response.EnsureSuccessStatusCode();
+
+        var json = await response.Content.ReadFromJsonAsync<JsonElement>(ct);
+        return ParseRunnerRegistrations(json)
+            .FirstOrDefault(r => string.Equals(r.Name, runnerName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Returns the GitHub account type of <paramref name="owner"/> ("User" or
+    /// "Organization"); throws when GitHub cannot be asked.
+    /// </summary>
+    internal async Task<string?> GetOwnerAccountTypeAsync(
+        ProviderCredential credential,
+        string owner,
+        CancellationToken ct = default)
+    {
+        var apiUrl = credential.GitHubApiUrl?.TrimEnd('/') ?? "https://api.github.com";
+        using var request = await _gitHubAuth.CreateRequestAsync(
+            HttpMethod.Get,
+            $"{apiUrl}/users/{Uri.EscapeDataString(owner.Trim())}",
+            credential,
+            ct: ct);
+        var response = await _httpFactory.CreateClient().SendAsync(request, ct);
+        response.EnsureSuccessStatusCode();
+
+        var json = await response.Content.ReadFromJsonAsync<JsonElement>(ct);
+        return json.TryGetProperty("type", out var type) ? type.GetString() : null;
+    }
+
+    private static List<GitHubRunnerRegistration> ParseRunnerRegistrations(JsonElement json)
+    {
         var runners = new List<GitHubRunnerRegistration>();
 
         foreach (var runner in json.GetProperty("runners").EnumerateArray())
