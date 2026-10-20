@@ -83,9 +83,11 @@ public class TartRunnerEnvironmentGuardTests
     }
 
     [Theory]
-    [InlineData(TartLaunch.GitHubJit)]
-    [InlineData(TartLaunch.GitHubStatic)]
-    public async Task UnexportableNameIsSkippedWithoutEchoingItsValue(TartLaunch launch)
+    [InlineData(TartLaunch.GitHubJit, false)]
+    [InlineData(TartLaunch.GitHubStatic, false)]
+    [InlineData(TartLaunch.GitHubJit, true)]
+    [InlineData(TartLaunch.GitHubStatic, true)]
+    public async Task UnexportableNameIsSkippedWithoutEchoingItsValue(TartLaunch launch, bool postExit)
     {
         if (OperatingSystem.IsWindows())
             return;
@@ -97,7 +99,7 @@ public class TartRunnerEnvironmentGuardTests
             ["ASC_KEY_ID"] = "ABC123XYZ",
         };
 
-        var failure = await Record.ExceptionAsync(() => guest.SetupAsync(launch, env, postExit: false));
+        var failure = await Record.ExceptionAsync(() => guest.SetupAsync(launch, env, postExit));
 
         Assert.DoesNotContain(guest.Sentinel, failure?.ToString() ?? "");
         Assert.Null(failure);
@@ -105,6 +107,9 @@ public class TartRunnerEnvironmentGuardTests
         Assert.Equal("ABC123XYZ", runner.Env.GetValueOrDefault("ASC_KEY_ID"));
         Assert.Contains(guest.Logs, line => line.Contains("BAD-NAME"));
         Assert.DoesNotContain(guest.Logs, line => line.Contains(guest.Sentinel));
+        if (postExit)
+            await guest.WaitForPostExitAsync();
+        guest.AssertNotPersisted(guest.Sentinel);
     }
 }
 
