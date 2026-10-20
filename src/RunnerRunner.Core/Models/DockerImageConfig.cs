@@ -17,4 +17,17 @@ public class DockerImageConfig
     public PullPolicy PullPolicy { get; set; } = PullPolicy.IfNotPresent;
     [Id(5)]
     public string? CredentialId { get; set; }
+    [Id(6)]
+    public DockerScratchConfig? Scratch { get; set; }
+
+    public DockerImageConfig Clone() => new()
+    {
+        Id = Id,
+        RegistryUrl = RegistryUrl,
+        ImageName = ImageName,
+        Tag = Tag,
+        PullPolicy = PullPolicy,
+        CredentialId = CredentialId,
+        Scratch = Scratch?.Clone()
+    };
 }

@@ -960,15 +960,8 @@ public class DynamicProvisioningService : BackgroundService
 
         if (docker != null)
         {
-            docker = new DockerImageConfig
-            {
-                Id = docker.Id,
-                RegistryUrl = docker.RegistryUrl,
-                ImageName = docker.ImageName,
-                Tag = imageTagOverride,
-                PullPolicy = docker.PullPolicy,
-                CredentialId = docker.CredentialId
-            };
+            docker = docker.Clone();
+            docker.Tag = imageTagOverride;
             applied = imageTagOverride;
         }
 

@@ -236,6 +236,12 @@
             @if (editProfile.ExecutionBackend == ExecutionBackend.Docker)
             {
                 <h6 class="mt-3">Docker Image Configuration</h6>
+                @if (profileError != null)
+                {
+                    <div class="alert alert-danger" role="alert">@profileError</div>
+                }
+                <DockerScratchEditor @bind-Value="dockerScratch" Platform="editProfile.RequiredHostPlatform"
+                                     Ephemeral="editProfile.Ephemeral" Provider="editProfile.Provider" />
                 <button type="button" class="btn btn-sm btn-outline-primary mb-3" @onclick="() => OpenProfileImagePicker(RegistryType.Docker)">
                     <i class="bi bi-search me-1"></i>Find image and tag
                 </button>
@@ -730,6 +736,8 @@
     private RunnerProfile editProfile = new() { Name = "" };
     private bool showForm;
     private bool isEditing;
+    private string? profileError;
+    private DockerScratchConfig? dockerScratch;
 
     // Filter & sort state
     private string searchText = "";
@@ -887,6 +895,8 @@
     private void EditProfile(RunnerProfile profile)
     {
         editProfile = profile;
+        profileError = null;
+        dockerScratch = profile.DockerConfig?.Scratch?.Clone();
         editLabels = [.. profile.Labels];
         newLabelInput = "";
         selectedEnvVarSetIds = [.. profile.EnvironmentVariableSetIds];
@@ -978,6 +988,12 @@
 
     private async Task SaveProfile()
     {
+        profileError = editProfile.ExecutionBackend == ExecutionBackend.Docker
+            ? dockerScratch?.GetValidationError(editProfile.RequiredHostPlatform, editProfile.Ephemeral, editProfile.Provider, jitDispatch: true)
+            : null;
+        if (profileError != null)
+            return;
+
         editProfile.Labels = [.. editLabels];
         editProfile.EnvironmentVariableSetIds = [.. selectedEnvVarSetIds];
         editProfile.EnvironmentOverrides = new Dictionary<string, string>(profileEnvOverrides);
@@ -1001,7 +1017,8 @@
                 RegistryUrl = dockerRegistry,
                 ImageName = dockerImage,
                 Tag = dockerTag,
-                PullPolicy = dockerPullPolicy
+                PullPolicy = dockerPullPolicy,
+                Scratch = dockerScratch?.Clone()
             };
             editProfile.TartConfig = null;
         }
@@ -1179,6 +1196,8 @@
 
     private void ResetImageFields()
     {
+        dockerScratch = null;
+        profileError = null;
         dockerRegistry = "ghcr.io"; dockerImage = ""; dockerTag = "latest";
         dockerPullPolicy = PullPolicy.IfNotPresent;
         tartRegistry = "ghcr.io"; tartImage = ""; tartTag = "latest";

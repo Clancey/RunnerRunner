@@ -302,6 +302,12 @@ Custom steps receive the runner environment plus their own environment variable 
 
 All backends receive the same `DeployRunnerCommand` shape: instance ID, runner target/profile compatibility ID, runner name, backend, provider, labels, environment variables, image config, runner URL/token/JIT config, work paths, registry credentials, and resolved custom steps.
 
+Docker targets and legacy profiles can opt into nullable `DockerImageConfig.Scratch` for Linux one-job GitHub
+JIT runners. The Docker backend then mounts capped, empty tmpfs at the runner work directory and `/tmp`, without
+host binds or sockets. Starts without a JIT config (static or scale-set dispatch of a shared profile) log a
+warning and run without scratch. The caps are not container memory limits or host memory admission.
+See [tmpfs configuration, budgeting and verification](README.md#opt-in-docker-tmpfs-scratch).
+
 ## Runner lifecycle and health
 
 Runner instances follow this lifecycle:
