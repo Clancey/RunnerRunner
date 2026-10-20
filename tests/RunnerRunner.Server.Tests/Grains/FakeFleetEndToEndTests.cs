@@ -5,6 +5,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Orleans.Runtime;
 using RunnerRunner.Core.Hub;
 using RunnerRunner.Core.Models;
 using RunnerRunner.Server.Grains.Interfaces;
@@ -228,6 +229,398 @@ public sealed class FakeFleetEndToEndTests
         }
     }
 
+    [Fact]
+    public async Task GitHubDockerWebhookFleet_UnplaceableEarlierJobDoesNotBlockPlaceableJobInSameLane()
+    {
+        // Reproduces #5: an earlier Linux/docker job that requests a label no host advertises sat in
+        // pending_host_match forever and held every later Linux/docker job in pending_fifo.
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-hol");
+        var hostId = $"{id}-host";
+        var unplaceableProfileId = $"{id}-fp-profile";
+        var placeableProfileId = $"{id}-nsr-profile";
+        var unplaceableSecret = $"{id}-fp-secret";
+        var placeableSecret = $"{id}-nsr-secret";
+        var unplaceableRepo = "octo/fashionpact";
+        var placeableRepo = "octo/nosaferoom";
+        var unplaceableTargetLabels = new[] { "self-hosted", "linux", "fleet-fp-linux" };
+        var unplaceableJobLabels = unplaceableTargetLabels.Append("fleet-fp-scratch-probe").ToArray();
+        var placeableLabels = new[] { "self-hosted", "linux", "fleet-nsr-apple" };
+        var service = CreateDynamicProvisioningService();
+        var host = await CreateHostAsync(hostId, HostPlatform.Linux, ExecutionBackend.Docker);
+        await CreateProfileAsync(
+            unplaceableProfileId,
+            "fp-docker",
+            RunnerProvider.GitHubActions,
+            HostPlatform.Linux,
+            ExecutionBackend.Docker,
+            unplaceableTargetLabels);
+        await CreateProfileAsync(
+            placeableProfileId,
+            "nsr-docker",
+            RunnerProvider.GitHubActions,
+            HostPlatform.Linux,
+            ExecutionBackend.Docker,
+            placeableLabels);
+        await CreateWebhookRuleAsync($"{id}-fp-rule", "fp docker", RunnerProvider.GitHubActions, unplaceableSecret, unplaceableRepo, unplaceableProfileId, unplaceableTargetLabels, hostId);
+        await CreateWebhookRuleAsync($"{id}-nsr-rule", "nsr docker", RunnerProvider.GitHubActions, placeableSecret, placeableRepo, placeableProfileId, placeableLabels, hostId);
+
+        var unplaceable = await ProcessWebhookAsync("github", "queued", NextJobId(), unplaceableRepo, unplaceableJobLabels, unplaceableSecret);
+        await service.ProcessQueuedWebhookEventOnceAsync(unplaceable.EventId!, unplaceableProfileId);
+
+        var unplaceableEvent = await _store.Get<WebhookEvent>(unplaceable.EventId!);
+        Assert.NotNull(unplaceableEvent);
+        Assert.Equal("pending_host_match", unplaceableEvent.Status);
+        Assert.Contains("No host matches", unplaceableEvent.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(unplaceableEvent.InstanceId);
+
+        var placeable = await ProcessWebhookAsync("github", "queued", NextJobId(), placeableRepo, placeableLabels, placeableSecret);
+        await service.ProcessQueuedWebhookEventOnceAsync(placeable.EventId!, placeableProfileId);
+
+        var placeableEvent = await _store.Get<WebhookEvent>(placeable.EventId!);
+        Assert.NotNull(placeableEvent);
+        Assert.True(
+            placeableEvent.Status == "provisioned",
+            $"Placeable job should dispatch past the unplaceable one, but is '{placeableEvent.Status}': {placeableEvent.Error}");
+        Assert.False(string.IsNullOrWhiteSpace(placeableEvent.InstanceId));
+        var deploy = FindDeployCommand(hostId, placeableEvent.InstanceId!);
+        Assert.Contains("fleet-nsr-apple", deploy.Labels);
+        Assert.Equal(1, GetRunningCount(await host.GetState(), ExecutionBackend.Docker));
+
+        // The unplaceable job is skipped for ordering, not dropped: it keeps waiting for a matching host.
+        var stillWaiting = await _store.Get<WebhookEvent>(unplaceable.EventId!);
+        Assert.NotNull(stillWaiting);
+        Assert.Equal("pending_host_match", stillWaiting.Status);
+        Assert.Null(stillWaiting.InstanceId);
+    }
+
+    [Fact]
+    public async Task GitHubDockerWebhookFleet_EarlierJobWaitingOnDisconnectedHostDoesNotBlockConnectedHost()
+    {
+        // A host can stay persisted as Online with no live HostWorker connection (e.g. after a server
+        // restart). An earlier job that only fits that host must not hold back a later job that can
+        // run on a connected host in the same pool.
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-hol-disc");
+        var pool = $"{id}-pool";
+        var connectedHostId = $"{id}-a";
+        var disconnectedHostId = $"{id}-b";
+        var earlyProfileId = $"{id}-gpu-profile";
+        var laterProfileId = $"{id}-plain-profile";
+        var earlySecret = $"{id}-gpu-secret";
+        var laterSecret = $"{id}-plain-secret";
+        var earlyRepo = "octo/gpu";
+        var laterRepo = "octo/plain";
+        var earlyTargetLabels = new[] { "self-hosted", "linux", "fleet-gpu-linux" };
+        var earlyJobLabels = earlyTargetLabels.Append("fleet-gpu").ToArray();
+        var laterLabels = new[] { "self-hosted", "linux", "fleet-plain-linux" };
+        var service = CreateDynamicProvisioningService();
+        var connectedHost = await CreateHostAsync(connectedHostId, HostPlatform.Linux, ExecutionBackend.Docker);
+        await CreateHostAsync(disconnectedHostId, HostPlatform.Linux, ExecutionBackend.Docker);
+        foreach (var hostId in new[] { connectedHostId, disconnectedHostId })
+        {
+            var document = (await _store.Get<Host>(hostId))!;
+            document.Labels["pool"] = pool;
+            if (hostId == disconnectedHostId)
+                document.Capabilities.Add("fleet-gpu");
+            await _store.Update(document);
+        }
+
+        await CreateProfileAsync(earlyProfileId, "gpu-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, earlyTargetLabels);
+        await CreateProfileAsync(laterProfileId, "plain-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, laterLabels);
+        await CreateWebhookRuleAsync($"{id}-gpu-rule", "gpu docker", RunnerProvider.GitHubActions, earlySecret, earlyRepo, earlyProfileId, earlyTargetLabels, pool);
+        await CreateWebhookRuleAsync($"{id}-plain-rule", "plain docker", RunnerProvider.GitHubActions, laterSecret, laterRepo, laterProfileId, laterLabels, pool);
+        _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: false);
+
+        try
+        {
+            var early = await ProcessWebhookAsync("github", "queued", NextJobId(), earlyRepo, earlyJobLabels, earlySecret);
+            await service.ProcessQueuedWebhookEventOnceAsync(early.EventId!, earlyProfileId);
+
+            var earlyEvent = await _store.Get<WebhookEvent>(early.EventId!);
+            Assert.NotNull(earlyEvent);
+            Assert.Equal("pending_host_match", earlyEvent.Status);
+            Assert.Contains("waiting for it to reconnect", earlyEvent.Error, StringComparison.OrdinalIgnoreCase);
+
+            var later = await ProcessWebhookAsync("github", "queued", NextJobId(), laterRepo, laterLabels, laterSecret);
+            await service.ProcessQueuedWebhookEventOnceAsync(later.EventId!, laterProfileId);
+
+            var laterEvent = await _store.Get<WebhookEvent>(later.EventId!);
+            Assert.NotNull(laterEvent);
+            Assert.True(
+                laterEvent.Status == "provisioned",
+                $"Later job should dispatch to the connected host, but is '{laterEvent.Status}': {laterEvent.Error}");
+            var deploy = FindDeployCommand(connectedHostId, laterEvent.InstanceId!);
+            Assert.Contains("fleet-plain-linux", deploy.Labels);
+            Assert.Equal(1, GetRunningCount(await connectedHost.GetState(), ExecutionBackend.Docker));
+        }
+        finally
+        {
+            _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: true);
+        }
+    }
+
+    [Fact]
+    public async Task GitHubDockerWebhookFleet_EarlierJobPreferringDisconnectedHostFallsBackAndDoesNotBlockLaterJob()
+    {
+        // The earlier job matches a persisted-Online but disconnected host that ranks first, plus a connected
+        // fallback. Host selection must skip the disconnected host instead of retrying it forever, otherwise the
+        // earlier job never dispatches and FIFO holds every later job that can only use the fallback host.
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-hol-pref");
+        var pool = $"{id}-pool";
+        var disconnectedHostId = $"{id}-a";
+        var connectedHostId = $"{id}-b";
+        var earlyProfileId = $"{id}-any-profile";
+        var laterProfileId = $"{id}-b-profile";
+        var earlySecret = $"{id}-any-secret";
+        var laterSecret = $"{id}-b-secret";
+        var earlyRepo = "octo/any";
+        var laterRepo = "octo/only-b";
+        var earlyLabels = new[] { "self-hosted", "linux", "fleet-any-linux" };
+        var laterTargetLabels = new[] { "self-hosted", "linux", "fleet-b-linux" };
+        var laterJobLabels = laterTargetLabels.Append("fleet-only-b").ToArray();
+        var service = CreateDynamicProvisioningService();
+        await CreateHostAsync(disconnectedHostId, HostPlatform.Linux, ExecutionBackend.Docker);
+        var connectedHost = await CreateHostAsync(connectedHostId, HostPlatform.Linux, ExecutionBackend.Docker);
+        await connectedHost.SetResourceLimits(maxDocker: 2, maxTart: 0, maxNative: 0);
+        foreach (var hostId in new[] { disconnectedHostId, connectedHostId })
+        {
+            var document = (await _store.Get<Host>(hostId))!;
+            document.Labels["pool"] = pool;
+            if (hostId == connectedHostId)
+            {
+                document.Capabilities.Add("fleet-only-b");
+                document.MaxDockerContainers = 2;
+            }
+            await _store.Update(document);
+        }
+
+        await CreateProfileAsync(earlyProfileId, "any-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, earlyLabels);
+        await CreateProfileAsync(laterProfileId, "b-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, laterTargetLabels);
+        await CreateWebhookRuleAsync($"{id}-any-rule", "any docker", RunnerProvider.GitHubActions, earlySecret, earlyRepo, earlyProfileId, earlyLabels, pool);
+        await CreateWebhookRuleAsync($"{id}-b-rule", "b docker", RunnerProvider.GitHubActions, laterSecret, laterRepo, laterProfileId, laterTargetLabels, pool);
+        _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: false);
+
+        try
+        {
+            var early = await ProcessWebhookAsync("github", "queued", NextJobId(), earlyRepo, earlyLabels, earlySecret);
+            await service.ProcessQueuedWebhookEventOnceAsync(early.EventId!, earlyProfileId);
+
+            var later = await ProcessWebhookAsync("github", "queued", NextJobId(), laterRepo, laterJobLabels, laterSecret);
+            await service.ProcessQueuedWebhookEventOnceAsync(later.EventId!, laterProfileId);
+
+            var laterEvent = await _store.Get<WebhookEvent>(later.EventId!);
+            Assert.NotNull(laterEvent);
+            Assert.True(
+                laterEvent.Status == "provisioned",
+                $"Later job should dispatch to the connected host, but is '{laterEvent.Status}': {laterEvent.Error}");
+            Assert.Contains("fleet-only-b", FindDeployCommand(connectedHostId, laterEvent.InstanceId!).Labels);
+
+            var earlyEvent = await _store.Get<WebhookEvent>(early.EventId!);
+            Assert.NotNull(earlyEvent);
+            Assert.True(
+                earlyEvent.Status == "provisioned",
+                $"Earlier job should fall back to the connected host, but is '{earlyEvent.Status}': {earlyEvent.Error}");
+            Assert.Contains("fleet-any-linux", FindDeployCommand(connectedHostId, earlyEvent.InstanceId!).Labels);
+            Assert.DoesNotContain(_fixture.HostCommands.Commands, command => command.HostId == disconnectedHostId && command.Kind == HostCommandKind.DeployRunner);
+            Assert.Equal(2, GetRunningCount(await connectedHost.GetState(), ExecutionBackend.Docker));
+        }
+        finally
+        {
+            _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: true);
+        }
+    }
+
+    [Fact]
+    public async Task StaticRuleGrain_FallsBackFromDisconnectedPreferredHostToConnectedHost()
+    {
+        // ProvisioningRuleGrain (static, scale-set, warm-webhook and JIT rules) must skip a persisted-Online
+        // host with no live HostWorker connection, not pick it on every reconcile and fail the dispatch.
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-rule-pref");
+        var pool = $"{id}-pool";
+        var disconnectedHostId = $"{id}-a";
+        var connectedHostId = $"{id}-b";
+        var profileId = $"{id}-profile";
+        await CreatePooledHostsAsync(pool, disconnectedHostId, connectedHostId);
+        await CreateProfileAsync(profileId, "static-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux", "fleet-static-linux"]);
+        var rule = await CreateRuleGrainAsync($"{id}-rule", profileId, pool);
+        _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: false);
+
+        try
+        {
+            await rule.Reconcile();
+
+            Assert.DoesNotContain(_fixture.HostCommands.Commands, command => command.HostId == disconnectedHostId && command.Kind == HostCommandKind.DeployRunner);
+            var instanceId = Assert.Single((await rule.GetState()).ManagedInstanceIds);
+            var instance = await _grainFactory.GetGrain<IRunnerInstanceGrain>(instanceId).GetState();
+            Assert.True(
+                instance.HostId == connectedHostId,
+                $"Rule should provision on the connected host '{connectedHostId}', but chose '{instance.HostId}' ({instance.Status})");
+            Assert.NotEqual(RunnerInstanceStatus.Failed, instance.Status);
+            FindDeployCommand(connectedHostId, instanceId);
+        }
+        finally
+        {
+            await rule.Disable();
+            _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: true);
+        }
+    }
+
+    [Fact]
+    public async Task StaticRuleGrain_WhenOnlyMatchingHostIsDisconnected_DoesNotDispatch()
+    {
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-rule-disc");
+        var pool = $"{id}-pool";
+        var disconnectedHostId = $"{id}-a";
+        var profileId = $"{id}-profile";
+        await CreatePooledHostsAsync(pool, disconnectedHostId);
+        await CreateProfileAsync(profileId, "static-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux", "fleet-static-linux"]);
+        var rule = await CreateRuleGrainAsync($"{id}-rule", profileId, pool);
+        _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: false);
+
+        try
+        {
+            await rule.Reconcile();
+
+            Assert.DoesNotContain(_fixture.HostCommands.Commands, command => command.HostId == disconnectedHostId && command.Kind == HostCommandKind.DeployRunner);
+            Assert.Empty((await rule.GetState()).ManagedInstanceIds);
+        }
+        finally
+        {
+            await rule.Disable();
+            _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(ProvisioningType.Static)]
+    [InlineData(ProvisioningType.ScaleSet)]
+    [InlineData(ProvisioningType.Webhook)]
+    public async Task RuleGrain_DisconnectedHostStopsRefillAfterFirstPlacementAttempt(ProvisioningType type)
+    {
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-refill-disc");
+        var hostId = $"{id}-host";
+        var profileId = $"{id}-profile";
+        await CreatePooledHostsAsync(hostId, hostId);
+        await CreateProfileAsync(profileId, "refill-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux"]);
+        _fixture.HostCommands.SetHostConnected(hostId, connected: false);
+        var rule = await CreateRuleGrainAsync($"{id}-rule", profileId, hostId, type, runnerCount: 100);
+
+        try
+        {
+            RequestContext.Set(RecordingHostCommandDispatcher.ConnectionCheckScopeKey, hostId);
+            await rule.Reconcile();
+
+            Assert.Equal(1, _fixture.HostCommands.GetConnectionCheckCount(hostId));
+            Assert.Empty((await rule.GetState()).ManagedInstanceIds);
+            Assert.DoesNotContain(_fixture.HostCommands.Commands, command => command.HostId == hostId && command.Kind == HostCommandKind.DeployRunner);
+
+            await rule.Reconcile();
+            Assert.Equal(2, _fixture.HostCommands.GetConnectionCheckCount(hostId));
+        }
+        finally
+        {
+            RequestContext.Remove(RecordingHostCommandDispatcher.ConnectionCheckScopeKey);
+            await rule.Disable();
+            _fixture.HostCommands.SetHostConnected(hostId, connected: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(ProvisioningType.Static)]
+    [InlineData(ProvisioningType.ScaleSet)]
+    [InlineData(ProvisioningType.Webhook)]
+    public async Task RuleGrain_RefillsAllMissingRunnersWhenCapacityAvailable(ProvisioningType type)
+    {
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-refill-ready");
+        var hostId = $"{id}-host";
+        var profileId = $"{id}-profile";
+        var host = await CreateHostAsync(hostId, HostPlatform.Linux, ExecutionBackend.Docker);
+        await host.SetResourceLimits(maxDocker: 3, maxTart: 0, maxNative: 0);
+        var document = (await _store.Get<Host>(hostId))!;
+        document.MaxDockerContainers = 3;
+        await _store.Update(document);
+        await CreateProfileAsync(profileId, "refill-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux"]);
+        var rule = await CreateRuleGrainAsync($"{id}-rule", profileId, hostId, type, runnerCount: 3);
+
+        try
+        {
+            await rule.Reconcile();
+
+            var instanceIds = (await rule.GetState()).ManagedInstanceIds;
+            Assert.Equal(3, instanceIds.Count);
+            Assert.Equal(3, _fixture.HostCommands.Commands.Count(command => command.HostId == hostId && command.Kind == HostCommandKind.DeployRunner));
+            foreach (var instanceId in instanceIds)
+                FindDeployCommand(hostId, instanceId);
+        }
+        finally
+        {
+            await rule.Disable();
+        }
+    }
+
+    [Fact]
+    public async Task GitHubDockerWebhookFleet_LaterJobStaysBehindEarlierJobWaitingForSameSaturatedHost()
+    {
+        // FIFO guard for #5: relaxing the lane check for unplaceable jobs must not let a later job
+        // overtake an earlier job that is waiting for the same (currently full) host.
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-fifo");
+        var hostId = $"{id}-host";
+        var saturatorProfileId = $"{id}-sat-profile";
+        var waitingProfileId = $"{id}-wait-profile";
+        var saturatorSecret = $"{id}-sat-secret";
+        var waitingSecret = $"{id}-wait-secret";
+        var saturatorRepo = "octo/saturator";
+        var waitingRepo = "octo/waiting";
+        var saturatorLabels = new[] { "self-hosted", "linux", "fleet-sat-linux" };
+        var waitingLabels = new[] { "self-hosted", "linux", "fleet-wait-linux" };
+        var service = CreateDynamicProvisioningService();
+        var host = await CreateHostAsync(hostId, HostPlatform.Linux, ExecutionBackend.Docker);
+        await CreateProfileAsync(saturatorProfileId, "sat-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, saturatorLabels);
+        await CreateProfileAsync(waitingProfileId, "wait-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, waitingLabels);
+        await CreateWebhookRuleAsync($"{id}-sat-rule", "sat docker", RunnerProvider.GitHubActions, saturatorSecret, saturatorRepo, saturatorProfileId, saturatorLabels, hostId);
+        await CreateWebhookRuleAsync($"{id}-wait-rule", "wait docker", RunnerProvider.GitHubActions, waitingSecret, waitingRepo, waitingProfileId, waitingLabels, hostId);
+
+        var saturator = await ProcessWebhookAsync("github", "queued", NextJobId(), saturatorRepo, saturatorLabels, saturatorSecret);
+        await service.ProcessQueuedWebhookEventOnceAsync(saturator.EventId!, saturatorProfileId);
+        var saturatorEvent = await _store.Get<WebhookEvent>(saturator.EventId!);
+        Assert.NotNull(saturatorEvent);
+        Assert.Equal("provisioned", saturatorEvent.Status);
+        Assert.Equal(1, GetRunningCount(await host.GetState(), ExecutionBackend.Docker));
+
+        var first = await ProcessWebhookAsync("github", "queued", NextJobId(), waitingRepo, waitingLabels, waitingSecret);
+        await service.ProcessQueuedWebhookEventOnceAsync(first.EventId!, waitingProfileId);
+        var firstEvent = await _store.Get<WebhookEvent>(first.EventId!);
+        Assert.NotNull(firstEvent);
+        Assert.Equal("pending_capacity", firstEvent.Status);
+
+        var second = await ProcessWebhookAsync("github", "queued", NextJobId(), waitingRepo, waitingLabels, waitingSecret);
+        await service.ProcessQueuedWebhookEventOnceAsync(second.EventId!, waitingProfileId);
+        Assert.Equal("pending_fifo", (await _store.Get<WebhookEvent>(second.EventId!))!.Status);
+
+        // Free the slot, then give the later job the first chance at it: it must still yield.
+        await _grainFactory.GetGrain<IRunnerInstanceGrain>(saturatorEvent.InstanceId!).MarkStopped();
+        Assert.Equal(0, GetRunningCount(await host.GetState(), ExecutionBackend.Docker));
+
+        await service.ProcessQueuedWebhookEventOnceAsync(second.EventId!, waitingProfileId);
+        var secondEvent = await _store.Get<WebhookEvent>(second.EventId!);
+        Assert.NotNull(secondEvent);
+        Assert.Equal("pending_fifo", secondEvent.Status);
+        Assert.Null(secondEvent.InstanceId);
+
+        await service.ProcessQueuedWebhookEventOnceAsync(first.EventId!, waitingProfileId);
+        firstEvent = await _store.Get<WebhookEvent>(first.EventId!);
+        Assert.NotNull(firstEvent);
+        Assert.Equal("provisioned", firstEvent.Status);
+        Assert.False(string.IsNullOrWhiteSpace(firstEvent.InstanceId));
+    }
+
     private DynamicProvisioningService CreateDynamicProvisioningService(FakeProviderHttpApi? api = null)
     {
         api ??= new FakeProviderHttpApi(_ => FakeProviderHttpApi.JsonResponse("{}"));
@@ -315,6 +708,45 @@ public sealed class FakeFleetEndToEndTests
         await _grainFactory.GetGrain<IProfileGrain>(profileId).SetProfile(profile);
         await _store.Insert(profile);
         return profile;
+    }
+
+    private async Task CreatePooledHostsAsync(string pool, params string[] hostIds)
+    {
+        foreach (var hostId in hostIds)
+        {
+            await CreateHostAsync(hostId, HostPlatform.Linux, ExecutionBackend.Docker);
+            var document = (await _store.Get<Host>(hostId))!;
+            document.Labels["pool"] = pool;
+            await _store.Update(document);
+        }
+    }
+
+    private async Task<IProvisioningRuleGrain> CreateRuleGrainAsync(
+        string ruleId,
+        string profileId,
+        string pool,
+        ProvisioningType type = ProvisioningType.Static,
+        int runnerCount = 1)
+    {
+        var profile = await _store.Get<RunnerProfile>(profileId);
+        Assert.NotNull(profile);
+        var rule = _grainFactory.GetGrain<IProvisioningRuleGrain>(ruleId);
+        await rule.SetConfig(new ProvisioningRuleConfig
+        {
+            Name = "fleet docker",
+            ProfileId = profileId,
+            Type = type,
+            Enabled = true,
+            DesiredCount = runnerCount,
+            MinReady = runnerCount,
+            MaxInstances = runnerCount,
+            RunnerDefinitions = type == ProvisioningType.Webhook ? [RunnerDefinition.FromProfile(profile)] : [],
+            RequiredHostLabels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["pool"] = pool
+            }
+        });
+        return rule;
     }
 
     private async Task CreateWebhookRuleAsync(

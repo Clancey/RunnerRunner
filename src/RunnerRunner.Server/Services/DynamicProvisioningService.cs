@@ -710,7 +710,8 @@ public class DynamicProvisioningService : BackgroundService
                 hosts,
                 instances,
                 currentEvent.Labels,
-                _minimumFreeDiskGb);
+                _minimumFreeDiskGb,
+                _hostCommands.CanDispatchToHost);
 
             if (hostSelection.Host == null)
             {
@@ -1372,7 +1373,7 @@ public class DynamicProvisioningService : BackgroundService
         return view.RemainingSlots <= 0;
     }
 
-    private static async Task<bool> HasEarlierQueuedWorkAheadAsync(
+    private async Task<bool> HasEarlierQueuedWorkAheadAsync(
         IDocumentStore store,
         WebhookEvent currentEvent,
         ProvisioningRule? currentRule,
@@ -1384,6 +1385,7 @@ public class DynamicProvisioningService : BackgroundService
             .ToDictionary(p => p.Id, p => p, StringComparer.OrdinalIgnoreCase);
         ProvisioningRuleRunnerResolver.AddMaterializedRunnerProfiles(profiles, rules.Values);
         var events = (await store.Query<WebhookEvent>().ToList()).ToList();
+        var hosts = (await store.Query<Host>().ToList()).ToList();
 
         return CapacityPlanningService.HasEarlierQueuedWorkAhead(
             currentEvent,
@@ -1391,7 +1393,9 @@ public class DynamicProvisioningService : BackgroundService
             currentProfile,
             events,
             rules,
-            profiles);
+            profiles,
+            hosts,
+            _hostCommands.CanDispatchToHost);
     }
 
     private static async Task<HostSelectionResult> SelectHostAsync(
@@ -1401,7 +1405,8 @@ public class DynamicProvisioningService : BackgroundService
         List<Host> hosts,
         List<RunnerInstance> instances,
         IReadOnlyCollection<string> requestedRunnerLabels,
-        double minimumFreeDiskGb)
+        double minimumFreeDiskGb,
+        Func<string, bool> isHostConnected)
     {
         var profilesById = (await store.Query<RunnerProfile>().ToList())
             .ToDictionary(p => p.Id, p => p, StringComparer.OrdinalIgnoreCase);
@@ -1415,10 +1420,19 @@ public class DynamicProvisioningService : BackgroundService
             instances,
             requireDispatchReadiness: true,
             requestedRunnerLabels,
-            minimumFreeDiskGb);
+            minimumFreeDiskGb,
+            isHostConnected: isHostConnected);
 
         if (analysis.SelectedHost != null)
             return new HostSelectionResult(analysis.SelectedHost, null, false);
+
+        // A matching host was ready except for its HostWorker connection: keep waiting for it to reconnect.
+        var disconnectedCandidate = analysis.Candidates.FirstOrDefault(candidate => candidate.IsHostWorkerDisconnected);
+        if (disconnectedCandidate != null)
+        {
+            var disconnectedHost = hosts.First(host => string.Equals(host.Id, disconnectedCandidate.HostId, StringComparison.OrdinalIgnoreCase));
+            return new HostSelectionResult(null, BuildHostWorkerDisconnectedReason(disconnectedHost), false);
+        }
 
         if (analysis.CapacityBlocked)
             return new HostSelectionResult(null, analysis.Reason, true);

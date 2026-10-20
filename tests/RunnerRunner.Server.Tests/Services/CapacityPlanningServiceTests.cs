@@ -784,6 +784,7 @@ public class CapacityPlanningServiceTests
     [Fact]
     public void HasEarlierQueuedWorkAhead_BlocksNewerEventInSameCapacityLaneAcrossRules()
     {
+        var host = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "ubuntu");
         var profileA = CreateProfile("linux-a", HostPlatform.Linux, ExecutionBackend.Docker);
         var profileB = CreateProfile("linux-b", HostPlatform.Linux, ExecutionBackend.Docker);
         var ruleA = CreateWebhookRule("rule-a", profileA.Id, ["ubuntu"]);
@@ -798,7 +799,8 @@ public class CapacityPlanningServiceTests
             profileB,
             [earlier, current],
             new Dictionary<string, ProvisioningRule> { [ruleA.Id] = ruleA, [ruleB.Id] = ruleB },
-            new Dictionary<string, RunnerProfile> { [profileA.Id] = profileA, [profileB.Id] = profileB });
+            new Dictionary<string, RunnerProfile> { [profileA.Id] = profileA, [profileB.Id] = profileB },
+            [host]);
 
         Assert.True(result);
     }
@@ -806,6 +808,8 @@ public class CapacityPlanningServiceTests
     [Fact]
     public void HasEarlierQueuedWorkAhead_IgnoresEarlierEventInDifferentCapacityLane()
     {
+        var linuxHost = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "ubuntu");
+        var macHost = CreateOnlineHost("mac-a", HostPlatform.MacOS, ExecutionBackend.Tart);
         var dockerProfile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
         var tartProfile = CreateProfile("mac-tart", HostPlatform.MacOS, ExecutionBackend.Tart);
         var dockerRule = CreateWebhookRule("rule-docker", dockerProfile.Id, ["ubuntu"]);
@@ -820,7 +824,8 @@ public class CapacityPlanningServiceTests
             tartProfile,
             [earlier, current],
             new Dictionary<string, ProvisioningRule> { [dockerRule.Id] = dockerRule, [tartRule.Id] = tartRule },
-            new Dictionary<string, RunnerProfile> { [dockerProfile.Id] = dockerProfile, [tartProfile.Id] = tartProfile });
+            new Dictionary<string, RunnerProfile> { [dockerProfile.Id] = dockerProfile, [tartProfile.Id] = tartProfile },
+            [linuxHost, macHost]);
 
         Assert.False(result);
     }
@@ -828,6 +833,8 @@ public class CapacityPlanningServiceTests
     [Fact]
     public void HasEarlierQueuedWorkAhead_IgnoresEarlierSameRuleEventInDifferentCapacityLane()
     {
+        var windowsHost = CreateOnlineHost("windows-a", HostPlatform.Windows, ExecutionBackend.Docker);
+        var macHost = CreateOnlineHost("mac-a", HostPlatform.MacOS, ExecutionBackend.Native);
         var windowsProfile = CreateProfile("windows-docker", HostPlatform.Windows, ExecutionBackend.Docker);
         var macProfile = CreateProfile("macos-native", HostPlatform.MacOS, ExecutionBackend.Native);
         var rule = new ProvisioningRule
@@ -853,7 +860,8 @@ public class CapacityPlanningServiceTests
             macProfile,
             [earlier, current],
             new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
-            new Dictionary<string, RunnerProfile> { [windowsProfile.Id] = windowsProfile, [macProfile.Id] = macProfile });
+            new Dictionary<string, RunnerProfile> { [windowsProfile.Id] = windowsProfile, [macProfile.Id] = macProfile },
+            [windowsHost, macHost]);
 
         Assert.False(result);
     }
@@ -861,6 +869,10 @@ public class CapacityPlanningServiceTests
     [Fact]
     public void HasEarlierQueuedWorkAhead_IgnoresEarlierSameBackendEventWithDifferentTargetGroups()
     {
+        var hostA = CreateOnlineHost("mac-a", HostPlatform.MacOS, ExecutionBackend.Native, "macos-a");
+        hostA.GroupId = "mac-pool-a";
+        var hostB = CreateOnlineHost("mac-b", HostPlatform.MacOS, ExecutionBackend.Native, "macos-b");
+        hostB.GroupId = "mac-pool-b";
         var profileA = CreateProfile("macos-a", HostPlatform.MacOS, ExecutionBackend.Native);
         profileA.TargetGroupId = "mac-pool-a";
         var profileB = CreateProfile("macos-b", HostPlatform.MacOS, ExecutionBackend.Native);
@@ -888,7 +900,8 @@ public class CapacityPlanningServiceTests
             profileB,
             [earlier, current],
             new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
-            new Dictionary<string, RunnerProfile> { [profileA.Id] = profileA, [profileB.Id] = profileB });
+            new Dictionary<string, RunnerProfile> { [profileA.Id] = profileA, [profileB.Id] = profileB },
+            [hostA, hostB]);
 
         Assert.False(result);
     }
@@ -896,6 +909,7 @@ public class CapacityPlanningServiceTests
     [Fact]
     public void HasEarlierQueuedWorkAhead_IgnoresEarlierMissingTargetEvent()
     {
+        var host = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "ubuntu");
         var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
         var rule = CreateWebhookRule("rule-1", profile.Id, ["ubuntu"]);
         var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
@@ -910,15 +924,203 @@ public class CapacityPlanningServiceTests
             profile,
             [earlier, current],
             new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
-            new Dictionary<string, RunnerProfile> { [profile.Id] = profile });
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            [host]);
 
         Assert.False(result);
     }
 
     [Fact]
+    public void HasEarlierQueuedWorkAhead_IgnoresEarlierEventNoHostCanPlace()
+    {
+        var host = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "ubuntu");
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
+        var rule = CreateWebhookRule("rule-1", profile.Id, ["ubuntu"]);
+        var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
+        var earlier = CreateQueuedEvent("evt-unplaceable", rule.Id, "job-a", now, ["ubuntu", "scratch-probe"], profile.Id);
+        earlier.Status = "pending_host_match";
+        var current = CreateQueuedEvent("evt-current", rule.Id, "job-b", now.AddSeconds(1), ["ubuntu"], profile.Id);
+
+        var result = CapacityPlanningService.HasEarlierQueuedWorkAhead(
+            current,
+            rule,
+            profile,
+            [earlier, current],
+            new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            [host]);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public void HasEarlierQueuedWorkAhead_StillBlocksBehindEarlierEventCompetingForSameHost()
+    {
+        var host = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "ubuntu");
+        host.MaxDockerContainers = 1;
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
+        var rule = CreateWebhookRule("rule-1", profile.Id, ["ubuntu"]);
+        var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
+        var earlier = CreateQueuedEvent("evt-waiting", rule.Id, "job-a", now, ["ubuntu"], profile.Id);
+        earlier.Status = "pending_capacity";
+        var current = CreateQueuedEvent("evt-current", rule.Id, "job-b", now.AddSeconds(1), ["ubuntu"], profile.Id);
+
+        var result = CapacityPlanningService.HasEarlierQueuedWorkAhead(
+            current,
+            rule,
+            profile,
+            [earlier, current],
+            new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            [host]);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public void HasEarlierQueuedWorkAhead_StillBlocksBehindEarlierEventWaitingOnSameDrainingHost()
+    {
+        var host = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "ubuntu");
+        host.IsDraining = true;
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
+        var rule = CreateWebhookRule("rule-1", profile.Id, ["ubuntu"]);
+        var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
+        var earlier = CreateQueuedEvent("evt-waiting", rule.Id, "job-a", now, ["ubuntu"], profile.Id);
+        earlier.Status = "pending_capacity";
+        var current = CreateQueuedEvent("evt-current", rule.Id, "job-b", now.AddSeconds(1), ["ubuntu"], profile.Id);
+
+        var result = CapacityPlanningService.HasEarlierQueuedWorkAhead(
+            current,
+            rule,
+            profile,
+            [earlier, current],
+            new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            [host]);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public void HasEarlierQueuedWorkAhead_IgnoresEarlierEventWhoseHostsDoNotOverlap()
+    {
+        var hostA = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "gpu");
+        var hostB = CreateOnlineHost("linux-b", HostPlatform.Linux, ExecutionBackend.Docker, "arm-cross");
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
+        var rule = CreateWebhookRule("rule-1", profile.Id, ["linux"]);
+        var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
+        var earlier = CreateQueuedEvent("evt-gpu", rule.Id, "job-a", now, ["linux", "gpu"], profile.Id);
+        var current = CreateQueuedEvent("evt-arm", rule.Id, "job-b", now.AddSeconds(1), ["linux", "arm-cross"], profile.Id);
+
+        var result = CapacityPlanningService.HasEarlierQueuedWorkAhead(
+            current,
+            rule,
+            profile,
+            [earlier, current],
+            new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            [hostA, hostB]);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public void HasEarlierQueuedWorkAhead_IgnoresEarlierEventWhoseOnlyHostIsOffline()
+    {
+        var onlineHost = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker);
+        var offlineHost = CreateOnlineHost("linux-gpu", HostPlatform.Linux, ExecutionBackend.Docker, "gpu");
+        offlineHost.AgentStatus = AgentStatus.Offline;
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
+        var rule = CreateWebhookRule("rule-1", profile.Id, ["linux"]);
+        var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
+        var earlier = CreateQueuedEvent("evt-gpu", rule.Id, "job-a", now, ["linux", "gpu"], profile.Id);
+        var current = CreateQueuedEvent("evt-plain", rule.Id, "job-b", now.AddSeconds(1), ["linux"], profile.Id);
+
+        var result = CapacityPlanningService.HasEarlierQueuedWorkAhead(
+            current,
+            rule,
+            profile,
+            [earlier, current],
+            new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            [onlineHost, offlineHost]);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public void HasEarlierQueuedWorkAhead_IgnoresEarlierEventWhoseOnlyHostIsDisconnected()
+    {
+        var plainHost = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker);
+        var gpuHost = CreateOnlineHost("linux-gpu", HostPlatform.Linux, ExecutionBackend.Docker, "gpu");
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
+        var rule = CreateWebhookRule("rule-1", profile.Id, ["linux"]);
+        var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
+        var earlier = CreateQueuedEvent("evt-gpu", rule.Id, "job-a", now, ["linux", "gpu"], profile.Id);
+        earlier.Status = "pending_host_match";
+        var current = CreateQueuedEvent("evt-plain", rule.Id, "job-b", now.AddSeconds(1), ["linux"], profile.Id);
+        var rules = new Dictionary<string, ProvisioningRule> { [rule.Id] = rule };
+        var profiles = new Dictionary<string, RunnerProfile> { [profile.Id] = profile };
+
+        var blockedWhenConnected = CapacityPlanningService.HasEarlierQueuedWorkAhead(
+            current, rule, profile, [earlier, current], rules, profiles, [plainHost, gpuHost]);
+        var blockedWhenDisconnected = CapacityPlanningService.HasEarlierQueuedWorkAhead(
+            current, rule, profile, [earlier, current], rules, profiles, [plainHost, gpuHost],
+            isHostConnected: hostId => hostId != gpuHost.Id);
+
+        Assert.True(blockedWhenConnected);
+        Assert.False(blockedWhenDisconnected);
+    }
+
+    [Fact]
+    public void ExplainEvent_StoredPendingFifoFallsThroughWhenNoEarlierJobCompetes()
+    {
+        var host = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "ubuntu");
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
+        var rule = CreateWebhookRule("rule-1", profile.Id, ["ubuntu"]);
+        var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
+        var earlier = CreateQueuedEvent("evt-a", rule.Id, "job-a", now, ["ubuntu", "scratch-probe"], profile.Id);
+        earlier.Status = "pending_host_match";
+        var current = CreateQueuedEvent("evt-b", rule.Id, "job-b", now.AddSeconds(1), ["ubuntu"], profile.Id);
+        current.Status = "pending_fifo";
+
+        var result = CapacityPlanningService.ExplainEvent(
+            current,
+            [host],
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
+            [],
+            [earlier, current]);
+
+        Assert.Equal(CapacityBlockerKind.None, result.BlockedBy);
+    }
+
+    [Fact]
+    public void ExplainEvent_DoesNotShowFifoBehindUnplaceableEarlierEvent()
+    {
+        var host = CreateOnlineHost("linux-a", HostPlatform.Linux, ExecutionBackend.Docker, "ubuntu");
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
+        var rule = CreateWebhookRule("rule-1", profile.Id, ["ubuntu"]);
+        var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
+        var earlier = CreateQueuedEvent("evt-a", rule.Id, "job-a", now, ["ubuntu", "scratch-probe"], profile.Id);
+        earlier.Status = "pending_host_match";
+        var current = CreateQueuedEvent("evt-b", rule.Id, "job-b", now.AddSeconds(1), ["ubuntu"], profile.Id);
+
+        var result = CapacityPlanningService.ExplainEvent(
+            current,
+            [host],
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            new Dictionary<string, ProvisioningRule> { [rule.Id] = rule },
+            [],
+            [earlier, current]);
+
+        Assert.Equal(CapacityBlockerKind.None, result.BlockedBy);
+    }
+
+    [Fact]
     public void ExplainEvent_ShowsFifoWhenOlderSameLaneEventIsStillQueued()
     {
-        var host = new Host { Name = "linux-a", Platform = HostPlatform.Linux, MaxDockerContainers = 10, Capabilities = ["docker"] };
+        var host = new Host { Name = "linux-a", Platform = HostPlatform.Linux, MaxDockerContainers = 10, Capabilities = ["docker", "ubuntu"], AgentStatus = AgentStatus.Online };
         var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker);
         var rule = CreateWebhookRule("rule-1", profile.Id, ["ubuntu"]);
         var now = new DateTime(2026, 5, 18, 12, 0, 0, DateTimeKind.Utc);
@@ -964,6 +1166,53 @@ public class CapacityPlanningServiceTests
         Assert.False(analysis.CapacityBlocked);
         Assert.NotNull(analysis.SelectedHost);
         Assert.Equal(hostB.Id, analysis.SelectedHost!.Id);
+    }
+
+    [Fact]
+    public void AnalyzeHostSelection_FallsBackFromDisconnectedPreferredHostToConnectedHost()
+    {
+        var disconnected = new Host { Name = "linux-a", Platform = HostPlatform.Linux, AgentStatus = AgentStatus.Online, MaxDockerContainers = 3, Capabilities = ["docker"] };
+        var connected = new Host { Name = "linux-b", Platform = HostPlatform.Linux, AgentStatus = AgentStatus.Online, MaxDockerContainers = 3, Capabilities = ["docker"] };
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker, maxParallelPerHost: 3);
+        var profiles = new Dictionary<string, RunnerProfile> { [profile.Id] = profile };
+
+        var withoutConnectionCheck = CapacityPlanningService.AnalyzeHostSelection(
+            profile, null, [disconnected, connected], profiles, [], requireDispatchReadiness: true);
+        Assert.Equal(disconnected.Id, withoutConnectionCheck.SelectedHost?.Id);
+
+        var analysis = CapacityPlanningService.AnalyzeHostSelection(
+            profile,
+            null,
+            [disconnected, connected],
+            profiles,
+            [],
+            requireDispatchReadiness: true,
+            isHostConnected: hostId => hostId != disconnected.Id);
+
+        Assert.Equal(connected.Id, analysis.SelectedHost?.Id);
+        var skipped = Assert.Single(analysis.Candidates, candidate => candidate.HostId == disconnected.Id);
+        Assert.False(skipped.CanRunNow);
+        Assert.True(skipped.IsHostWorkerDisconnected);
+    }
+
+    [Fact]
+    public void AnalyzeHostSelection_WhenOnlyMatchingHostIsDisconnected_SelectsNothingAndFlagsIt()
+    {
+        var disconnected = new Host { Name = "linux-a", Platform = HostPlatform.Linux, AgentStatus = AgentStatus.Online, MaxDockerContainers = 3, Capabilities = ["docker"] };
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker, maxParallelPerHost: 3);
+
+        var analysis = CapacityPlanningService.AnalyzeHostSelection(
+            profile,
+            null,
+            [disconnected],
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            [],
+            requireDispatchReadiness: true,
+            isHostConnected: _ => false);
+
+        Assert.Null(analysis.SelectedHost);
+        Assert.False(analysis.CapacityBlocked);
+        Assert.True(Assert.Single(analysis.Candidates).IsHostWorkerDisconnected);
     }
 
     [Fact]
@@ -1175,6 +1424,18 @@ public class CapacityPlanningServiceTests
                 break;
         }
 
+        return host;
+    }
+
+    private static Host CreateOnlineHost(
+        string name,
+        HostPlatform platform,
+        ExecutionBackend backend,
+        params string[] capabilities)
+    {
+        var host = CreateHostWithBackendLimit(name, platform, backend, limit: 4);
+        host.AgentStatus = AgentStatus.Online;
+        host.Capabilities.AddRange(capabilities);
         return host;
     }
 }

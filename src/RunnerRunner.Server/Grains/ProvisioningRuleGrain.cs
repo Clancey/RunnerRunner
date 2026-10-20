@@ -210,7 +210,10 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
                 this.GetPrimaryKeyString(), aliveCount, desired, toProvision);
 
             for (var i = 0; i < toProvision; i++)
-                await ProvisionRunner();
+            {
+                if (await ProvisionRunner() == null)
+                    break;
+            }
         }
         else if (aliveCount > desired)
         {
@@ -233,7 +236,10 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
                 this.GetPrimaryKeyString(), aliveCount, minReady, toProvision);
 
             for (var i = 0; i < toProvision; i++)
-                await ProvisionRunner();
+            {
+                if (await ProvisionRunner() == null)
+                    break;
+            }
         }
     }
 
@@ -259,7 +265,10 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
                 this.GetPrimaryKeyString(), idleCount, minReady, toProvision);
 
             for (var i = 0; i < toProvision; i++)
-                await ProvisionRunner();
+            {
+                if (await ProvisionRunner() == null)
+                    break;
+            }
         }
     }
 
@@ -381,28 +390,30 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
         ProvisioningRuleRunnerResolver.AddMaterializedRunnerProfiles(profilesById, [ruleModel]);
         profilesById[profile.Id] = profile;
 
+        var backendName = profile.ExecutionBackend.ToString().ToLowerInvariant();
+        var backendCapableHosts = hosts
+            .Where(h => h.Capabilities.Any(c => c.Equals(backendName, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+        // Dispatch readiness plus the live-connection check make selection skip hosts that are persisted
+        // Online but have no connected HostWorker, so a stale preferred host can't fail every reconcile.
         var analysis = CapacityPlanningService.AnalyzeHostSelection(
             profile,
             ruleModel,
-            hosts,
+            backendCapableHosts,
             profilesById,
             instances,
+            requireDispatchReadiness: true,
             minimumFreeDiskGb: CapacityPlanningService.ResolveMinimumFreeDiskGb(
-                _serviceProvider.GetService<IConfiguration>()));
-        var backendName = profile.ExecutionBackend.ToString().ToLowerInvariant();
-        var host = analysis.Candidates
-            .Where(candidate => candidate.CanRunNow)
-            .Select(candidate => hosts.First(h => string.Equals(h.Id, candidate.HostId, StringComparison.OrdinalIgnoreCase)))
-            .FirstOrDefault(h =>
-                h.AgentStatus == AgentStatus.Online
-                && h.Capabilities.Any(c => c.Equals(backendName, StringComparison.OrdinalIgnoreCase)));
+                _serviceProvider.GetService<IConfiguration>()),
+            isHostConnected: _hostCommands.CanDispatchToHost);
+        var host = analysis.SelectedHost;
         if (host == null)
         {
             _logger.LogWarning("No host available for rule {RuleId}: {Reason}",
                 this.GetPrimaryKeyString(),
-                analysis.SelectedHost == null
-                    ? analysis.Reason
-                    : $"No online HostWorker with backend '{backendName}' is currently available");
+                backendCapableHosts.Count == 0
+                    ? $"No host advertises the '{backendName}' backend capability"
+                    : analysis.Reason);
             return null;
         }
 
