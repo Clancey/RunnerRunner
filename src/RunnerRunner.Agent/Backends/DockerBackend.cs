@@ -300,40 +300,32 @@ public class DockerBackend : IRunnerBackend
     /// </summary>
     public async Task<List<DiscoveredRunner>> DiscoverManagedContainersAsync(CancellationToken ct = default)
     {
+        // Throws when Docker cannot be listed: an empty list would tell the server every
+        // container on this host is gone.
         var result = new List<DiscoveredRunner>();
-        if (!await IsAvailableAsync(ct))
-            return result;
-
-        try
+        var containers = await _client.Containers.ListContainersAsync(new ContainersListParameters
         {
-            var containers = await _client.Containers.ListContainersAsync(new ContainersListParameters
+            All = true,
+            Filters = new Dictionary<string, IDictionary<string, bool>>
             {
-                All = true,
-                Filters = new Dictionary<string, IDictionary<string, bool>>
-                {
-                    ["label"] = new Dictionary<string, bool> { ["runnerrunner.managed=true"] = true }
-                }
-            }, ct);
-
-            foreach (var container in containers)
-            {
-                container.Labels.TryGetValue("runnerrunner.instance-id", out var instanceId);
-                container.Labels.TryGetValue("runnerrunner.runner-name", out var runnerName);
-
-                result.Add(new DiscoveredRunner
-                {
-                    InstanceId = instanceId ?? "",
-                    RunnerName = runnerName ?? container.Names.FirstOrDefault()?.TrimStart('/') ?? "",
-                    ContainerId = container.ID,
-                    Backend = ExecutionBackend.Docker,
-                    IsRunning = container.State == "running",
-                    Status = container.State
-                });
+                ["label"] = new Dictionary<string, bool> { ["runnerrunner.managed=true"] = true }
             }
-        }
-        catch (Exception ex)
+        }, ct);
+
+        foreach (var container in containers)
         {
-            _logger.LogWarning(ex, "Failed to discover managed containers");
+            container.Labels.TryGetValue("runnerrunner.instance-id", out var instanceId);
+            container.Labels.TryGetValue("runnerrunner.runner-name", out var runnerName);
+
+            result.Add(new DiscoveredRunner
+            {
+                InstanceId = instanceId ?? "",
+                RunnerName = runnerName ?? container.Names.FirstOrDefault()?.TrimStart('/') ?? "",
+                ContainerId = container.ID,
+                Backend = ExecutionBackend.Docker,
+                IsRunning = container.State == "running",
+                Status = container.State
+            });
         }
 
         return result;

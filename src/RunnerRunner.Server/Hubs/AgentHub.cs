@@ -222,6 +222,7 @@ public class AgentHub : Hub<IAgentHubClient>, IAgentHubServer
                 : RunnerInstanceStatus.Stopped;
             instance.ErrorMessage = evt.ErrorMessage;
             instance.StoppedAt = DateTime.UtcNow;
+            instance.HostReportedGoneAt = instance.StoppedAt;
             await _store.Update(instance);
 
             if (instance.ProvisioningMode == "dynamic"

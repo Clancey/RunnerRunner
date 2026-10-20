@@ -12,12 +12,21 @@ namespace RunnerRunner.Agent.Backends;
 public class TartBackend : IRunnerBackend
 {
     private readonly ILogger<TartBackend> _logger;
+    private readonly Func<string, string, CancellationToken, Task<(int ExitCode, string Output)>> _runCommand;
 
     public ExecutionBackend BackendType => ExecutionBackend.Tart;
 
     public TartBackend(ILogger<TartBackend> logger)
+        : this(logger, RunProcessAsync)
+    {
+    }
+
+    internal TartBackend(
+        ILogger<TartBackend> logger,
+        Func<string, string, CancellationToken, Task<(int ExitCode, string Output)>> runCommand)
     {
         _logger = logger;
+        _runCommand = runCommand;
     }
 
     public async Task<bool> IsAvailableAsync(CancellationToken ct = default)
@@ -126,41 +135,59 @@ public class TartBackend : IRunnerBackend
     public async Task<RunnerHealthStatus> GetHealthAsync(string instanceHandle, CancellationToken ct = default)
     {
         var result = await RunCommandAsync("tart", $"ip {instanceHandle} --resolver=arp", ct);
+        if (result.ExitCode == 0 && !string.IsNullOrWhiteSpace(result.Output))
+            return new RunnerHealthStatus { IsRunning = true, Status = "running" };
 
-        return new RunnerHealthStatus
+        // `tart ip --resolver=arp` only says whether the guest is in the host's ARP cache.
+        // That cache is empty for a while after the host wakes from sleep or its network
+        // changes, so a failure here does not mean the VM stopped -- and reporting it
+        // stopped makes the server end a VM that is mid-job. The VM state is authoritative.
+        List<TartVmInfo> vms;
+        try
         {
-            IsRunning = result.ExitCode == 0 && !string.IsNullOrWhiteSpace(result.Output),
-            Status = result.ExitCode == 0 ? "running" : "stopped"
-        };
+            vms = await ListVmsAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex,
+                "tart ip {VM} failed ({Code}) and tart list failed; reporting state unknown rather than stopped",
+                instanceHandle, result.ExitCode);
+            return new RunnerHealthStatus { IsRunning = true, Status = "unknown" };
+        }
+
+        var vm = vms.FirstOrDefault(v => string.Equals(v.Name, instanceHandle, StringComparison.OrdinalIgnoreCase));
+        if (vm?.IsRunning == true)
+        {
+            _logger.LogDebug(
+                "tart ip {VM} failed ({Code}: {Output}) but tart list reports it running",
+                instanceHandle, result.ExitCode, result.Output);
+            return new RunnerHealthStatus { IsRunning = true, Status = "running" };
+        }
+
+        return new RunnerHealthStatus { IsRunning = false, Status = vm == null ? "not_found" : "stopped" };
     }
 
     /// <summary>
     /// Discovers all RunnerRunner-managed Tart VMs currently on this host.
-    /// Filters by VMs whose name starts with "rr-".
+    /// Filters by VMs whose name starts with "rr-". Throws when <c>tart list</c> fails: an
+    /// empty list would tell the server every VM on this host is gone.
     /// </summary>
     public async Task<List<DiscoveredRunner>> DiscoverManagedVmsAsync(CancellationToken ct = default)
     {
         var result = new List<DiscoveredRunner>();
-        try
+        foreach (var vm in await ListVmsAsync(ct))
         {
-            foreach (var vm in await ListVmsAsync(ct))
-            {
-                if (!vm.Name.StartsWith("rr-", StringComparison.OrdinalIgnoreCase))
-                    continue;
+            if (!vm.Name.StartsWith("rr-", StringComparison.OrdinalIgnoreCase))
+                continue;
 
-                result.Add(new DiscoveredRunner
-                {
-                    VmName = vm.Name,
-                    RunnerName = vm.Name.StartsWith("rr-", StringComparison.OrdinalIgnoreCase) ? vm.Name[3..] : vm.Name,
-                    Backend = ExecutionBackend.Tart,
-                    IsRunning = vm.IsRunning,
-                    Status = vm.State
-                });
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to discover managed Tart VMs");
+            result.Add(new DiscoveredRunner
+            {
+                VmName = vm.Name,
+                RunnerName = vm.Name[3..],
+                Backend = ExecutionBackend.Tart,
+                IsRunning = vm.IsRunning,
+                Status = vm.State
+            });
         }
 
         return result;
@@ -578,7 +605,11 @@ public class TartBackend : IRunnerBackend
             throw new InvalidOperationException($"{operation} failed: {result.Output}");
     }
 
-    private static async Task<(int ExitCode, string Output)> RunCommandAsync(
+    private Task<(int ExitCode, string Output)> RunCommandAsync(
+        string command, string arguments, CancellationToken ct)
+        => _runCommand(command, arguments, ct);
+
+    private static async Task<(int ExitCode, string Output)> RunProcessAsync(
         string command, string arguments, CancellationToken ct)
     {
         if (string.Equals(command, "tart", StringComparison.OrdinalIgnoreCase))

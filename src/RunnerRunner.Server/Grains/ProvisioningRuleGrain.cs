@@ -284,11 +284,7 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
             var grain = GrainFactory.GetGrain<IRunnerInstanceGrain>(id);
             var instanceState = await grain.GetState();
             await grain.MarkStopping();
-            await _hostCommands.DispatchStopRunnerAsync(instanceState.HostId, new StopRunnerCommand
-            {
-                InstanceId = id,
-                InstanceHandle = instanceState.ContainerId ?? instanceState.VmName ?? instanceState.ProcessId?.ToString()
-            });
+            await _hostCommands.DispatchStopRunnerAsync(instanceState.HostId, StopRunnerCommand.ForInstance(id, instanceState.ContainerId, instanceState.VmName, instanceState.ProcessId));
             _logger.LogInformation("Stopping excess instance {InstanceId}", id);
         }
     }

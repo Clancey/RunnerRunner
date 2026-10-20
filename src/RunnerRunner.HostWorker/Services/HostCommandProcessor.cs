@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using RunnerRunner.Agent.Backends;
 using RunnerRunner.Agent.Services;
@@ -295,7 +296,7 @@ internal sealed class HostCommandProcessor : BackgroundService
             }
             else if (!string.IsNullOrWhiteSpace(command.InstanceHandle))
             {
-                await TryStopByHandleAsync(command.InstanceHandle, ct);
+                await TryStopByHandleAsync(command.InstanceHandle, command.Backend, ct);
             }
 
             await PublishAsync(HostWorkerMessageKinds.RunnerStopped, new RunnerStoppedEvent
@@ -316,10 +317,22 @@ internal sealed class HostCommandProcessor : BackgroundService
         }
     }
 
-    private async Task TryStopByHandleAsync(string handle, CancellationToken ct)
+    private async Task TryStopByHandleAsync(string handle, ExecutionBackend? backendType, CancellationToken ct)
     {
+        // A handle is only meaningful to the backend that issued it. Trying each backend in
+        // turn sent native PIDs to `tart stop <pid>` (which reports failure without throwing,
+        // so the native backend was never reached), and a PID is also a valid Docker ID prefix.
+        IRunnerBackend[] candidates = backendType switch
+        {
+            ExecutionBackend.Docker => [_dockerBackend],
+            ExecutionBackend.Tart => [_tartBackend],
+            ExecutionBackend.Native => [_nativeBackend],
+            _ when int.TryParse(handle, NumberStyles.None, CultureInfo.InvariantCulture, out _) => [_nativeBackend],
+            _ => [_dockerBackend, _tartBackend, _nativeBackend]
+        };
+
         var errors = new List<string>();
-        foreach (var backend in new[] { _dockerBackend, _tartBackend, _nativeBackend })
+        foreach (var backend in candidates)
         {
             try
             {
@@ -607,11 +620,7 @@ internal sealed class HostCommandProcessor : BackgroundService
                     }
                 }
 
-                await PublishAsync(HostWorkerMessageKinds.Reconciliation, new ReconciliationReport
-                {
-                    HostId = _identity.HostId,
-                    Runners = await DiscoverManagedRunnersAsync(ct)
-                }, ct);
+                await PublishAsync(HostWorkerMessageKinds.Reconciliation, await BuildReconciliationReportAsync(ct), ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -637,49 +646,67 @@ internal sealed class HostCommandProcessor : BackgroundService
         return images;
     }
 
-    private async Task<List<DiscoveredRunnerInfo>> DiscoverManagedRunnersAsync(CancellationToken ct)
+    internal async Task<ReconciliationReport> BuildReconciliationReportAsync(CancellationToken ct)
     {
-        var runners = new List<DiscoveredRunnerInfo>();
+        var report = new ReconciliationReport { HostId = _identity.HostId, ReportsBackendAvailability = true };
 
-        if (_dockerBackend is DockerBackend docker && await docker.IsAvailableAsync())
+        // A backend that cannot be listed is flagged rather than reported empty: the server
+        // reads a missing runner as one that exited, and would end and deregister it.
+        if (_dockerBackend is DockerBackend docker)
         {
             try
             {
-                var discovered = await docker.DiscoverManagedContainersAsync(ct);
-                runners.AddRange(discovered.Select(d => new DiscoveredRunnerInfo
+                if (!await docker.IsAvailableAsync(ct))
                 {
-                    InstanceId = d.InstanceId,
-                    RunnerName = d.RunnerName,
-                    ContainerId = d.ContainerId,
-                    Backend = d.Backend,
-                    IsRunning = d.IsRunning,
-                    Status = d.Status
-                }));
+                    report.UnavailableBackends.Add(ExecutionBackend.Docker);
+                }
+                else
+                {
+                    var discovered = await docker.DiscoverManagedContainersAsync(ct);
+                    report.Runners.AddRange(discovered.Select(d => new DiscoveredRunnerInfo
+                    {
+                        InstanceId = d.InstanceId,
+                        RunnerName = d.RunnerName,
+                        ContainerId = d.ContainerId,
+                        Backend = d.Backend,
+                        IsRunning = d.IsRunning,
+                        Status = d.Status
+                    }));
+                }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 _logger.LogWarning(ex, "Docker discovery failed during HostWorker reconciliation");
+                report.UnavailableBackends.Add(ExecutionBackend.Docker);
             }
         }
 
-        if (_tartBackend is TartBackend tart && await tart.IsAvailableAsync())
+        if (_tartBackend is TartBackend tart)
         {
             try
             {
-                var discovered = await tart.DiscoverManagedVmsAsync(ct);
-                runners.AddRange(discovered.Select(d => new DiscoveredRunnerInfo
+                if (!await tart.IsAvailableAsync(ct))
                 {
-                    InstanceId = d.InstanceId,
-                    RunnerName = d.RunnerName,
-                    VmName = d.VmName,
-                    Backend = d.Backend,
-                    IsRunning = d.IsRunning,
-                    Status = d.Status
-                }));
+                    report.UnavailableBackends.Add(ExecutionBackend.Tart);
+                }
+                else
+                {
+                    var discovered = await tart.DiscoverManagedVmsAsync(ct);
+                    report.Runners.AddRange(discovered.Select(d => new DiscoveredRunnerInfo
+                    {
+                        InstanceId = d.InstanceId,
+                        RunnerName = d.RunnerName,
+                        VmName = d.VmName,
+                        Backend = d.Backend,
+                        IsRunning = d.IsRunning,
+                        Status = d.Status
+                    }));
+                }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 _logger.LogWarning(ex, "Tart discovery failed during HostWorker reconciliation");
+                report.UnavailableBackends.Add(ExecutionBackend.Tart);
             }
         }
 
@@ -688,7 +715,7 @@ internal sealed class HostCommandProcessor : BackgroundService
             try
             {
                 var discovered = await native.DiscoverManagedProcessesAsync(ct);
-                runners.AddRange(discovered.Select(d => new DiscoveredRunnerInfo
+                report.Runners.AddRange(discovered.Select(d => new DiscoveredRunnerInfo
                 {
                     InstanceId = d.InstanceId,
                     RunnerName = d.RunnerName,
@@ -699,13 +726,14 @@ internal sealed class HostCommandProcessor : BackgroundService
                     Status = d.Status
                 }));
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 _logger.LogWarning(ex, "Native process discovery failed during HostWorker reconciliation");
+                report.UnavailableBackends.Add(ExecutionBackend.Native);
             }
         }
 
-        return runners;
+        return report;
     }
 
     private void OnRunnerExited(string instanceId, long exitCode, string reason)

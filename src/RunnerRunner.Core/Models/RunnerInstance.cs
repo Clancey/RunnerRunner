@@ -54,6 +54,14 @@ public class RunnerInstance
     public DateTime? StoppedAt { get; set; }
     public DateTime? LastHealthCheck { get; set; }
 
+    /// <summary>
+    /// When the host last affirmatively said this runner's resource is gone: a reconciliation
+    /// report that listed its backend without it (or listed it exited), or a stopped event.
+    /// Only meaningful while <see cref="LastHealthCheck"/> is older; stale health alone is
+    /// never evidence that the resource exited.
+    /// </summary>
+    public DateTime? HostReportedGoneAt { get; set; }
+
     /// <summary>Human-readable status detail, e.g. "Downloading runner v2.333.1", "Connected to GitHub"</summary>
     public string? StatusMessage { get; set; }
 

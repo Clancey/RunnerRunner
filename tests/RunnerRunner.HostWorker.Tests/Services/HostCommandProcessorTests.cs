@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
+using RunnerRunner.Agent.Backends;
 using RunnerRunner.Agent.Services;
 using RunnerRunner.Core.HostWorkers;
 using RunnerRunner.Core.Hub;
@@ -176,6 +177,103 @@ public class HostCommandProcessorTests
         Assert.Contains("simulated stop failure", rejected.Error);
     }
 
+    // Reproduces M4ini 2026-10-20 11:46:48: the server stopped native instances 516c3058,
+    // c5235957 and 2cdc03c7 by handle after the HostWorker had stopped tracking them. Docker
+    // rejected the unknown id, then TartBackend ran `tart stop 3331` -- which returns 2
+    // ("the specified VM "3331" does not exist") without throwing -- so the native backend that
+    // owns PID 3331 was never asked.
+    [Fact]
+    public Task StopRunner_UntrackedNativeHandle_GoesToTheNativeBackendOnly() =>
+        AssertUntrackedNativeHandleGoesToNativeOnly(ExecutionBackend.Native);
+
+    // Same as above for a server that predates StopRunnerCommand.Backend: a numeric handle is a PID.
+    [Fact]
+    public Task StopRunner_UntrackedNumericHandleWithoutBackend_GoesToTheNativeBackendOnly() =>
+        AssertUntrackedNativeHandleGoesToNativeOnly(backend: null);
+
+    private async Task AssertUntrackedNativeHandleGoesToNativeOnly(ExecutionBackend? backend)
+    {
+        using var directory = HostWorkerTestDirectory.Create("command-stop-native-handle");
+        var docker = new FakeRunnerBackend
+        {
+            BackendType = ExecutionBackend.Docker,
+            StopAsyncHandler = (handle, _) => throw new InvalidOperationException($"No such container: {handle}")
+        };
+        var tart = new FakeRunnerBackend { BackendType = ExecutionBackend.Tart };
+        var native = new FakeRunnerBackend { BackendType = ExecutionBackend.Native };
+        using var processor = CreateProcessor(directory, out _, out _, docker, tart, native);
+
+        await processor.ProcessCommandAsync(CreateCommand("cmd-stop-pid", new HostCommandEnvelope
+        {
+            Kind = HostCommandKind.StopRunner,
+            StopRunner = new StopRunnerCommand
+            {
+                InstanceId = "516c3058",
+                InstanceHandle = "3331",
+                Backend = backend
+            }
+        }), CancellationToken.None);
+
+        Assert.Equal(["3331"], native.StopRequests);
+        Assert.Empty(tart.StopRequests);
+        Assert.Empty(docker.StopRequests);
+    }
+
+    [Fact]
+    public async Task StopRunner_UntrackedTartHandle_GoesToTheTartBackendOnly()
+    {
+        using var directory = HostWorkerTestDirectory.Create("command-stop-tart-handle");
+        var docker = new FakeRunnerBackend { BackendType = ExecutionBackend.Docker };
+        var tart = new FakeRunnerBackend { BackendType = ExecutionBackend.Tart };
+        var native = new FakeRunnerBackend { BackendType = ExecutionBackend.Native };
+        using var processor = CreateProcessor(directory, out _, out _, docker, tart, native);
+
+        await processor.ProcessCommandAsync(CreateCommand("cmd-stop-vm", new HostCommandEnvelope
+        {
+            Kind = HostCommandKind.StopRunner,
+            StopRunner = StopRunnerCommand.ForInstance("02b717c2", containerId: null, vmName: "rr-FashionPact-macOS-VM-jit-44578a61", processId: null)
+        }), CancellationToken.None);
+
+        Assert.Equal(["rr-FashionPact-macOS-VM-jit-44578a61"], tart.StopRequests);
+        Assert.Empty(docker.StopRequests);
+        Assert.Empty(native.StopRequests);
+    }
+
+    // When `tart list` failed while the HostWorker built its reconciliation report, TartBackend
+    // swallowed the error and the report listed no VMs. The server reads a missing runner as
+    // one that exited: it marked each running VM's instance crashed and deregistered it, so a
+    // VM mid-job was ended over a failed listing. The report must say Tart could not be listed.
+    [Fact]
+    public async Task ReconciliationReport_WhenTartCannotBeListed_FlagsTartInsteadOfReportingNoVms()
+    {
+        using var directory = HostWorkerTestDirectory.Create("reconcile-tart-unavailable");
+        var listFails = true;
+        var tart = new TartBackend(
+            NullLogger<TartBackend>.Instance,
+            (_, args, _) => Task.FromResult(args switch
+            {
+                "--version" => (0, "2.28.0"),
+                "list --format json" when listFails => (1, "Error: Operation not permitted"),
+                "list --format json" => (0, """[{"Name":"rr-FashionPact-macOS-VM-jit-b848a12a","State":"running"}]"""),
+                _ => throw new InvalidOperationException($"unexpected tart {args}")
+            }));
+        using var processor = CreateProcessor(directory, out _, out _, tartBackend: tart);
+
+        var failed = await processor.BuildReconciliationReportAsync(CancellationToken.None);
+
+        Assert.Empty(failed.Runners);
+        Assert.Equal([ExecutionBackend.Tart], failed.UnavailableBackends);
+        Assert.True(failed.ReportsBackendAvailability);
+
+        listFails = false;
+        var listed = await processor.BuildReconciliationReportAsync(CancellationToken.None);
+
+        var vm = Assert.Single(listed.Runners);
+        Assert.Equal("rr-FashionPact-macOS-VM-jit-b848a12a", vm.VmName);
+        Assert.True(vm.IsRunning);
+        Assert.Empty(listed.UnavailableBackends);
+    }
+
     [Fact]
     public async Task MalformedCommandEnvelope_PublishesRejectedStatus()
     {
@@ -261,9 +359,9 @@ public class HostCommandProcessorTests
         HostWorkerTestDirectory directory,
         out FakeHostWorkerEventSink sink,
         out RunnerLifecycleManager lifecycle,
-        FakeRunnerBackend? dockerBackend = null,
-        FakeRunnerBackend? tartBackend = null,
-        FakeRunnerBackend? nativeBackend = null,
+        IRunnerBackend? dockerBackend = null,
+        IRunnerBackend? tartBackend = null,
+        IRunnerBackend? nativeBackend = null,
         string? runnerBasePath = null)
     {
         var configValues = new Dictionary<string, string?>

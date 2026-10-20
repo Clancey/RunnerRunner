@@ -74,7 +74,14 @@ internal sealed class RecordingHostCommandDispatcher : IHostCommandDispatcher
     private Task RecordAsync(string hostId, HostCommandKind kind, object command)
     {
         lock (_gate)
+        {
+            // Mirrors HostWorkerConnectionRegistry.SendAsync: there is no outbox, so a command
+            // for a host that is not connected is not sent.
+            if (_disconnectedHosts.Contains(hostId))
+                throw new InvalidOperationException($"HostWorker '{hostId}' is not connected.");
+
             _commands.Add(new DispatchedHostCommand(hostId, kind, command));
+        }
 
         return Task.CompletedTask;
     }

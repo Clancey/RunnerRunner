@@ -34,4 +34,16 @@ public static class TestDocumentStore
 
         return store;
     }
+
+    /// <summary>
+    /// Tables are created on first insert. A live server has long since stored webhook
+    /// events, and services that scan them assume the table exists.
+    /// </summary>
+    public static async Task<IDocumentStore> CreateWithWebhookEventsTableAsync()
+    {
+        var store = Create();
+        await store.Insert(new WebhookEvent { Id = "table-seed", Action = "queued", Status = "completed", JobId = "0" });
+        await store.Remove<WebhookEvent>("table-seed");
+        return store;
+    }
 }

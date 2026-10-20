@@ -273,46 +273,62 @@ public class OrchestrationEngineEnvCompositionTests
     }
 
     [Fact]
-    public async Task StaleCleanup_RemovesOldStoppedInstances()
+    public void StaleCleanup_RemovesOnlyTerminalRecordsTheHostReportedGone()
     {
-        var store = TestDocumentStore.Create();
-
-        var stale = new RunnerInstance
+        var now = DateTime.UtcNow;
+        var gone = new RunnerInstance
         {
             RunnerName = "stale-runner",
             Status = RunnerInstanceStatus.Stopped,
-            StoppedAt = DateTime.UtcNow.AddMinutes(-10) // older than 5 min
+            StoppedAt = now.AddMinutes(-10),
+            HostReportedGoneAt = now.AddMinutes(-10)
         };
         var recent = new RunnerInstance
         {
             RunnerName = "recent-runner",
             Status = RunnerInstanceStatus.Stopped,
-            StoppedAt = DateTime.UtcNow.AddMinutes(-1) // recent
+            StoppedAt = now.AddMinutes(-1),
+            HostReportedGoneAt = now.AddMinutes(-1)
         };
-        var running = new RunnerInstance
+        var running = new RunnerInstance { RunnerName = "active-runner", Status = RunnerInstanceStatus.Running };
+
+        Assert.True(OrchestrationEngine.IsRemovableStaleInstance(gone, now));
+        Assert.False(OrchestrationEngine.IsRemovableStaleInstance(recent, now));
+        Assert.False(OrchestrationEngine.IsRemovableStaleInstance(running, now));
+    }
+
+    // Marked crashed while the host was unreachable (stale health): the VM may still be
+    // running a job, so the record must not be forgotten 5 minutes later.
+    [Fact]
+    public void StaleCleanup_KeepsATerminalRecordTheHostNeverReportedGone()
+    {
+        var now = DateTime.UtcNow;
+        var staleHealth = new RunnerInstance
         {
-            RunnerName = "active-runner",
-            Status = RunnerInstanceStatus.Running
+            RunnerName = "Macos-jit-073525a2",
+            Status = RunnerInstanceStatus.Crashed,
+            StoppedAt = now.AddMinutes(-10),
+            LastHealthCheck = now.AddMinutes(-14)
+        };
+        var reportedAgain = new RunnerInstance
+        {
+            RunnerName = "FashionPact-macOS-VM-jit-b848a12a",
+            Status = RunnerInstanceStatus.Crashed,
+            StoppedAt = now.AddMinutes(-10),
+            HostReportedGoneAt = now.AddMinutes(-10),
+            LastHealthCheck = now.AddMinutes(-1)
+        };
+        var dynamic = new RunnerInstance
+        {
+            RunnerName = "ll-linux-jit-e38466ec",
+            ProvisioningMode = "dynamic",
+            Status = RunnerInstanceStatus.Failed,
+            StoppedAt = now.AddMinutes(-10),
+            HostReportedGoneAt = now.AddMinutes(-10)
         };
 
-        await store.Insert(stale);
-        await store.Insert(recent);
-        await store.Insert(running);
-
-        // Simulate stale cleanup logic
-        var instances = (await store.Query<RunnerInstance>().ToList()).ToList();
-        var staleInstances = instances.Where(i =>
-            i.Status is RunnerInstanceStatus.Stopped or RunnerInstanceStatus.Failed or RunnerInstanceStatus.Crashed
-            && i.StoppedAt.HasValue
-            && i.StoppedAt.Value < DateTime.UtcNow.AddMinutes(-5));
-
-        foreach (var s in staleInstances)
-            await store.Remove<RunnerInstance>(s.Id);
-
-        var remaining = (await store.Query<RunnerInstance>().ToList()).ToList();
-        Assert.Equal(2, remaining.Count);
-        Assert.DoesNotContain(remaining, r => r.RunnerName == "stale-runner");
-        Assert.Contains(remaining, r => r.RunnerName == "recent-runner");
-        Assert.Contains(remaining, r => r.RunnerName == "active-runner");
+        Assert.False(OrchestrationEngine.IsRemovableStaleInstance(staleHealth, now));
+        Assert.False(OrchestrationEngine.IsRemovableStaleInstance(reportedAgain, now));
+        Assert.False(OrchestrationEngine.IsRemovableStaleInstance(dynamic, now));
     }
 }

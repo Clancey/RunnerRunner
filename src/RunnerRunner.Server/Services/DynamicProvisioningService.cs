@@ -1629,11 +1629,7 @@ public class DynamicProvisioningService : BackgroundService
             var host = (await store.Query<Host>().ToList()).FirstOrDefault(h => h.Id == instance.HostId);
             if (host != null)
             {
-                await _hostCommands.DispatchStopRunnerAsync(host.Id, new StopRunnerCommand
-                {
-                    InstanceId = instance.Id,
-                    InstanceHandle = instance.ContainerId ?? instance.VmName ?? instance.ProcessId?.ToString()
-                });
+                await _hostCommands.DispatchStopRunnerAsync(host.Id, StopRunnerCommand.ForInstance(instance.Id, instance.ContainerId, instance.VmName, instance.ProcessId));
             }
 
             await _runnerRegistrationCleanupService.TryRemoveRunnerAsync(store, instance);

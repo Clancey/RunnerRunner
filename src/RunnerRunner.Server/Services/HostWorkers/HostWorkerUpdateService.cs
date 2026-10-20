@@ -441,11 +441,7 @@ public sealed class HostWorkerUpdateService
                 var runnerGrain = _grainFactory.GetGrain<IRunnerInstanceGrain>(instance.Id);
                 await runnerGrain.MarkStopping();
 
-                await _dispatcher.DispatchStopRunnerAsync(hostId, new StopRunnerCommand
-                {
-                    InstanceId = instance.Id,
-                    InstanceHandle = instance.ContainerId ?? instance.VmName ?? instance.ProcessId?.ToString()
-                });
+                await _dispatcher.DispatchStopRunnerAsync(hostId, StopRunnerCommand.ForInstance(instance.Id, instance.ContainerId, instance.VmName, instance.ProcessId));
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {

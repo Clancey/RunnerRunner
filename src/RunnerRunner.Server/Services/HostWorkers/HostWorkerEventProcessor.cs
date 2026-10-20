@@ -368,6 +368,7 @@ public sealed class HostWorkerEventProcessor
                 : RunnerInstanceStatus.Stopped;
             instance.ErrorMessage = evt.ErrorMessage;
             instance.StoppedAt = DateTime.UtcNow;
+            instance.HostReportedGoneAt = instance.StoppedAt;
             await _store.Update(instance);
 
             if (instance.ProvisioningMode == "dynamic" && !string.IsNullOrWhiteSpace(instance.WebhookEventId))
