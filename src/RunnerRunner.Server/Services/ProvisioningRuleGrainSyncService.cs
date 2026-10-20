@@ -219,7 +219,7 @@ internal static class ProvisioningRuleGrainConfigMapper
         EnvironmentVariableSetIds = [.. runner.EnvironmentVariableSetIds],
         EnvironmentOverrides = new Dictionary<string, string>(runner.EnvironmentOverrides),
         EnvironmentOverrideSecretKeys = [.. runner.EnvironmentOverrideSecretKeys],
-        DockerConfig = runner.DockerConfig,
+        DockerConfig = runner.DockerConfig?.Clone(),
         TartConfig = runner.TartConfig,
         Labels = [.. runner.Labels],
         TargetGroupId = runner.TargetGroupId,

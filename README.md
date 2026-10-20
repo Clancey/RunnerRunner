@@ -537,6 +537,33 @@ executed command. It does not undo remote side effects or stop a detached
 runner. Runner launch backgrounds only the runner, so SSH can return while the
 runner remains active and preamble failures still reach the host.
 
+### Opt-in Docker tmpfs scratch
+
+Docker runner containers normally keep the runner work directory and `/tmp` on the container root
+filesystem. On hosts where that root is a slow loopback overlay (for example Unraid's `docker.img`), fsync-heavy
+jobs such as SQLite-backed test suites can run several times slower than on a bind-mounted static runner.
+
+In a rule's **runner target → Docker image** (or the legacy **Profiles → Docker Image Configuration**), enable
+**Use capped RAM scratch**. RunnerRunner then creates the container with two size-capped tmpfs mounts:
+
+| Mount | Options |
+|---|---|
+| Work directory (default `/actions-runner/_work`, the `myoung34/github-runner` path) | `rw,exec,nosuid,nodev,size=<work MiB>m,mode=1777` |
+| `/tmp` | `rw,exec,nosuid,nodev,size=<tmp MiB>m,mode=1777` |
+
+- It is off by default (`DockerConfig.Scratch` absent or `null`), and disabled targets create containers exactly as before.
+- It adds no host bind paths, Docker socket, privileges or memory limits. Contents vanish with the container.
+- It is only for ephemeral GitHub JIT runners in Linux containers, so only webhook rules can enable it on a target.
+  The editors reject other combinations. The Docker backend rejects non-ephemeral, non-GitHub, and non-Linux-image starts before creating a container.
+  A profile that is also used by a static or scale-set rule starts without scratch there, and a warning is logged.
+- The tool cache (`/opt/hostedtoolcache`), `dotnet` installs and `~/.nuget` stay on the container root.
+- The JIT wrapper logs a warning if the runner's real `_work` directory differs from the configured mount. In that case the job still runs, but without the speedup.
+- Tmpfs pages are host RAM, and the caps are ceilings, not reservations. Budget `(work + tmp) × max concurrent runners` against the host's free memory.
+- The HostWorker applies the mounts. Older HostWorkers ignore the setting and run the job on the container root as before.
+
+Verify a live runner with `docker inspect <container> --format '{{json .HostConfig.Tmpfs}}'` and
+`stat -f -c %T /actions-runner/_work` inside it (expect `tmpfs`).
+
 ## Environment Variable Composition
 
 Env vars are composed in layers (later layers win on key conflicts):

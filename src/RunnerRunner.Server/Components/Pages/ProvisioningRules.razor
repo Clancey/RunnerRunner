@@ -702,6 +702,9 @@
                                                             </select>
                                                         </div>
                                                     </div>
+                                                    <DockerScratchEditor @bind-Value="docker.Scratch" Platform="runner.RequiredHostPlatform"
+                                                                         Ephemeral="runner.Ephemeral" Provider="editRule.Provider"
+                                                                         JitDispatch="editRule.Type == ProvisioningType.Webhook" />
                                                 </div>
                                             }
                                             else if (runner.ExecutionBackend == ExecutionBackend.Tart)
@@ -1349,6 +1352,11 @@ else
                 if (string.IsNullOrWhiteSpace(docker.RegistryUrl) || string.IsNullOrWhiteSpace(docker.ImageName))
                 {
                     formError = $"Docker runner '{runner.Name}' needs a registry and image name.";
+                    return false;
+                }
+                if (docker.Scratch?.GetValidationError(runner.RequiredHostPlatform, runner.Ephemeral, editRule.Provider, editRule.Type == ProvisioningType.Webhook) is { } error)
+                {
+                    formError = $"Runner '{runner.Name}': {error}";
                     return false;
                 }
             }
@@ -2835,7 +2843,7 @@ else
         UpdatedAt = rule.UpdatedAt
     };
 
-    private static RunnerDefinition CloneRunnerDefinition(RunnerDefinition runner) => new()
+    internal static RunnerDefinition CloneRunnerDefinition(RunnerDefinition runner) => new()
     {
         Id = runner.Id,
         Name = runner.Name,
@@ -2848,7 +2856,7 @@ else
         EnvironmentVariableSetIds = [.. runner.EnvironmentVariableSetIds],
         EnvironmentOverrides = new Dictionary<string, string>(runner.EnvironmentOverrides),
         EnvironmentOverrideSecretKeys = [.. runner.EnvironmentOverrideSecretKeys],
-        DockerConfig = runner.DockerConfig,
+        DockerConfig = runner.DockerConfig?.Clone(),
         TartConfig = runner.TartConfig,
         Labels = [.. runner.Labels],
         TargetGroupId = runner.TargetGroupId,

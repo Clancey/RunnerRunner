@@ -33,6 +33,14 @@ public class DockerBackend : IRunnerBackend
         _client = new DockerClientConfiguration(_endpoint).CreateClient();
     }
 
+    internal DockerBackend(ILogger<DockerBackend> logger, DockerClient client)
+    {
+        _logger = logger;
+        _client = client;
+        _endpoint = client.Configuration.EndpointBaseUri;
+        _hasDockerHint = true;
+    }
+
     public async Task<bool> IsAvailableAsync(CancellationToken ct = default)
     {
         if (!_hasDockerHint)
@@ -61,6 +69,21 @@ public class DockerBackend : IRunnerBackend
         var config = request.DockerConfig
             ?? throw new InvalidOperationException("DockerConfig is required for Docker backend");
 
+        var scratch = config.Scratch;
+        if (scratch != null)
+        {
+            var error = scratch.GetRunnerValidationError(request.Ephemeral, request.Provider);
+            if (error != null)
+                throw new InvalidOperationException(error);
+            if (string.IsNullOrWhiteSpace(request.JitConfig))
+            {
+                // Static/scale-set dispatch of a shared profile: the image's own entrypoint picks
+                // the work directory, so run exactly as before rather than failing every start.
+                _logger.LogWarning("Docker scratch ignored for {Runner}: it only applies to GitHub JIT runners", request.RunnerName);
+                scratch = null;
+            }
+        }
+
         var imageName = ImageReference.Build(config.RegistryUrl, config.ImageName, config.Tag);
         var repository = ImageReference.BuildRepository(config.RegistryUrl, config.ImageName);
 
@@ -82,6 +105,17 @@ public class DockerBackend : IRunnerBackend
             await _client.Images.CreateImageAsync(
                 new ImagesCreateParameters { FromImage = repository, Tag = config.Tag },
                 authConfig, new Progress<JSONMessage>(m => _logger.LogDebug("Pull: {Status}", m.Status)), ct);
+        }
+
+        ImageInspectResponse? scratchImage = null;
+        if (scratch != null)
+        {
+            // The container OS (not the worker's OS) decides whether Linux tmpfs applies.
+            // Never infer the runner path from WorkingDir. The JIT wrapper discovers
+            // run.sh and checks its real working directory before launching the runner.
+            scratchImage = await _client.Images.InspectImageAsync(imageName, ct);
+            if (!string.Equals(scratchImage.Os, "linux", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Docker scratch requires a Linux container image.");
         }
 
         // Build environment variables
@@ -168,6 +202,11 @@ public class DockerBackend : IRunnerBackend
                 // reconciliation and logs can distinguish "exited" from "never existed".
                 AutoRemove = false,
                 Binds = null,
+                Tmpfs = scratch == null ? null : new Dictionary<string, string>
+                {
+                    [scratch.WorkDirectory] = $"rw,exec,nosuid,nodev,size={scratch.WorkSizeMb}m,mode=1777",
+                    ["/tmp"] = $"rw,exec,nosuid,nodev,size={scratch.TempSizeMb}m,mode=1777"
+                },
                 RestartPolicy = request.Ephemeral
                     ? new RestartPolicy { Name = RestartPolicyKind.No }
                     : new RestartPolicy { Name = RestartPolicyKind.UnlessStopped }
@@ -178,7 +217,7 @@ public class DockerBackend : IRunnerBackend
         // a wrapper that does JIT setup and exec's the original entrypoint.
         if (!string.IsNullOrEmpty(request.JitConfig))
         {
-            var imageInspect = await _client.Images.InspectImageAsync(imageName, ct);
+            var imageInspect = scratchImage ?? await _client.Images.InspectImageAsync(imageName, ct);
             var originalEntrypoint = imageInspect.Config?.Entrypoint;
             var originalCmd = imageInspect.Config?.Cmd;
             var imageShell = imageInspect.Config?.Shell;
@@ -189,7 +228,8 @@ public class DockerBackend : IRunnerBackend
                 originalEntrypoint,
                 originalCmd,
                 imageShell,
-                request.InitSteps);
+                request.InitSteps,
+                scratch);
             createParams.Cmd = new List<string>();
 
             _logger.LogInformation("JIT mode: overriding entrypoint for {Image} ({ContainerOs} container, {StepCount} init steps)",
@@ -407,16 +447,18 @@ public class DockerBackend : IRunnerBackend
         IList<string>? entrypoint,
         IList<string>? cmd,
         IList<string>? shell,
-        IList<Core.Models.ResolvedInitStep>? initSteps = null)
+        IList<Core.Models.ResolvedInitStep>? initSteps = null,
+        DockerScratchConfig? scratch = null)
         => isWindowsContainer
             ? BuildWindowsJitEntrypointOverride(entrypoint, cmd, initSteps)
-            : BuildLinuxJitEntrypointOverride(entrypoint, cmd, shell, initSteps);
+            : BuildLinuxJitEntrypointOverride(entrypoint, cmd, shell, initSteps, scratch);
 
     private static List<string> BuildLinuxJitEntrypointOverride(
         IList<string>? entrypoint,
         IList<string>? cmd,
         IList<string>? shell,
-        IList<Core.Models.ResolvedInitStep>? initSteps)
+        IList<Core.Models.ResolvedInitStep>? initSteps,
+        DockerScratchConfig? scratch)
     {
         var shellPath = DetectShell(entrypoint, cmd, shell);
         var execParts = new List<string>();
@@ -539,6 +581,20 @@ public class DockerBackend : IRunnerBackend
 
             "if [ -n \"$runner_cmd\" ] && [ -n \"${RR_JIT_CONFIG:-}\" ]; then " +
             "  echo \"[RunnerRunner] Starting GitHub runner via JIT config: $runner_cmd\"; cd \"$(dirname \"$runner_cmd\")\"; ");
+
+        if (scratch != null)
+        {
+            if (scratch.GetValidationError() is { } error)
+                throw new InvalidOperationException(error);
+            // Validation excludes shell syntax, so single quotes are safe. A mismatch is
+            // logged rather than fatal: the job still runs, only without the speedup.
+            wrapperScript.Append(
+                $"rr_expected_work='{scratch.WorkDirectory}'; " +
+                "rr_actual_work=\"$(pwd -P)/_work\"; " +
+                "if [ \"$rr_actual_work\" != \"$rr_expected_work\" ]; then " +
+                "  echo \"[RunnerRunner] WARNING: Docker scratch is mounted at $rr_expected_work but the runner work directory is $rr_actual_work\" >&2; " +
+                "fi; ");
+        }
 
         if (string.IsNullOrEmpty(postFragment))
         {
