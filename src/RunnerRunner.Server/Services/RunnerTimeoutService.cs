@@ -17,7 +17,6 @@ public class RunnerTimeoutService : BackgroundService
     private static readonly TimeSpan PendingTimeout = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan StartingTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan DynamicPickupTimeout = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan DefaultDynamicRunningTimeout = TimeSpan.FromHours(6);
     private static readonly TimeSpan StoppingTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan HealthCheckStaleTimeout = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan DynamicTerminalRetention = TimeSpan.FromMinutes(10);
@@ -29,7 +28,7 @@ public class RunnerTimeoutService : BackgroundService
     // How long a provider answer that blocks a stop (Busy, Unknown) is reused. The scan runs
     // every 30s and each lookup costs up to two GitHub API calls per runner; a busy runner
     // stays busy for minutes, and acting on Idle is never delayed because Idle is not cached.
-    private static readonly TimeSpan ProviderActivityCacheDuration = TimeSpan.FromMinutes(2);
+    internal static readonly TimeSpan ProviderActivityCacheDuration = TimeSpan.FromMinutes(2);
 
     // "pending" (WebhookEvent.ScheduleRetry's default status) is one of the open-ended queue
     // statuses that WebhookEvent.EnsureLifecycleWindow/ScheduleRetry deliberately never expire
@@ -47,11 +46,8 @@ public class RunnerTimeoutService : BackgroundService
         new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Backstop for dynamic runners whose completion webhook was lost. It must stay above
-    /// the longest job the pool can legitimately run: a runner that trips this is killed
-    /// and its workspace deleted, so a value below a real job's timeout destroys healthy
-    /// builds mid-step and reports it as a build failure. Runners that really exited are
-    /// caught far sooner by the host reporting them gone, so this only needs to be generous.
+    /// Backstop for dynamic runners whose completion webhook was lost; see
+    /// <see cref="DynamicRunnerTimeouts.GetRunningTimeout"/>.
     /// </summary>
     private readonly TimeSpan _dynamicRunningTimeout;
 
@@ -65,11 +61,7 @@ public class RunnerTimeoutService : BackgroundService
         _services = services;
         _hostCommands = hostCommands;
 
-        var configuredMinutes = configuration.GetValue(
-            "DynamicProvisioning:RunningTimeoutMinutes",
-            (int)DefaultDynamicRunningTimeout.TotalMinutes);
-
-        _dynamicRunningTimeout = TimeSpan.FromMinutes(Math.Max(1, configuredMinutes));
+        _dynamicRunningTimeout = DynamicRunnerTimeouts.GetRunningTimeout(configuration);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -434,11 +426,10 @@ public class RunnerTimeoutService : BackgroundService
             or ProviderRunnerActivity.NotSupported;
 
     /// <summary>
-    /// How long a runner the provider cannot answer about (Unknown) is left alone. Busy is
-    /// never stopped; Unknown is usually a GitHub outage or a credential problem, so it waits
-    /// well past any job the backstop allows before giving up on the runner.
+    /// How long a runner the provider cannot answer about (Unknown) is left alone; shared with
+    /// <see cref="ReconciliationService"/>'s orphan cleanup.
     /// </summary>
-    private TimeSpan UnknownActivityCeiling => _dynamicRunningTimeout * 2;
+    private TimeSpan UnknownActivityCeiling => DynamicRunnerTimeouts.GetUnknownActivityCeiling(_dynamicRunningTimeout);
 
     private bool IsPastUnknownActivityCeiling(DateTime startedAt, DateTime now) =>
         now - startedAt > UnknownActivityCeiling;

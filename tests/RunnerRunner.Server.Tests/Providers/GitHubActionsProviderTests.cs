@@ -469,4 +469,33 @@ public class GitHubActionsProviderTests
         Assert.Equal(["/orgs/octo-org/actions/runners/10"], deletedPaths);
         Assert.All(api.Requests, request => Assert.Equal("Bearer", request.Authorization?.Scheme));
     }
+
+    [Fact]
+    public async Task RemoveOfflineDynamicRunners_KeepsARegistrationWhoseBusyStateIsMissing()
+    {
+        var api = new FakeProviderHttpApi()
+            .Respond(
+                req => req.Method == HttpMethod.Get,
+                _ => FakeProviderHttpApi.JsonResponse("""
+                {
+                  "runners": [
+                    { "id": 15, "name": "rr-jit-no-busy", "status": "offline" }
+                  ]
+                }
+                """))
+            .Respond(req => req.Method == HttpMethod.Delete, _ => new HttpResponseMessage(HttpStatusCode.NoContent));
+        var provider = new GitHubActionsProvider(api, new GitHubAuthenticationService(api, _authLogger), _logger);
+
+        var removed = await provider.RemoveOfflineDynamicRunnersAsync(
+            new ProviderCredential
+            {
+                Name = "github",
+                GitHubOrg = "octo-org",
+                GitHubToken = "ghp_test"
+            },
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
+        Assert.Equal(0, removed);
+        Assert.DoesNotContain(api.Requests, request => request.Method == HttpMethod.Delete);
+    }
 }

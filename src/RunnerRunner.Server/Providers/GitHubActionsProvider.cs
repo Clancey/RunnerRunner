@@ -13,7 +13,9 @@ namespace RunnerRunner.Server.Providers;
 /// </summary>
 public class GitHubActionsProvider : IRunnerProviderPlugin
 {
-    internal sealed record GitHubRunnerRegistration(long Id, string Name, string Status, bool Busy);
+    /// <param name="Busy">Null when GitHub's listing omits the field: that says nothing about
+    /// whether the runner is on a job, so callers must not read it as idle.</param>
+    internal sealed record GitHubRunnerRegistration(long Id, string Name, string Status, bool? Busy);
     private sealed record GitHubRunnerEndpoint(string Url, string? Repository);
 
     private readonly IHttpClientFactory _httpFactory;
@@ -83,7 +85,7 @@ public class GitHubActionsProvider : IRunnerProviderPlugin
         foreach (var runner in registrations)
         {
             if (!IsDynamicRunnerName(runner.Name)
-                || runner.Busy
+                || runner.Busy != false
                 || string.Equals(runner.Status, "online", StringComparison.OrdinalIgnoreCase)
                 || protectedRunnerNames.Contains(runner.Name))
             {
@@ -201,7 +203,14 @@ public class GitHubActionsProvider : IRunnerProviderPlugin
             var status = runner.TryGetProperty("status", out var statusElement)
                 ? statusElement.GetString() ?? ""
                 : "";
-            var busy = runner.TryGetProperty("busy", out var busyElement) && busyElement.ValueKind is JsonValueKind.True;
+            bool? busy = runner.TryGetProperty("busy", out var busyElement)
+                ? busyElement.ValueKind switch
+                {
+                    JsonValueKind.True => true,
+                    JsonValueKind.False => false,
+                    _ => null
+                }
+                : null;
 
             runners.Add(new GitHubRunnerRegistration(id, name, status, busy));
         }

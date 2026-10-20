@@ -714,7 +714,9 @@ internal sealed class HostCommandProcessor : BackgroundService
         {
             try
             {
-                var discovered = await native.DiscoverManagedProcessesAsync(ct);
+                // Runner:BasePath is where this HostWorker reads native runner logs from, so
+                // runners may live there too. Base paths that deploys used are recorded by the backend.
+                var discovered = await native.DiscoverManagedProcessesAsync([_configuration["Runner:BasePath"]], ct);
                 report.Runners.AddRange(discovered.Select(d => new DiscoveredRunnerInfo
                 {
                     InstanceId = d.InstanceId,

@@ -37,12 +37,20 @@ public class ReconciliationService : IHostedService, IDisposable
     internal static readonly TimeSpan RunningOrphanGracePeriod = TimeSpan.FromMinutes(10);
 
     // A running orphan the provider cannot answer about (Unknown) is left alone this long,
-    // counted from the first report that listed it. Matches RunnerTimeoutService's default
-    // ceiling (twice the 6h dynamic backstop).
-    internal static readonly TimeSpan OrphanUnknownActivityCeiling = TimeSpan.FromHours(12);
+    // counted from the first report that listed it. It is the same ceiling RunnerTimeoutService
+    // gives a tracked runner (twice DynamicProvisioning:RunningTimeoutMinutes), so a runner
+    // that loses its record is not destroyed sooner than one that kept it.
+    private readonly TimeSpan _orphanUnknownActivityCeiling;
 
     // host|backend|resource -> first report that listed it as a running orphan.
     private readonly ConcurrentDictionary<string, DateTime> _runningOrphanFirstSeen = new(StringComparer.Ordinal);
+
+    // Instance id -> a provider answer that blocks deregistration (Busy, Unknown), reused for
+    // RunnerTimeoutService.ProviderActivityCacheDuration. A runner left running because the
+    // provider reports it busy is missing from every 30s report; this keeps that to one
+    // provider lookup every couple of minutes.
+    private readonly ConcurrentDictionary<string, (ProviderRunnerActivity Activity, DateTime CheckedAt)> _blockingActivity =
+        new(StringComparer.Ordinal);
 
     private readonly ILogger<ReconciliationService> _logger;
     private readonly IServiceProvider _services;
@@ -51,11 +59,13 @@ public class ReconciliationService : IHostedService, IDisposable
     public ReconciliationService(
         ILogger<ReconciliationService> logger,
         IServiceProvider services,
-        IHostCommandDispatcher hostCommands)
+        IHostCommandDispatcher hostCommands,
+        IConfiguration configuration)
     {
         _logger = logger;
         _services = services;
         _hostCommands = hostCommands;
+        _orphanUnknownActivityCeiling = DynamicRunnerTimeouts.GetUnknownActivityCeiling(configuration);
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -137,6 +147,18 @@ public class ReconciliationService : IHostedService, IDisposable
                     continue;
                 }
 
+                // The host listed the backend and the runner is not there, but a runner the
+                // provider reports busy is evidently alive somewhere (a discovery gap on the
+                // host, say). Ending it would requeue its job and deregister it mid-job.
+                var activity = await GetProviderActivityAsync(store, registrationCleanup, instance, nowUtc);
+                if (activity == ProviderRunnerActivity.Busy)
+                {
+                    _logger.LogWarning(
+                        "Runner {Name} is missing from host {Host}'s report, but the provider reports it busy; leaving it {Status} for a later report or the timeout service to decide",
+                        instance.RunnerName, reportHostId, instance.Status);
+                    continue;
+                }
+
                 var newStatus = instance.Status == RunnerInstanceStatus.Running
                     ? RunnerInstanceStatus.Crashed
                     : RunnerInstanceStatus.Stopped;
@@ -147,15 +169,16 @@ public class ReconciliationService : IHostedService, IDisposable
                 instance.HostReportedGoneAt = nowUtc;
                 await store.Update(instance);
 
-                await TryRecoverDynamicRunnerAsync(
+                await RequeueDynamicJobAsync(
                     store,
-                    registrationCleanup,
                     instance,
                     "Runner disappeared from the host before the queued job started; provisioning will be retried");
 
                 _logger.LogWarning(
                     "Marking stale runner {Name} as {Status} — not found on host",
                     instance.RunnerName, newStatus);
+
+                await TryDeregisterRunnerAsync(store, registrationCleanup, instance, activity);
             }
             else if (!IsRunnerStillActive(matchedRunner))
             {
@@ -169,13 +192,27 @@ public class ReconciliationService : IHostedService, IDisposable
                     "Marking runner {Name} as stopped — host reported it exited (status: {HostStatus})",
                     instance.RunnerName, matchedRunner.Status);
 
-                await TryRecoverDynamicRunnerAsync(
+                await RequeueDynamicJobAsync(
                     store,
-                    registrationCleanup,
                     instance,
                     $"Runner exited on the host before the queued job started ({matchedRunner.Status}); provisioning will be retried");
                 await SendCleanupCommandAsync(hostId, matchedRunner);
+
+                // The process is gone, so the record ends whatever the provider says; the
+                // provider soon shows a dead runner offline and not busy. Until it does (or
+                // while it cannot answer), the registration stays.
+                await TryDeregisterRunnerAsync(
+                    store,
+                    registrationCleanup,
+                    instance,
+                    await GetProviderActivityAsync(store, registrationCleanup, instance, nowUtc));
             }
+        }
+
+        foreach (var (cachedId, cached) in _blockingActivity)
+        {
+            if (nowUtc - cached.CheckedAt >= RunnerTimeoutService.ProviderActivityCacheDuration)
+                _blockingActivity.TryRemove(cachedId, out _);
         }
 
         // Find orphans on host (in report but NOT in DB)
@@ -262,7 +299,7 @@ public class ReconciliationService : IHostedService, IDisposable
             }
 
             if (!RunnerTimeoutService.ProviderAllowsRecycle(known)
-                && !(known == ProviderRunnerActivity.Unknown && nowUtc - firstSeen > OrphanUnknownActivityCeiling))
+                && !(known == ProviderRunnerActivity.Unknown && nowUtc - firstSeen > _orphanUnknownActivityCeiling))
             {
                 _logger.LogWarning(
                     "Not cleaning up {Backend} resource {Resource} on host {Host}: it has no record, but the provider reports runner {RunnerName} {Activity}",
@@ -407,9 +444,8 @@ public class ReconciliationService : IHostedService, IDisposable
         => string.Equals(instance.ProvisioningMode, "dynamic", StringComparison.OrdinalIgnoreCase)
             && RunnerTimeoutService.PrepareLinkedEventRetry(linkedEvent, nowUtc, reason);
 
-    private async Task TryRecoverDynamicRunnerAsync(
+    private static async Task RequeueDynamicJobAsync(
         IDocumentStore store,
-        RunnerRegistrationCleanupService registrationCleanup,
         RunnerInstance instance,
         string reason)
     {
@@ -420,8 +456,68 @@ public class ReconciliationService : IHostedService, IDisposable
             if (TryPrepareDynamicWebhookRetry(instance, linkedEvent, DateTime.UtcNow, reason) && linkedEvent != null)
                 await store.Update(linkedEvent);
         }
+    }
 
-        await registrationCleanup.TryRemoveRunnerAsync(store, instance);
+    /// <summary>
+    /// Deregisters <paramref name="instance"/>'s runner only when the provider allows it.
+    /// Deregistering a runner that is on a job kills the job, so Busy and Unknown keep the
+    /// registration.
+    /// </summary>
+    private async Task TryDeregisterRunnerAsync(
+        IDocumentStore store,
+        RunnerRegistrationCleanupService registrationCleanup,
+        RunnerInstance instance,
+        ProviderRunnerActivity activity)
+    {
+        if (RunnerTimeoutService.ProviderAllowsRecycle(activity))
+        {
+            await registrationCleanup.TryRemoveRunnerAsync(store, instance);
+            return;
+        }
+
+        if (activity == ProviderRunnerActivity.Busy)
+        {
+            _logger.LogWarning(
+                "Not deregistering runner {Name} ({Id}): the provider reports it busy",
+                instance.RunnerName, instance.Id);
+        }
+        else
+        {
+            _logger.LogDebug(
+                "Not deregistering runner {Name} ({Id}): the provider reports it {Activity}",
+                instance.RunnerName, instance.Id, activity);
+        }
+    }
+
+    private async Task<ProviderRunnerActivity> GetProviderActivityAsync(
+        IDocumentStore store,
+        RunnerRegistrationCleanupService registrationCleanup,
+        RunnerInstance instance,
+        DateTime nowUtc)
+    {
+        if (_blockingActivity.TryGetValue(instance.Id, out var cached)
+            && nowUtc - cached.CheckedAt < RunnerTimeoutService.ProviderActivityCacheDuration)
+        {
+            return cached.Activity;
+        }
+
+        ProviderRunnerActivity activity;
+        try
+        {
+            activity = await registrationCleanup.GetProviderRunnerActivityAsync(store, instance);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Could not determine provider activity for runner {RunnerName}", instance.RunnerName);
+            activity = ProviderRunnerActivity.Unknown;
+        }
+
+        if (activity is ProviderRunnerActivity.Busy or ProviderRunnerActivity.Unknown)
+            _blockingActivity[instance.Id] = (activity, nowUtc);
+        else
+            _blockingActivity.TryRemove(instance.Id, out _);
+
+        return activity;
     }
 
     private Task SendCleanupCommandAsync(string hostId, DiscoveredRunnerInfo runner) =>
