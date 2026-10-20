@@ -21,6 +21,7 @@ internal sealed class HostMaintenanceService : BackgroundService
     private readonly HostResourceUsageCollector _resourceUsage;
     private readonly RunnerLifecycleManager _lifecycleManager;
     private readonly ILogger<HostMaintenanceService> _logger;
+    private readonly MountSafeDirectoryDeleter _deleter;
 
     private readonly bool _enabled;
     private readonly TimeSpan _interval;
@@ -40,6 +41,7 @@ internal sealed class HostMaintenanceService : BackgroundService
         _resourceUsage = resourceUsage;
         _lifecycleManager = lifecycleManager;
         _logger = logger;
+        _deleter = new MountSafeDirectoryDeleter(logger);
 
         _enabled = configuration.GetValue("HostWorker:Maintenance:Enabled", true);
         _interval = TimeSpan.FromHours(Math.Max(0.25, configuration.GetValue("HostWorker:Maintenance:IntervalHours", 6d)));
@@ -250,7 +252,7 @@ internal sealed class HostMaintenanceService : BackgroundService
             var size = MeasureSize(entry);
 
             if (entry.IsDirectory)
-                Directory.Delete(entry.Path, recursive: true);
+                _deleter.DeleteOrThrow(entry.Path);
             else
                 File.Delete(entry.Path);
 

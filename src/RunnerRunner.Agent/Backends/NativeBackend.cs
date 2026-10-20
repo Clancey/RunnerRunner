@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using RunnerRunner.Agent.Services;
 using RunnerRunner.Core.Interfaces;
 using RunnerRunner.Core.Models;
 
@@ -27,13 +28,20 @@ public class NativeBackend : IRunnerBackend
         Environment.GetEnvironmentVariable("RR_DEFAULT_LOCALE") ?? "C.UTF-8";
 
     private readonly ILogger<NativeBackend> _logger;
+    private readonly MountSafeDirectoryDeleter _deleter;
     private readonly Dictionary<string, ManagedNativeRunner> _runners = new();
 
     public ExecutionBackend BackendType => ExecutionBackend.Native;
 
     public NativeBackend(ILogger<NativeBackend> logger)
+        : this(logger, new MountSafeDirectoryDeleter(logger))
+    {
+    }
+
+    internal NativeBackend(ILogger<NativeBackend> logger, MountSafeDirectoryDeleter deleter)
     {
         _logger = logger;
+        _deleter = deleter;
     }
 
     public Task<bool> IsAvailableAsync(CancellationToken ct = default) => Task.FromResult(true);
@@ -68,7 +76,7 @@ public class NativeBackend : IRunnerBackend
         var agentDir = Path.Combine(basePath, "agents", provider.ToString().ToLower(), agentVersion);
         if (!Directory.Exists(agentDir) || Directory.GetFiles(agentDir, "*", SearchOption.AllDirectories).Length == 0)
         {
-            if (Directory.Exists(agentDir)) Directory.Delete(agentDir, recursive: true);
+            if (Directory.Exists(agentDir)) _deleter.DeleteOrThrow(agentDir);
             _logger.LogInformation("Runner agent not found at {Dir}, attempting download...", agentDir);
             await DownloadRunnerAgentAsync(provider, agentVersion, agentDir, ct);
         }
@@ -86,8 +94,12 @@ public class NativeBackend : IRunnerBackend
 
         // Step 2: Create isolated instance directory (clone the agent)
         var instanceDir = Path.Combine(basePath, "instances", runnerDirectoryName);
-        if (Directory.Exists(instanceDir))
-            Directory.Delete(instanceDir, recursive: true);
+        var staleInstance = _deleter.Delete(instanceDir);
+        if (!staleInstance.Completed)
+        {
+            throw new InvalidOperationException(
+                $"Existing instance directory {instanceDir} could not be fully removed ({staleInstance.Describe()}); refusing to reuse it.");
+        }
 
         _logger.LogInformation("Creating isolated instance at {Dir}", instanceDir);
         CopyDirectory(agentDir, instanceDir);
@@ -232,49 +244,118 @@ public class NativeBackend : IRunnerBackend
             if (!runner.Process.HasExited)
             {
                 _logger.LogWarning("Runner {RunnerName} did not exit gracefully, force killing", runner.RunnerName);
-                runner.Process.Kill(entireProcessTree: true);
+                try
+                {
+                    runner.Process.Kill(entireProcessTree: true);
+                    runner.Process.WaitForExit(10_000);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error force killing runner {RunnerName}", runner.RunnerName);
+                }
             }
         }
 
+        // Anything still running could mount into the directories while cleanup walks them.
+        var exited = HasExited(runner.Process);
         runner.Process.Dispose();
+        if (!exited)
+        {
+            _logger.LogError(
+                "Runner {RunnerName} was still running after being killed; leaving {InstanceDir} in place and skipping post-exit steps",
+                runner.RunnerName, runner.InstanceDir);
+            _runners.Remove(instanceHandle);
+            return;
+        }
 
         // Run PostExit init steps before wiping the instance dir.
         if (runner.PostExitSteps.Count > 0)
         {
-            _logger.LogInformation("Running {Count} post-exit init step(s) for {RunnerName}",
-                runner.PostExitSteps.Count, runner.RunnerName);
-            try
-            {
-                var executor = new InitStepExecutor(_logger);
-                await executor.RunAsync(
-                    runner.PostExitSteps,
-                    Core.Models.InitStepPhase.PostExit,
-                    runner.WorkDir,
-                    runner.RunnerEnvironment,
-                    runner.LogFile,
-                    ct);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Post-exit init steps failed for {RunnerName}", runner.RunnerName);
-            }
+            await RunPostExitStepsAsync(
+                runner.RunnerName,
+                runner.WorkDir,
+                runner.InstanceDir,
+                runner.PostExitSteps,
+                runner.RunnerEnvironment,
+                runner.LogFile,
+                ct);
         }
 
         // Clean up instance directory
+        if (Directory.Exists(runner.InstanceDir))
+            DeleteInstanceDirectory(runner.InstanceDir, "instance");
+
+        _runners.Remove(instanceHandle);
+    }
+
+    /// <summary>
+    /// Post-exit steps are user scripts that typically <c>rm -rf</c> the work directory, so they
+    /// only run once nothing the job mounted is left inside the runner's directories.
+    /// </summary>
+    internal async Task<bool> RunPostExitStepsAsync(
+        string runnerName,
+        string workDir,
+        string instanceDir,
+        IReadOnlyList<Core.Models.ResolvedInitStep> steps,
+        IReadOnlyDictionary<string, string> environment,
+        string? logFile,
+        CancellationToken ct)
+    {
+        var workDirMounts = _deleter.UnmountBeneath(workDir);
+        var instanceDirMounts = _deleter.UnmountBeneath(instanceDir);
+        if (workDirMounts is null || instanceDirMounts is null)
+        {
+            _logger.LogError(
+                "Skipping {Count} post-exit init step(s) for {RunnerName}: could not check {WorkDir} and {InstanceDir} for mounts, so a cleanup step could delete through one",
+                steps.Count, runnerName, workDir, instanceDir);
+            return false;
+        }
+
+        var remainingMounts = workDirMounts
+            .Concat(instanceDirMounts)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (remainingMounts.Count > 0)
+        {
+            _logger.LogError(
+                "Skipping {Count} post-exit init step(s) for {RunnerName}: {Mounts} still mounted inside the runner's directories and could not be unmounted, so a cleanup step could delete through them",
+                steps.Count, runnerName, string.Join(", ", remainingMounts));
+            return false;
+        }
+
+        _logger.LogInformation("Running {Count} post-exit init step(s) for {RunnerName}", steps.Count, runnerName);
         try
         {
-            if (Directory.Exists(runner.InstanceDir))
+            var executor = new InitStepExecutor(_logger);
+            await executor.RunAsync(steps, Core.Models.InitStepPhase.PostExit, workDir, environment, logFile, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Post-exit init steps failed for {RunnerName}", runnerName);
+        }
+        return true;
+    }
+
+    private void DeleteInstanceDirectory(string instanceDir, string kind)
+    {
+        try
+        {
+            var result = _deleter.Delete(instanceDir);
+            if (result.Completed)
             {
-                Directory.Delete(runner.InstanceDir, recursive: true);
-                _logger.LogInformation("Cleaned up instance dir {Dir}", runner.InstanceDir);
+                _logger.LogInformation("Cleaned up {Kind} dir {Dir}", kind, instanceDir);
+            }
+            else
+            {
+                _logger.LogError(
+                    "Left part of {Kind} dir {Dir} in place: {Reason}",
+                    kind, instanceDir, result.Describe());
             }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to clean up instance directory {Dir}", runner.InstanceDir);
+            _logger.LogWarning(ex, "Failed to clean up {Kind} directory {Dir}", kind, instanceDir);
         }
-
-        _runners.Remove(instanceHandle);
     }
 
     public Task<RunnerHealthStatus> GetHealthAsync(string instanceHandle, CancellationToken ct = default)
@@ -393,9 +474,10 @@ public class NativeBackend : IRunnerBackend
     {
         _logger.LogInformation("Cleaning up orphaned native runner (PID: {PID})", processId);
 
+        var exited = true;
         try
         {
-            var proc = Process.GetProcessById(processId);
+            using var proc = Process.GetProcessById(processId);
             if (!proc.HasExited)
             {
                 if (!OperatingSystem.IsWindows())
@@ -408,9 +490,19 @@ public class NativeBackend : IRunnerBackend
                 if (!proc.HasExited)
                 {
                     _logger.LogWarning("Orphan PID {PID} did not exit after SIGTERM, force killing", processId);
-                    proc.Kill(entireProcessTree: true);
+                    try
+                    {
+                        proc.Kill(entireProcessTree: true);
+                        proc.WaitForExit(10_000);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error force killing orphan process {PID}", processId);
+                    }
                 }
             }
+
+            exited = HasExited(proc);
         }
         catch (ArgumentException)
         {
@@ -419,19 +511,55 @@ public class NativeBackend : IRunnerBackend
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Error killing orphan process {PID}", processId);
+            exited = !IsProcessRunning(processId);
+        }
+
+        if (!exited)
+        {
+            // Anything still running could mount into the directory while cleanup walks it.
+            _logger.LogError(
+                "Orphan PID {PID} was still running after being killed; leaving {InstanceDir} in place",
+                processId, instanceDir);
+            return;
         }
 
         if (!string.IsNullOrEmpty(instanceDir) && Directory.Exists(instanceDir))
         {
-            try
-            {
-                Directory.Delete(instanceDir, recursive: true);
-                _logger.LogInformation("Cleaned up orphan instance dir {Dir}", instanceDir);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to clean up orphan instance directory {Dir}", instanceDir);
-            }
+            DeleteInstanceDirectory(instanceDir, "orphan instance");
+        }
+    }
+
+    private static bool HasExited(Process process)
+    {
+        try
+        {
+            process.Refresh();
+            return process.HasExited;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsProcessRunning(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            return true;
         }
     }
 

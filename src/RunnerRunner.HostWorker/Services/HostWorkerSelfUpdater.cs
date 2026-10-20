@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Docker.DotNet;
 using Docker.DotNet.Models;
+using RunnerRunner.Agent.Services;
 using RunnerRunner.Core.Hub;
 
 namespace RunnerRunner.HostWorker.Services;
@@ -52,7 +53,7 @@ internal sealed class HostWorkerSelfUpdater
         await VerifySha256Async(downloadPath, command.Sha256, ct);
 
         if (Directory.Exists(payloadPath))
-            Directory.Delete(payloadPath, recursive: true);
+            new MountSafeDirectoryDeleter(_logger).DeleteOrThrow(payloadPath);
         Directory.CreateDirectory(payloadPath);
         Extract(downloadPath, payloadPath);
 
@@ -365,7 +366,7 @@ internal sealed class HostWorkerSelfUpdater
         public override Task PrepareAsync(CancellationToken ct)
         {
             if (Directory.Exists(_targetDirectory))
-                Directory.Delete(_targetDirectory, recursive: true);
+                new MountSafeDirectoryDeleter(Logger).DeleteOrThrow(_targetDirectory);
             CopyDirectory(PayloadPath, _targetDirectory);
             CopySettings(AppContext.BaseDirectory, _targetDirectory);
             TryMakeExecutable(Path.Combine(_targetDirectory, "RunnerRunner.HostWorker"));
