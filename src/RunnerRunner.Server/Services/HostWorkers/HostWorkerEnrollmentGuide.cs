@@ -748,8 +748,10 @@ public sealed class HostWorkerEnrollmentGuideBuilder
           fi
         fi
 
+        __MOUNT_SAFE_REMOVAL_HELPERS__
+
         version_dir="${install_root}/versions/${version}"
-        rm -rf "${version_dir}"
+        rr_safe_rm "${version_dir}"
         mkdir -p "${version_dir}" "${install_root}/logs"
         tar -xzf "${archive}" -C "${version_dir}"
         chmod +x "${version_dir}/RunnerRunner.HostWorker"
@@ -761,6 +763,7 @@ public sealed class HostWorkerEnrollmentGuideBuilder
         launchctl kickstart -k "gui/$(id -u)/${service_label}"
         "${install_root}/runnerrunner-host" status
         """)
+            .Replace("__MOUNT_SAFE_REMOVAL_HELPERS__", MacOSMountSafeRemovalHelpers)
             .Replace("__VERSION__", ShellQuote(package.Version))
             .Replace("__ASSET_URL__", ShellQuote(package.AssetUrl ?? ""))
             .Replace("__SHA256__", ShellQuote(package.Sha256 ?? ""));
@@ -1108,6 +1111,75 @@ public sealed class HostWorkerEnrollmentGuideBuilder
             BuildRemovalNotes(request));
     }
 
+    /// <summary>
+    /// Bash helpers (macOS) that remove a runner-controlled directory without deleting through a
+    /// share or disk image a CI job left mounted inside it: unmount what can be unmounted, refuse
+    /// otherwise, and never let rm cross onto another filesystem.
+    /// </summary>
+    private const string MacOSMountSafeRemovalHelpers = """
+        # --- mount-safe removal helpers ---
+        # A CI job can leave a share or disk image mounted inside its work directory; a plain
+        # recursive rm would delete that share's contents. Unmount what we can and refuse otherwise.
+        rr_mounts_under() {
+          mount | awk '{
+              start = index($0, " on ")
+              if (start == 0) next
+              rest = substr($0, start + 4)
+              cut = 0
+              for (i = length(rest) - 1; i > 0; i--) if (substr(rest, i, 2) == " (") { cut = i; break }
+              if (cut == 0) next
+              mp = substr(rest, 1, cut - 1)
+              print mp
+              if (index(mp, "/System/Volumes/Data/") == 1) print substr(mp, 21)
+            }' \
+            | RR_ROOT="$1" awk 'BEGIN { root = ENVIRON["RR_ROOT"] } $0 == root || index($0, root "/") == 1' \
+            | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-
+        }
+
+        rr_safe_rm() {
+          local target="$1" name parent root remaining mount_point root_dev parent_dev
+          [ -n "$target" ] || return 0
+          target="${target%/}"
+          if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target" ]; }; then
+            rm -f "$target"
+            return 0
+          fi
+          [ -d "$target" ] || return 0
+          # Resolve only the parent: following the target itself would turn a target swapped for
+          # a symlink into a delete of whatever it points at (rm never follows its operand).
+          name="$(basename "$target")"
+          parent="$(cd "$(dirname "$target")" && pwd -P)" || parent=""
+          case "$name" in ''|.|..|/) parent="" ;; esac
+          if [ -z "$parent" ]; then
+            echo "Refusing to remove ${target}: could not resolve it safely." >&2
+            return 1
+          fi
+          if [ "$parent" = "/" ]; then root="/${name}"; else root="${parent}/${name}"; fi
+          while IFS= read -r mount_point; do
+            [ -n "$mount_point" ] || continue
+            umount "$mount_point" || true
+          done <<< "$(rr_mounts_under "$root")"
+          remaining="$(rr_mounts_under "$root")"
+          if [ -n "$remaining" ]; then
+            echo "Refusing to remove ${target}: these are still mounted inside it after an unmount attempt:" >&2
+            printf '%s\n' "$remaining" >&2
+            echo "Unmount them, then run this again." >&2
+            return 1
+          fi
+          # -x keeps rm on the device of $root itself, so $root must not be a mount the table
+          # didn't show (or one that appeared since it was read): compare it with its parent.
+          root_dev="$(stat -f %d "$root" 2>/dev/null)" || root_dev=""
+          parent_dev="$(stat -f %d "$parent" 2>/dev/null)" || parent_dev=""
+          if [ -z "$root_dev" ] || [ -z "$parent_dev" ] || [ "$root_dev" != "$parent_dev" ]; then
+            echo "Refusing to remove ${target}: ${root} is on a different filesystem than its parent (or its device could not be read)." >&2
+            return 1
+          fi
+          # -x: never cross into another filesystem, even one the mount table didn't show.
+          rm -rfx "$root"
+        }
+        # --- end mount-safe removal helpers ---
+        """;
+
     private HostWorkerEnrollmentInstructions BuildMacOSNativeRemoval(HostWorkerRemovalRequest request)
     {
         var command = NormalizeCommand("""
@@ -1119,21 +1191,38 @@ public sealed class HostWorkerEnrollmentGuideBuilder
         native_base_path="${runner_base_path:-${install_root}}"
         instances_dir="${native_base_path}/instances"
 
+        runner_pids=""
         if [ -d "$instances_dir" ]; then
-          find "$instances_dir" -name rr.pid -print | while IFS= read -r pid_file; do
+          while IFS= read -r pid_file; do
             pid="$(cat "$pid_file" 2>/dev/null || true)"
             case "$pid" in ''|*[!0-9]*) continue ;; esac
             kill "$pid" 2>/dev/null || true
-          done
+            runner_pids="${runner_pids} ${pid}"
+          done < <(find "$instances_dir" -name rr.pid -print)
+        fi
+        # A runner still running could mount something into its directory while it is removed.
+        for _ in $(seq 1 30); do
+          alive=""
+          for pid in $runner_pids; do kill -0 "$pid" 2>/dev/null && alive="${alive} ${pid}"; done
+          [ -z "$alive" ] && break
+          sleep 1
+        done
+        if [ -n "${alive:-}" ]; then
+          echo "Refusing to remove runner directories: runner processes${alive} are still running. Stop them, then run this again." >&2
+          exit 1
         fi
 
         launchctl bootout "gui/$(id -u)/${service_label}" 2>/dev/null || true
         launchctl unload "${HOME}/Library/LaunchAgents/${service_label}.plist" 2>/dev/null || true
         rm -f "${HOME}/Library/LaunchAgents/${service_label}.plist"
-        rm -rf "${install_root}"
-        if [ -n "$work_directory" ]; then rm -rf "$work_directory"; fi
-        if [ -n "$runner_base_path" ] && [ "$runner_base_path" != "$install_root" ]; then rm -rf "$runner_base_path"; fi
+
+        __MOUNT_SAFE_REMOVAL_HELPERS__
+
+        rr_safe_rm "${install_root}"
+        if [ -n "$work_directory" ]; then rr_safe_rm "$work_directory"; fi
+        if [ -n "$runner_base_path" ] && [ "$runner_base_path" != "$install_root" ]; then rr_safe_rm "$runner_base_path"; fi
         """)
+            .Replace("__MOUNT_SAFE_REMOVAL_HELPERS__", MacOSMountSafeRemovalHelpers)
             .Replace("__RUNNER_BASE_PATH__", ShellQuote(request.RunnerBasePath ?? ""))
             .Replace("__WORK_DIRECTORY__", ShellQuote(request.WorkDirectory ?? ""));
 

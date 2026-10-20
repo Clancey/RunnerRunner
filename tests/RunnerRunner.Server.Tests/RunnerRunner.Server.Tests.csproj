@@ -27,6 +27,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\RunnerRunner.Agent.Tests\TestSupport\MacDiskImage.cs" Link="TestSupport\MacDiskImage.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\RunnerRunner.Core\RunnerRunner.Core.csproj" />
     <ProjectReference Include="..\..\src\RunnerRunner.Server\RunnerRunner.Server.csproj" />
   </ItemGroup>
