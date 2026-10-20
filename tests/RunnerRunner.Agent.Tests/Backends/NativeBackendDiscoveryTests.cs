@@ -246,44 +246,149 @@ public sealed class NativeBackendDiscoveryTests : IDisposable
         if (OperatingSystem.IsWindows())
             return;
 
-        var token = "rr-pid-write-test-" + Guid.NewGuid().ToString("N");
-        var agentDir = Path.Combine(HostBasePath, "agents", "githubactions", "2.999.0");
-        Directory.CreateDirectory(agentDir);
-        await File.WriteAllTextAsync(Path.Combine(agentDir, "config.sh"), "#!/bin/bash\nexit 0\n");
-        // The runner and a child that carries the same arguments, so both are visible to ps.
-        await File.WriteAllTextAsync(
-            Path.Combine(agentDir, "run.sh"),
-            "#!/bin/bash\nbash -c 'sleep 120 & wait' rr-runner-child \"$@\" &\nwait\n");
+        var token = await CreateSpawningAgentAsync();
         // The instance is a copy of the agent directory, so this makes rr.pid a directory there.
+        var agentDir = Path.Combine(HostBasePath, "agents", "githubactions", "2.999.0");
         Directory.CreateDirectory(Path.Combine(agentDir, "rr.pid"));
         await File.WriteAllTextAsync(Path.Combine(agentDir, "rr.pid", "placeholder"), "");
 
         try
         {
-            await Assert.ThrowsAnyAsync<Exception>(() => CreateBackend().StartRunnerAsync(new RunnerStartRequest
-            {
-                InstanceId = "inst-pid-write",
-                RunnerName = "Macos-jit-pid-write",
-                Provider = RunnerProvider.GitHubActions,
-                RunnerAgentVersion = "2.999.0",
-                RunnerBasePath = HostBasePath,
-                JitConfig = token
-            }));
+            await Assert.ThrowsAnyAsync<Exception>(() => StartSpawningRunnerAsync(CreateBackend(), token));
 
             Assert.Empty(FindProcessesWithArgument(token));
         }
         finally
         {
-            foreach (var pid in FindProcessesWithArgument(token))
+            KillProcessesWithArgument(token);
+        }
+    }
+
+    // A PID file write that fails part way (a full disk) left an empty or partial rr.pid
+    // behind after the runner was stopped. Discovery reads every rr.pid as a live runner's,
+    // so it failed the scan on every report from then on: the host reported the native
+    // backend unavailable, hiding every native runner on it, until someone removed the file.
+    [Fact]
+    public async Task Start_WhenThePidFileWriteFillsTheDisk_LeavesNothingThatBreaksDiscovery()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var token = await CreateSpawningAgentAsync();
+        var backend = new NativeBackend(NullLogger<NativeBackend>.Instance)
+        {
+            DefaultBasePath = DefaultBasePath,
+            WriteTextFileAsync = async (path, _, _) =>
             {
-                try
-                {
-                    using var leaked = Process.GetProcessById(pid);
-                    leaked.Kill(entireProcessTree: true);
-                }
-                catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
-                {
-                }
+                await File.WriteAllTextAsync(path, "");
+                throw new IOException("No space left on device");
+            }
+        };
+
+        try
+        {
+            var error = await Assert.ThrowsAsync<IOException>(() => StartSpawningRunnerAsync(backend, token));
+            Assert.Equal("No space left on device", error.Message);
+            Assert.Empty(FindProcessesWithArgument(token));
+
+            Assert.Empty(await CreateBackend().DiscoverManagedProcessesAsync());
+            Assert.Empty(Directory.GetFiles(SpawningInstanceDir, "rr.pid*"));
+        }
+        finally
+        {
+            KillProcessesWithArgument(token);
+        }
+    }
+
+    // Whatever rr.pid the instance holds when the write fails names no runner of ours, since
+    // the one launched was stopped, so it is removed rather than left for discovery.
+    [Fact]
+    public async Task Start_WhenThePidFileCannotBeWritten_RemovesTheRrPidLeftInTheInstance()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var token = await CreateSpawningAgentAsync();
+        // A stray PID file in the cached agent is copied into the instance.
+        await File.WriteAllTextAsync(Path.Combine(HostBasePath, "agents", "githubactions", "2.999.0", "rr.pid"), "");
+        var backend = new NativeBackend(NullLogger<NativeBackend>.Instance)
+        {
+            DefaultBasePath = DefaultBasePath,
+            WriteTextFileAsync = (_, _, _) => throw new UnauthorizedAccessException("Access to the path is denied.")
+        };
+
+        try
+        {
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() => StartSpawningRunnerAsync(backend, token));
+            Assert.Empty(FindProcessesWithArgument(token));
+
+            Assert.Empty(await CreateBackend().DiscoverManagedProcessesAsync());
+            Assert.False(File.Exists(Path.Combine(SpawningInstanceDir, "rr.pid")));
+            Assert.True(Directory.Exists(SpawningInstanceDir));
+        }
+        finally
+        {
+            KillProcessesWithArgument(token);
+        }
+    }
+
+    // The PID file is written to a temporary name and renamed into place, so a reader sees a
+    // whole PID or none. The temporary file names no runner.
+    [Fact]
+    public async Task Discover_IgnoresAnInstanceWithOnlyATemporaryPidFile()
+    {
+        var dir = Path.Combine(DefaultBasePath, "instances", "rr-writing");
+        Directory.CreateDirectory(dir);
+        await File.WriteAllTextAsync(
+            Path.Combine(dir, "rr-instance.json"),
+            JsonSerializer.Serialize(new { InstanceId = "inst-writing", RunnerName = "Macos-jit-writing" }));
+        await File.WriteAllTextAsync(Path.Combine(dir, $"rr.pid.{Guid.NewGuid():N}.tmp"), "36");
+
+        Assert.Empty(await CreateBackend().DiscoverManagedProcessesAsync());
+    }
+
+    private const string SpawningInstanceId = "inst-pid-write";
+    private const string SpawningRunnerName = "Macos-jit-pid-write";
+
+    private string SpawningInstanceDir => Path.Combine(
+        HostBasePath, "instances", NativeBackend.CreateSafeRunnerDirectoryName(SpawningRunnerName, SpawningInstanceId));
+
+    // A cached GitHub Actions agent under HostBasePath whose run.sh starts a runner and a
+    // child that both carry the returned token in their arguments, so both are visible to ps.
+    private async Task<string> CreateSpawningAgentAsync()
+    {
+        var token = "rr-pid-write-test-" + Guid.NewGuid().ToString("N");
+        var agentDir = Path.Combine(HostBasePath, "agents", "githubactions", "2.999.0");
+        Directory.CreateDirectory(agentDir);
+        await File.WriteAllTextAsync(Path.Combine(agentDir, "config.sh"), "#!/bin/bash\nexit 0\n");
+        await File.WriteAllTextAsync(
+            Path.Combine(agentDir, "run.sh"),
+            "#!/bin/bash\nbash -c 'sleep 120 & wait' rr-runner-child \"$@\" &\nwait\n");
+        return token;
+    }
+
+    private Task<RunnerInstanceInfo> StartSpawningRunnerAsync(NativeBackend backend, string token) =>
+        backend.StartRunnerAsync(new RunnerStartRequest
+        {
+            InstanceId = SpawningInstanceId,
+            RunnerName = SpawningRunnerName,
+            Provider = RunnerProvider.GitHubActions,
+            RunnerAgentVersion = "2.999.0",
+            RunnerBasePath = HostBasePath,
+            JitConfig = token
+        });
+
+    private static void KillProcessesWithArgument(string argument)
+    {
+        foreach (var pid in FindProcessesWithArgument(argument))
+        {
+            try
+            {
+                using var leaked = Process.GetProcessById(pid);
+                leaked.Kill(entireProcessTree: true);
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            {
             }
         }
     }

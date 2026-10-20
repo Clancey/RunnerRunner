@@ -42,6 +42,8 @@ public class RunnerTimeoutService : BackgroundService
     private readonly ILogger<RunnerTimeoutService> _logger;
     private readonly IServiceProvider _services;
     private readonly IHostCommandDispatcher _hostCommands;
+    // Instance id -> a provider answer that keeps a runner (Busy, Unknown), reused for
+    // ProviderActivityCacheDuration. See GetProviderActivityAsync.
     private readonly ConcurrentDictionary<string, (ProviderRunnerActivity Activity, DateTime CheckedAt)> _blockingActivity =
         new(StringComparer.Ordinal);
 
@@ -240,7 +242,7 @@ public class RunnerTimeoutService : BackgroundService
                         "Dynamic runner {RunnerName} ({Id}) is not bound to resolved event job {EventJobId} (claim: {JobId}); leaving it running",
                         instance.RunnerName, instance.Id, linkedEvent?.JobId, instance.JobId ?? "released");
                 }
-                else if (await GetProviderActivityAsync(registrations, store, instance, ct) is var resolvedActivity
+                else if (await GetProviderActivityAsync(registrations, store, instance, unknownAllowsStop: false, ct) is var resolvedActivity
                     && !ProviderAllowsRecycle(resolvedActivity))
                 {
                     // A matching claim is RunnerRunner's belief, and it goes stale whenever the
@@ -281,7 +283,7 @@ public class RunnerTimeoutService : BackgroundService
                         "Dynamic runner {RunnerName} ({Id}) did not pick up job {EventJobId} and no longer holds that claim (now {JobId}); leaving it running",
                         instance.RunnerName, instance.Id, linkedEvent?.JobId, instance.JobId ?? "released");
                 }
-                else if (await GetProviderActivityAsync(registrations, store, instance, ct) is var pickupActivity
+                else if (await GetProviderActivityAsync(registrations, store, instance, unknownAllowsStop: false, ct) is var pickupActivity
                     && !ProviderAllowsRecycle(pickupActivity))
                 {
                     // Without webhooks the claim never moves, so "never picked up" really means
@@ -320,7 +322,10 @@ public class RunnerTimeoutService : BackgroundService
             && instance.StartedAt != null
             && now - instance.StartedAt.Value > _dynamicRunningTimeout)
         {
-            var activity = await GetProviderActivityAsync(registrations, store, instance, ct);
+            var activity = await GetProviderActivityAsync(
+                registrations, store, instance,
+                unknownAllowsStop: IsPastUnknownActivityCeiling(instance.StartedAt.Value, now),
+                ct);
             if (activity == ProviderRunnerActivity.Busy)
             {
                 _logger.LogWarning(
@@ -381,10 +386,14 @@ public class RunnerTimeoutService : BackgroundService
         return false;
     }
 
+    // A cached answer may only keep a runner. When the caller stops the runner on Unknown
+    // (unknownAllowsStop: it is past the Unknown ceiling), a cached Unknown is not reused: it
+    // may predate the provider giving the runner a job, so the stop waits for a fresh answer.
     private async Task<ProviderRunnerActivity> GetProviderActivityAsync(
         RunnerRegistrationCleanupService? registrations,
         IDocumentStore store,
         RunnerInstance instance,
+        bool unknownAllowsStop,
         CancellationToken ct)
     {
         if (registrations == null)
@@ -392,7 +401,8 @@ public class RunnerTimeoutService : BackgroundService
 
         var now = DateTime.UtcNow;
         if (_blockingActivity.TryGetValue(instance.Id, out var cached)
-            && now - cached.CheckedAt < ProviderActivityCacheDuration)
+            && now - cached.CheckedAt < ProviderActivityCacheDuration
+            && !(cached.Activity == ProviderRunnerActivity.Unknown && unknownAllowsStop))
         {
             return cached.Activity;
         }
@@ -621,10 +631,11 @@ public class RunnerTimeoutService : BackgroundService
 
         var hostReportsIt = HostStillReportsActive(instance, terminalSince, now);
 
-        var activity = await GetProviderActivityAsync(registrations, store, instance, ct);
         var startedAt = instance.StartedAt ?? instance.DeployedAt ?? instance.CreatedAt;
+        var pastUnknownCeiling = IsPastUnknownActivityCeiling(startedAt, now);
+        var activity = await GetProviderActivityAsync(registrations, store, instance, unknownAllowsStop: pastUnknownCeiling, ct);
         if (!ProviderAllowsRecycle(activity)
-            && !(activity == ProviderRunnerActivity.Unknown && IsPastUnknownActivityCeiling(startedAt, now)))
+            && !(activity == ProviderRunnerActivity.Unknown && pastUnknownCeiling))
         {
             _logger.LogInformation(
                 "Keeping {Status} record for runner {RunnerName} ({Id}): the host {HostView} and the provider reports it {Activity}",

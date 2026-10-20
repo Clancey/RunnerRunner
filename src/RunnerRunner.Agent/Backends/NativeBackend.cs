@@ -174,9 +174,10 @@ public class NativeBackend : IRunnerBackend
         }
 
         var instanceHandle = runProcess.Id.ToString();
+        var pidFile = Path.Combine(instanceDir, PidFileName);
         try
         {
-            await File.WriteAllTextAsync(Path.Combine(instanceDir, "rr.pid"), runProcess.Id.ToString());
+            await WritePidFileAsync(pidFile, instanceHandle);
         }
         catch (Exception ex)
         {
@@ -194,6 +195,9 @@ public class NativeBackend : IRunnerBackend
                 _logger.LogError(killEx, "Could not stop native runner {RunnerName} (PID: {PID}) after its PID file write failed", request.RunnerName, runProcess.Id);
             }
             runProcess.Dispose();
+            // An rr.pid left here names no runner of ours, but discovery would read it as a
+            // live runner's on every scan, and fail each one if it is damaged.
+            TryDeletePidFile(pidFile);
             throw;
         }
         _runners[instanceHandle] = new ManagedNativeRunner
@@ -327,6 +331,51 @@ public class NativeBackend : IRunnerBackend
     // Where runners go when a start request names no base path. Settable so tests can keep
     // discovery away from the real ~/.runnerrunner.
     internal string DefaultBasePath { get; init; } = GetDefaultRunnerBasePath();
+
+    // Writes the PID file's text. Settable so tests can make that write fail.
+    internal Func<string, string, CancellationToken, Task> WriteTextFileAsync { get; init; } =
+        (path, contents, ct) => File.WriteAllTextAsync(path, contents, ct);
+
+    private const string PidFileName = "rr.pid";
+
+    // Discovery reads every rr.pid as a live runner's PID, and fails its scan on one that holds
+    // none, so a reader must see a whole PID or no file. The PID goes to a temporary file in
+    // the same directory, which discovery does not read, and is renamed into place.
+    private async Task WritePidFileAsync(string pidFile, string pid)
+    {
+        var tempFile = $"{pidFile}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            await WriteTextFileAsync(tempFile, pid, CancellationToken.None);
+            File.Move(tempFile, pidFile, overwrite: true);
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(tempFile);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogWarning(ex, "Could not remove temporary PID file {File}", tempFile);
+            }
+        }
+    }
+
+    // Removes only the PID file, never the instance directory, which can hold mounts that a
+    // recursive delete would follow.
+    private void TryDeletePidFile(string pidFile)
+    {
+        try
+        {
+            if (File.Exists(pidFile))
+                File.Delete(pidFile);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Could not remove PID file {File}; native runner discovery will report it until it is removed", pidFile);
+        }
+    }
 
     private string RecordedBasePathsDirectory => Path.Combine(DefaultBasePath, RecordedBasePathsDirectoryName);
 

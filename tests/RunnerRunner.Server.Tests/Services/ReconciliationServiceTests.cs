@@ -692,6 +692,223 @@ public class ReconciliationServiceTests
         Assert.Equal("rr-FashionPact-macOS-VM-jit-44578a61", command.VmName);
     }
 
+    // Reproduces Tower 2026-10-20 07:58:39: "Marking runner NoSafeRoom-Apple-Docker-jit-0a5e827c
+    // as stopped — host reported it exited (status: created)". DockerBackend creates a JIT
+    // container, copies its start script in, then starts it, so a report taken in between
+    // lists it "created" with IsRunning false. Reconciliation read that as exited: it stopped
+    // the record, requeued the job and had the host remove the container (exit 137).
+    // "restarting" and "paused" containers still exist and will run again, too.
+    [Fact]
+    public async Task DockerContainerNotYetOrNotCurrentlyRunning_IsNotStoppedRequeuedOrCleanedUp()
+    {
+        foreach (var state in new[] { "created", "Created", "restarting", "paused" })
+        {
+            var (service, dispatcher, store, cleanup) = await CreateReconciliationAsync("Tower");
+            await InsertStartingDockerRunnerAsync(store);
+
+            await service.ProcessReportAsync(Report("Tower", DockerRunner(state)), store, cleanup, Now);
+
+            var record = await store.Get<RunnerInstance>(DockerInstanceId);
+            Assert.True(RunnerInstanceStatus.Starting == record!.Status, $"{state}: record is {record.Status}");
+            Assert.Null(record.StoppedAt);
+            Assert.Null(record.HostReportedGoneAt);
+            Assert.Equal("provisioned", (await store.Get<WebhookEvent>(DockerEventId))!.Status);
+            Assert.DoesNotContain(dispatcher.Commands, c => c.Kind == HostCommandKind.CleanupOrphan);
+        }
+    }
+
+    // Guard: a container Docker reports exited, dead or being removed has ended.
+    [Fact]
+    public async Task DockerContainerReportedEnded_IsStoppedRequeuedAndCleanedUp()
+    {
+        foreach (var state in new[] { "exited", "dead", "removing" })
+        {
+            var (service, dispatcher, store, cleanup) = await CreateReconciliationAsync("Tower");
+            await InsertStartingDockerRunnerAsync(store);
+
+            await service.ProcessReportAsync(Report("Tower", DockerRunner(state)), store, cleanup, Now);
+
+            var record = await store.Get<RunnerInstance>(DockerInstanceId);
+            Assert.True(RunnerInstanceStatus.Stopped == record!.Status, $"{state}: record is {record.Status}");
+            Assert.Equal(Now, record.HostReportedGoneAt);
+            Assert.Equal("pending", (await store.Get<WebhookEvent>(DockerEventId))!.Status);
+            Assert.Equal(DockerContainerId, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ContainerId);
+        }
+    }
+
+    // A "created" container with no record was cleaned up on the first report that listed
+    // it, as "not active", skipping the grace period a running orphan gets.
+    [Fact]
+    public async Task DockerOrphanReportedCreated_GetsTheRunningOrphanGracePeriod()
+    {
+        var (service, dispatcher, store, _) = await CreateReconciliationAsync("Tower");
+        var cleanup = new FakeOrphanActivity(ProviderRunnerActivity.NotRegistered);
+        var report = Report("Tower", DockerRunner("created"));
+
+        await service.ProcessReportAsync(report, store, cleanup, Now);
+        await service.ProcessReportAsync(report, store, cleanup, Now.AddMinutes(9));
+
+        Assert.DoesNotContain(dispatcher.Commands, c => c.Kind == HostCommandKind.CleanupOrphan);
+
+        await service.ProcessReportAsync(report, store, cleanup, Now + ReconciliationService.RunningOrphanGracePeriod);
+
+        Assert.Equal(DockerContainerId, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ContainerId);
+    }
+
+    // Guard: an exited or dead container with no record is still cleaned up at once.
+    [Fact]
+    public async Task DockerOrphanReportedEnded_IsCleanedUpImmediately()
+    {
+        foreach (var state in new[] { "exited", "dead" })
+        {
+            var (service, dispatcher, store, _) = await CreateReconciliationAsync("Tower");
+            var cleanup = new FakeOrphanActivity(ProviderRunnerActivity.Busy);
+
+            await service.ProcessReportAsync(Report("Tower", DockerRunner(state)), store, cleanup, Now);
+
+            Assert.Equal(DockerContainerId, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ContainerId);
+        }
+    }
+
+    [Fact]
+    public void IsRunnerStillActive_OnlyDockerTransitionalStatesCountAsActive()
+    {
+        foreach (var state in new[] { "created", "CREATED", "restarting", "paused" })
+            Assert.True(ReconciliationService.IsRunnerStillActive(DockerRunner(state)), state);
+        foreach (var state in new[] { "exited", "dead", "removing" })
+            Assert.False(ReconciliationService.IsRunnerStillActive(DockerRunner(state)), state);
+
+        // Other backends keep their own vocabulary.
+        Assert.False(ReconciliationService.IsRunnerStillActive(new DiscoveredRunnerInfo
+        {
+            RunnerName = "FashionPact-macOS-VM-jit-44578a61",
+            VmName = "rr-FashionPact-macOS-VM-jit-44578a61",
+            Backend = ExecutionBackend.Tart,
+            IsRunning = false,
+            Status = "paused"
+        }));
+    }
+
+    // A cached Unknown may only keep an orphan. Probed a minute before the ceiling, Unknown
+    // was cached for two minutes and then reused past the ceiling to clean up the resource,
+    // although GitHub had meanwhile given the runner a job.
+    [Fact]
+    public async Task RunningOrphan_UnknownBeforeTheCeilingThenBusy_IsNotCleanedUpOnTheCachedUnknown()
+    {
+        var (service, dispatcher, store, _) = await CreateReconciliationAsync("M4ini");
+        var cleanup = new FakeOrphanActivity(ProviderRunnerActivity.Unknown);
+        var report = Report("M4ini", RunningResource(ExecutionBackend.Tart));
+        var ceiling = TimeSpan.FromHours(12);
+
+        await service.ProcessReportAsync(report, store, cleanup, Now);
+        await service.ProcessReportAsync(report, store, cleanup, Now + ceiling - TimeSpan.FromMinutes(1));
+        Assert.Equal(1, cleanup.Calls);
+
+        cleanup.Activity = ProviderRunnerActivity.Busy;
+        await service.ProcessReportAsync(report, store, cleanup, Now + ceiling + TimeSpan.FromSeconds(30));
+
+        Assert.DoesNotContain(dispatcher.Commands, c => c.Kind == HostCommandKind.CleanupOrphan);
+        Assert.Equal(2, cleanup.Calls);
+
+        // The Busy answer only keeps the resource, so it is reused.
+        await service.ProcessReportAsync(report, store, cleanup, Now + ceiling + TimeSpan.FromSeconds(60));
+
+        Assert.DoesNotContain(dispatcher.Commands, c => c.Kind == HostCommandKind.CleanupOrphan);
+        Assert.Equal(2, cleanup.Calls);
+    }
+
+    // Guard: past the ceiling a fresh Unknown still lets the orphan go.
+    [Fact]
+    public async Task RunningOrphan_UnknownBeforeTheCeilingAndAgainAfterIt_IsCleanedUpOnTheFreshAnswer()
+    {
+        var (service, dispatcher, store, _) = await CreateReconciliationAsync("M4ini");
+        var cleanup = new FakeOrphanActivity(ProviderRunnerActivity.Unknown);
+        var report = Report("M4ini", RunningResource(ExecutionBackend.Tart));
+        var ceiling = TimeSpan.FromHours(12);
+
+        await service.ProcessReportAsync(report, store, cleanup, Now);
+        await service.ProcessReportAsync(report, store, cleanup, Now + ceiling - TimeSpan.FromMinutes(1));
+        await service.ProcessReportAsync(report, store, cleanup, Now + ceiling + TimeSpan.FromSeconds(30));
+
+        Assert.Equal(2, cleanup.Calls);
+        Assert.Equal("rr-FashionPact-macOS-VM-jit-44578a61", dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).VmName);
+    }
+
+    // HostWorkerEventProcessor.RunnerStartedAsync sets a record Running whatever its status,
+    // so a record reconciliation ended on Unknown can be live again a report later. The
+    // Unknown it ended on was cached, and the next report that missed the runner ended it
+    // again on that answer without asking GitHub, which by then had given it a job.
+    [Fact]
+    public async Task RunnerMissingFromAReport_IsNotEndedOnACachedUnknown()
+    {
+        var githubDown = true;
+        var (service, store, cleanup, api) = await ProviderScenarioAsync(api => api
+            .Respond(IsRepoLookup, _ => githubDown
+                ? FakeProviderHttpApi.JsonResponse("""{"message":"boom"}""", HttpStatusCode.InternalServerError)
+                : FakeProviderHttpApi.JsonResponse(RunnersJson((LiveNativeRunner, true)))));
+
+        await service.ProcessReportAsync(Report("M4ini"), store, cleanup, Now);
+
+        var record = await store.Get<RunnerInstance>(LiveNativeInstanceId);
+        Assert.Equal(RunnerInstanceStatus.Crashed, record!.Status);
+
+        record.Status = RunnerInstanceStatus.Running;
+        record.StartedAt = Now.AddSeconds(10);
+        record.StoppedAt = null;
+        record.HostReportedGoneAt = null;
+        await store.Update(record);
+        githubDown = false;
+        var probes = api.Requests.Count(IsActivityProbe);
+
+        await service.ProcessReportAsync(Report("M4ini"), store, cleanup, Now.AddSeconds(30));
+
+        record = await store.Get<RunnerInstance>(LiveNativeInstanceId);
+        Assert.Equal(RunnerInstanceStatus.Running, record!.Status);
+        Assert.Null(record.HostReportedGoneAt);
+        Assert.True(api.Requests.Count(IsActivityProbe) > probes);
+    }
+
+    private const string DockerInstanceId = "0a5e827c-6c1e-4f43-9d2b-1f0e8f3a9b11";
+    private const string DockerRunnerName = "NoSafeRoom-Apple-Docker-jit-0a5e827c";
+    private const string DockerContainerId = "3f1c9d8e2b7a4c6d5e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d";
+    private const string DockerEventId = "evt-118640012345";
+
+    private static DiscoveredRunnerInfo DockerRunner(string state) => new()
+    {
+        InstanceId = DockerInstanceId,
+        RunnerName = DockerRunnerName,
+        ContainerId = DockerContainerId,
+        Backend = ExecutionBackend.Docker,
+        IsRunning = state == "running",
+        Status = state
+    };
+
+    // A dynamic Docker runner whose deploy command has just created its container.
+    private static async Task InsertStartingDockerRunnerAsync(IDocumentStore store)
+    {
+        await store.Insert(new WebhookEvent
+        {
+            Id = DockerEventId,
+            Action = "queued",
+            Status = "provisioned",
+            Repository = "Clancey/NoSafeRoom",
+            JobId = "118640012345",
+            Provider = RunnerProvider.GitHubActions.ToString()
+        });
+        await store.Insert(new RunnerInstance
+        {
+            Id = DockerInstanceId,
+            HostId = "Tower",
+            RunnerName = DockerRunnerName,
+            ContainerId = DockerContainerId,
+            WebhookEventId = DockerEventId,
+            JobId = "118640012345",
+            ProvisioningMode = "dynamic",
+            Status = RunnerInstanceStatus.Starting,
+            DeployedAt = Now.AddSeconds(-20)
+        });
+    }
+
     private const string LiveNativeInstanceId = "516c3058";
     private const string LiveNativeRunner = "Macos-jit-516c3058";
     private const string LiveNativeEventId = "evt-118606912280";

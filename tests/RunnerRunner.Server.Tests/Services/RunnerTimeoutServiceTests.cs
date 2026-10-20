@@ -504,6 +504,85 @@ public class RunnerTimeoutServiceTests
         Assert.Null(await store.Get<RunnerInstance>("9ac7f9f7"));
     }
 
+    // A cached Unknown may only keep a runner. Asked half a minute before the ceiling, the
+    // provider answered Unknown, which was cached for two minutes; the next scan, past the
+    // ceiling, reused it to stop a runner GitHub had meanwhile reported busy.
+    [Fact]
+    public async Task DynamicRunningBackstop_UnknownBeforeTheCeilingThenBusy_IsNotStoppedOnTheCachedUnknown()
+    {
+        var (store, hostCommands) = await BackstopScenarioAsync(startedHoursAgo: 7);
+        var registrations = new FakeActivity(ProviderRunnerActivity.Unknown);
+        var service = CreateService(store, hostCommands, registrations, out var services);
+        using (services)
+        {
+            await SetStartedAtAsync(store, "9ac7f9f7", DateTime.UtcNow - UnknownCeiling + TimeSpan.FromSeconds(30));
+            await InvokeScanForTimeoutsAsync(service);
+            Assert.DoesNotContain(hostCommands.Commands, c => c.Kind == HostCommandKind.StopRunner);
+
+            // A minute later: past the ceiling, still inside the cache window.
+            await SetStartedAtAsync(store, "9ac7f9f7", DateTime.UtcNow - UnknownCeiling - TimeSpan.FromSeconds(30));
+            registrations.Activity = ProviderRunnerActivity.Busy;
+            await InvokeScanForTimeoutsAsync(service);
+        }
+
+        Assert.DoesNotContain(hostCommands.Commands, c => c.Kind == HostCommandKind.StopRunner);
+        Assert.Equal(RunnerInstanceStatus.Running, (await store.Get<RunnerInstance>("9ac7f9f7"))!.Status);
+        Assert.Equal(2, registrations.Calls);
+    }
+
+    // Guard: past the ceiling a fresh Unknown still stops the runner.
+    [Fact]
+    public async Task DynamicRunningBackstop_UnknownBeforeTheCeilingAndAgainAfterIt_StopsOnTheFreshAnswer()
+    {
+        var (store, hostCommands) = await BackstopScenarioAsync(startedHoursAgo: 7);
+        var registrations = new FakeActivity(ProviderRunnerActivity.Unknown);
+        var service = CreateService(store, hostCommands, registrations, out var services);
+        using (services)
+        {
+            await SetStartedAtAsync(store, "9ac7f9f7", DateTime.UtcNow - UnknownCeiling + TimeSpan.FromSeconds(30));
+            await InvokeScanForTimeoutsAsync(service);
+            await SetStartedAtAsync(store, "9ac7f9f7", DateTime.UtcNow - UnknownCeiling - TimeSpan.FromSeconds(30));
+            await InvokeScanForTimeoutsAsync(service);
+        }
+
+        Assert.Equal("f98754d595f4", hostCommands.SingleCommand<StopRunnerCommand>(HostCommandKind.StopRunner).InstanceHandle);
+        Assert.Equal(2, registrations.Calls);
+    }
+
+    // The terminal-record path has the same ceiling and the same cache.
+    [Fact]
+    public async Task TerminalRecordStillRunningOnItsHost_UnknownBeforeTheCeilingThenBusy_IsKept()
+    {
+        const string id = "8aefd1a6-d063-4649-b699-90a4cf65c2ff";
+        var (store, hostCommands) = await LeakedTartScenarioAsync();
+        var registrations = new FakeActivity(ProviderRunnerActivity.Unknown);
+        var service = CreateService(store, hostCommands, registrations, out var services);
+        using (services)
+        {
+            await SetStartedAtAsync(store, id, DateTime.UtcNow - UnknownCeiling + TimeSpan.FromSeconds(30));
+            await InvokeScanForTimeoutsAsync(service);
+            Assert.DoesNotContain(hostCommands.Commands, c => c.Kind == HostCommandKind.StopRunner);
+
+            await SetStartedAtAsync(store, id, DateTime.UtcNow - UnknownCeiling - TimeSpan.FromSeconds(30));
+            registrations.Activity = ProviderRunnerActivity.Busy;
+            await InvokeScanForTimeoutsAsync(service);
+        }
+
+        Assert.DoesNotContain(hostCommands.Commands, c => c.Kind == HostCommandKind.StopRunner);
+        Assert.NotNull(await store.Get<RunnerInstance>(id));
+        Assert.Equal(2, registrations.Calls);
+    }
+
+    // Twice the default 6h DynamicProvisioning:RunningTimeoutMinutes.
+    private static readonly TimeSpan UnknownCeiling = TimeSpan.FromHours(12);
+
+    private static async Task SetStartedAtAsync(IDocumentStore store, string instanceId, DateTime startedAt)
+    {
+        var record = (await store.Get<RunnerInstance>(instanceId))!;
+        record.StartedAt = startedAt;
+        await store.Update(record);
+    }
+
     // GrpcHostCommandDispatcher has no outbox: a stop for a host whose stream is down throws.
     // The recycle used to swallow that, mark the runner Failed, requeue its job and forget the
     // record. The runner was still registered and running, so GitHub could hand it a job, and
@@ -777,13 +856,15 @@ public class RunnerTimeoutServiceTests
     {
         public int Calls { get; private set; }
 
+        public ProviderRunnerActivity Activity { get; set; } = activity;
+
         public override Task<ProviderRunnerActivity> GetProviderRunnerActivityAsync(
             IDocumentStore store,
             RunnerInstance instance,
             CancellationToken ct = default)
         {
             Calls++;
-            return Task.FromResult(activity);
+            return Task.FromResult(Activity);
         }
     }
 }
