@@ -789,6 +789,83 @@ public class ReconciliationServiceTests
         }));
     }
 
+    // A container that failed to start stays "created". It has no process, so it cannot be on
+    // a job, but "created" counted as active forever: the static record matching it was never
+    // ended, and once the Starting timeout failed it, its health kept being refreshed, so
+    // neither the record nor the container was ever removed. "created" means starting only
+    // within the deploy window.
+    [Fact]
+    public async Task StaticDockerRunnerStillCreatedLongAfterItsDeploy_IsStoppedAndCleanedUp()
+    {
+        var (service, dispatcher, store, cleanup) = await CreateReconciliationAsync("Tower");
+        await InsertStaticDockerRunnerAsync(store, RunnerInstanceStatus.Starting, deployedAt: Now.AddMinutes(-10));
+
+        await service.ProcessReportAsync(Report("Tower", DockerRunner("created")), store, cleanup, Now);
+
+        var record = await store.Get<RunnerInstance>(DockerInstanceId);
+        Assert.Equal(RunnerInstanceStatus.Stopped, record!.Status);
+        Assert.Equal(Now, record.HostReportedGoneAt);
+        Assert.Equal(DockerContainerId, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ContainerId);
+    }
+
+    // The record the Starting timeout failed: its "created" container is reported gone rather
+    // than refreshing the record's health, so the record can be removed and the container
+    // cleaned up as an orphan.
+    [Fact]
+    public async Task FailedStaticDockerRecordWhoseContainerIsStillCreated_IsReportedGone()
+    {
+        var (service, _, store, cleanup) = await CreateReconciliationAsync("Tower");
+        var lastHealth = Now.AddMinutes(-6);
+        await InsertStaticDockerRunnerAsync(
+            store, RunnerInstanceStatus.Failed, deployedAt: Now.AddMinutes(-11), stoppedAt: Now.AddMinutes(-6), lastHealthCheck: lastHealth);
+
+        await service.ProcessReportAsync(Report("Tower", DockerRunner("created")), store, cleanup, Now);
+
+        var record = await store.Get<RunnerInstance>(DockerInstanceId);
+        Assert.Equal(Now, record!.HostReportedGoneAt);
+        Assert.Equal(lastHealth, record.LastHealthCheck);
+    }
+
+    // Guard: "restarting" and "paused" containers have a process, so they are not ended
+    // however long ago they were deployed.
+    [Fact]
+    public async Task DockerRunnerRestartingOrPausedLongAfterItsDeploy_IsNotEnded()
+    {
+        foreach (var state in new[] { "restarting", "paused" })
+        {
+            var (service, dispatcher, store, cleanup) = await CreateReconciliationAsync("Tower");
+            await InsertStaticDockerRunnerAsync(store, RunnerInstanceStatus.Starting, deployedAt: Now.AddMinutes(-10));
+
+            await service.ProcessReportAsync(Report("Tower", DockerRunner(state)), store, cleanup, Now);
+
+            var record = await store.Get<RunnerInstance>(DockerInstanceId);
+            Assert.True(RunnerInstanceStatus.Starting == record!.Status, $"{state}: record is {record.Status}");
+            Assert.Null(record.HostReportedGoneAt);
+            Assert.Equal(Now, record.LastHealthCheck);
+            Assert.DoesNotContain(dispatcher.Commands, c => c.Kind == HostCommandKind.CleanupOrphan);
+        }
+    }
+
+    // An orphan still "created" after the running-orphan grace period was never started, so
+    // it has no job to protect: it is cleaned up without asking the provider, whose Busy or
+    // Unknown answer about a runner of the same name kept it forever.
+    [Fact]
+    public async Task DockerOrphanStillCreatedAfterTheGracePeriod_IsCleanedUpWithoutAskingTheProvider()
+    {
+        foreach (var activity in new[] { ProviderRunnerActivity.Busy, ProviderRunnerActivity.Unknown })
+        {
+            var (service, dispatcher, store, _) = await CreateReconciliationAsync("Tower");
+            var cleanup = new FakeOrphanActivity(activity);
+            var report = Report("Tower", DockerRunner("created"));
+
+            await service.ProcessReportAsync(report, store, cleanup, Now);
+            await service.ProcessReportAsync(report, store, cleanup, Now + ReconciliationService.RunningOrphanGracePeriod);
+
+            Assert.Equal(DockerContainerId, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ContainerId);
+            Assert.Equal(0, cleanup.Calls);
+        }
+    }
+
     // A cached Unknown may only keep an orphan. Probed a minute before the ceiling, Unknown
     // was cached for two minutes and then reused past the ceiling to clean up the resource,
     // although GitHub had meanwhile given the runner a job.
@@ -908,6 +985,26 @@ public class ReconciliationServiceTests
             DeployedAt = Now.AddSeconds(-20)
         });
     }
+
+    private static Task InsertStaticDockerRunnerAsync(
+        IDocumentStore store,
+        RunnerInstanceStatus status,
+        DateTime deployedAt,
+        DateTime? stoppedAt = null,
+        DateTime? lastHealthCheck = null) =>
+        store.Insert(new RunnerInstance
+        {
+            Id = DockerInstanceId,
+            HostId = "Tower",
+            RunnerName = DockerRunnerName,
+            ContainerId = DockerContainerId,
+            ProvisioningMode = "static",
+            Status = status,
+            CreatedAt = deployedAt.AddSeconds(-5),
+            DeployedAt = deployedAt,
+            StoppedAt = stoppedAt,
+            LastHealthCheck = lastHealthCheck
+        });
 
     private const string LiveNativeInstanceId = "516c3058";
     private const string LiveNativeRunner = "Macos-jit-516c3058";

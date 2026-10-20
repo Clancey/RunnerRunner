@@ -184,20 +184,36 @@ public class NativeBackend : IRunnerBackend
             // Without its PID file discovery never reports this runner, so nothing would ever
             // stop it, and it could take a job no one sees. Stop it before failing the start.
             _logger.LogError(ex, "Could not write the PID file for native runner {RunnerName} (PID: {PID}); stopping it", request.RunnerName, runProcess.Id);
+            var exited = false;
             try
             {
-                runProcess.Kill(entireProcessTree: true);
-                if (!runProcess.WaitForExit(TimeSpan.FromSeconds(30)))
+                exited = KillProcessTreeAndWaitForExit(runProcess, TimeSpan.FromSeconds(30));
+                if (!exited)
                     _logger.LogError("Native runner {RunnerName} (PID: {PID}) did not exit after being killed", request.RunnerName, runProcess.Id);
             }
-            catch (Exception killEx) when (killEx is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
+            catch (Exception killEx) when (killEx is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException or AggregateException)
             {
                 _logger.LogError(killEx, "Could not stop native runner {RunnerName} (PID: {PID}) after its PID file write failed", request.RunnerName, runProcess.Id);
             }
-            runProcess.Dispose();
-            // An rr.pid left here names no runner of ours, but discovery would read it as a
-            // live runner's on every scan, and fail each one if it is damaged.
-            TryDeletePidFile(pidFile);
+
+            if (exited)
+            {
+                runProcess.Dispose();
+                // An rr.pid left here names no runner of ours, but discovery would read it as a
+                // live runner's on every scan, and fail each one if it is damaged.
+                TryDeletePidFile(pidFile);
+            }
+            else
+            {
+                // The runner may still be running and could take a job. Its rr.pid is the only
+                // way discovery reports it, so it is kept, and written again if it holds no PID.
+                // Its output is still drained, or it would block once the pipe filled.
+                _ = Task.Run(() => PipeOutputToLogFile(runProcess, instanceLogFile), CancellationToken.None);
+                await TryKeepPidFileForUnstoppedRunnerAsync(pidFile, instanceHandle);
+                _logger.LogError(
+                    "Native runner {RunnerName} (PID: {PID}) in {InstanceDir} may still be running after its PID file write failed; its PID file is kept so discovery reports it",
+                    request.RunnerName, runProcess.Id, instanceDir);
+            }
             throw;
         }
         _runners[instanceHandle] = new ManagedNativeRunner
@@ -336,6 +352,15 @@ public class NativeBackend : IRunnerBackend
     internal Func<string, string, CancellationToken, Task> WriteTextFileAsync { get; init; } =
         (path, contents, ct) => File.WriteAllTextAsync(path, contents, ct);
 
+    // Kills a runner's process tree and returns whether it exited within the timeout.
+    // Settable so tests can make the kill fail to stop it.
+    internal Func<Process, TimeSpan, bool> KillProcessTreeAndWaitForExit { get; init; } =
+        (process, timeout) =>
+        {
+            process.Kill(entireProcessTree: true);
+            return process.WaitForExit(timeout);
+        };
+
     private const string PidFileName = "rr.pid";
 
     // Discovery reads every rr.pid as a live runner's PID, and fails its scan on one that holds
@@ -361,6 +386,26 @@ public class NativeBackend : IRunnerBackend
             }
         }
     }
+
+    // For a runner that may still be running after its PID file write failed. An rr.pid that
+    // holds a PID is left alone; one that is missing or holds none is written once more.
+    private async Task TryKeepPidFileForUnstoppedRunnerAsync(string pidFile, string pid)
+    {
+        try
+        {
+            if (File.Exists(pidFile) && TryParsePid(await File.ReadAllTextAsync(pidFile), out _))
+                return;
+
+            await WritePidFileAsync(pidFile, pid);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Could not write PID file {File} for native runner PID {PID}; discovery will not report it", pidFile, pid);
+        }
+    }
+
+    private static bool TryParsePid(string pidText, out int pid) =>
+        int.TryParse(pidText.Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out pid) && pid > 0;
 
     // Removes only the PID file, never the instance directory, which can hold mounts that a
     // recursive delete would follow.

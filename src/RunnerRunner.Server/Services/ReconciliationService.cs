@@ -186,7 +186,7 @@ public class ReconciliationService : IHostedService, IDisposable
 
                 await TryDeregisterRunnerAsync(store, registrationCleanup, instance, activity);
             }
-            else if (!IsRunnerStillActive(matchedRunner))
+            else if (!IsRunnerStillActive(matchedRunner, instance, nowUtc))
             {
                 // A runner the provider reports busy is on a job somewhere, whatever the host
                 // says about this process (a stale or misread status, say). Ending it would
@@ -258,6 +258,19 @@ public class ReconciliationService : IHostedService, IDisposable
                         "Host {Host} reports {Backend} resource {Resource} ({RunnerName}) running with no matching record; cleaning it up only if that persists for {Grace}",
                         reportHostId, runner.Backend, resource, runner.RunnerName, RunningOrphanGracePeriod);
                 }
+                continue;
+            }
+
+            // A container Docker has created but never started has no process, so it cannot
+            // be on a job, and one still "created" after the grace period never will be.
+            if (IsDockerCreated(runner))
+            {
+                _logger.LogWarning(
+                    "Sending cleanup for orphaned Docker container {Resource} on host {Host}: never started (status: {Status}) since {FirstSeen:u}",
+                    resource, reportHostId, runner.Status, firstSeen);
+                await SendCleanupCommandAsync(hostId, runner);
+                _runningOrphanFirstSeen.TryRemove(key, out _);
+                _orphanBlockingActivity.TryRemove(key, out _);
                 continue;
             }
 
@@ -370,7 +383,7 @@ public class ReconciliationService : IHostedService, IDisposable
         {
             var matched = report.Runners.FirstOrDefault(r => MatchesRunner(instance, r));
 
-            if (matched != null && IsRunnerStillActive(matched))
+            if (matched != null && IsRunnerStillActive(matched, instance, nowUtc))
             {
                 instance.LastHealthCheck = nowUtc;
                 await store.Update(instance);
@@ -479,14 +492,30 @@ public class ReconciliationService : IHostedService, IDisposable
     // dead or removing ones have ended. A HostWorker reports IsRunning false for all of them,
     // so the Docker state is read here, on the server, which also covers older HostWorkers.
     // Treating "created" as exited ended JIT runners as they started (Tower 2026-10-20
-    // 07:58:39: "host reported it exited (status: created)"). A container stuck in "created"
-    // is still ended: a tracked one by RunnerTimeoutService's Starting timeout (counted from
-    // StartedAt or DeployedAt, not from the health this refreshes), an untracked one by the
-    // running-orphan grace period and provider check in ProcessReportAsync.
+    // 07:58:39: "host reported it exited (status: created)"). A "created" container has no
+    // process, though, so it is only starting while its deploy is: a recorded one is judged
+    // by the overload below, and an untracked one is cleaned up after the running-orphan
+    // grace period in ProcessReportAsync.
     internal static bool IsRunnerStillActive(DiscoveredRunnerInfo runner) =>
         runner.IsRunning
         || string.Equals(runner.Status, "running", StringComparison.OrdinalIgnoreCase)
         || (runner.Backend == ExecutionBackend.Docker && runner.Status?.Trim() is { } state && DockerStatesNotEnded.Contains(state));
+
+    // As above, for the resource that matches a record. A "created" container counts as
+    // starting only for StartingDeployGracePeriod from the record's deploy: the window every
+    // other path gives a deploy (the missing-runner grace, the Starting timeout and the
+    // grain's registration timer), counted from DeployedAt, which precedes the image pull.
+    // Past it the container has ended. Otherwise a static record failed at the Starting
+    // timeout kept matching it and refreshing its health, so neither the record nor the
+    // container was ever removed.
+    internal static bool IsRunnerStillActive(DiscoveredRunnerInfo runner, RunnerInstance instance, DateTime nowUtc) =>
+        IsRunnerStillActive(runner)
+        && !(IsDockerCreated(runner) && nowUtc - (instance.DeployedAt ?? instance.CreatedAt) >= StartingDeployGracePeriod);
+
+    private static bool IsDockerCreated(DiscoveredRunnerInfo runner) =>
+        runner.Backend == ExecutionBackend.Docker
+        && !runner.IsRunning
+        && string.Equals(runner.Status?.Trim(), "created", StringComparison.OrdinalIgnoreCase);
 
     private static readonly HashSet<string> DockerStatesNotEnded =
         new(["created", "restarting", "paused"], StringComparer.OrdinalIgnoreCase);

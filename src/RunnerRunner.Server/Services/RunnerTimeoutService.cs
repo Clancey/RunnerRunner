@@ -117,7 +117,7 @@ public class RunnerTimeoutService : BackgroundService
                         continue;
                     break;
                 case RunnerInstanceStatus.Starting:
-                    if (await CheckStartingTimeout(store, instance, now))
+                    if (await CheckStartingTimeout(store, registrations, instance, now, ct))
                         continue;
                     break;
                 case RunnerInstanceStatus.Running:
@@ -178,7 +178,12 @@ public class RunnerTimeoutService : BackgroundService
     }
 
     /// <returns>True when the instance's record was removed or must be left as it is.</returns>
-    private async Task<bool> CheckStartingTimeout(IDocumentStore store, RunnerInstance instance, DateTime now)
+    private async Task<bool> CheckStartingTimeout(
+        IDocumentStore store,
+        RunnerRegistrationCleanupService? registrations,
+        RunnerInstance instance,
+        DateTime now,
+        CancellationToken ct)
     {
         var referenceTime = instance.StartedAt ?? instance.DeployedAt;
         if (referenceTime == null || now - referenceTime.Value <= StartingTimeout)
@@ -188,8 +193,32 @@ public class RunnerTimeoutService : BackgroundService
             "Runner {RunnerName} ({Id}) timed out in Starting state after {Elapsed}",
             instance.RunnerName, instance.Id, now - referenceTime.Value);
 
-        if (instance.ProvisioningMode == "dynamic" && !await TrySendStopRunner(store, instance))
-            return true;
+        if (instance.ProvisioningMode == "dynamic")
+        {
+            // A Starting record only says RunnerRunner never heard the runner start: the
+            // RunnerStarted event can be lost while the runner registers and takes a job.
+            // Stopping it then killed that job, and requeuing ran it twice.
+            var pastUnknownCeiling = IsPastUnknownActivityCeiling(referenceTime.Value, now);
+            var activity = await GetProviderActivityAsync(registrations, store, instance, unknownAllowsStop: pastUnknownCeiling, ct);
+            if (activity == ProviderRunnerActivity.Busy)
+            {
+                _logger.LogWarning(
+                    "Runner {RunnerName} ({Id}) timed out in Starting state, but the provider reports it running a job; leaving it Starting",
+                    instance.RunnerName, instance.Id);
+                return true;
+            }
+
+            if (activity == ProviderRunnerActivity.Unknown && !pastUnknownCeiling)
+            {
+                _logger.LogWarning(
+                    "Runner {RunnerName} ({Id}) timed out in Starting state, but the provider cannot say whether it is running a job; leaving it Starting until {Ceiling} have passed",
+                    instance.RunnerName, instance.Id, UnknownActivityCeiling);
+                return true;
+            }
+
+            if (!await TrySendStopRunner(store, instance))
+                return true;
+        }
 
         instance.Status = RunnerInstanceStatus.Failed;
         instance.StatusMessage = "Registration timeout — runner did not connect to provider";

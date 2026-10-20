@@ -332,6 +332,96 @@ public sealed class NativeBackendDiscoveryTests : IDisposable
         }
     }
 
+    // When the PID file write failed, rr.pid was removed even when the kill did not confirm
+    // that the runner exited. A runner still running then had no PID file, so discovery never
+    // reported it and nothing would stop it, though it could take a job. rr.pid is removed
+    // only once the runner has exited.
+    [Fact]
+    public async Task Start_WhenThePidFileWriteFailsAndTheKillIsNotConfirmed_KeepsTheRrPid()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var token = await CreateSpawningAgentAsync();
+        string? launchedPid = null;
+        var backend = new NativeBackend(NullLogger<NativeBackend>.Instance)
+        {
+            DefaultBasePath = DefaultBasePath,
+            // A write reported failed after the PID reached rr.pid.
+            WriteTextFileAsync = async (_, contents, _) =>
+            {
+                launchedPid = contents;
+                await File.WriteAllTextAsync(Path.Combine(SpawningInstanceDir, "rr.pid"), contents);
+                throw new IOException("Input/output error");
+            },
+            KillProcessTreeAndWaitForExit = (_, _) => false
+        };
+
+        try
+        {
+            var error = await Assert.ThrowsAsync<IOException>(() => StartSpawningRunnerAsync(backend, token));
+            Assert.Equal("Input/output error", error.Message);
+            Assert.NotNull(launchedPid);
+            var pid = int.Parse(launchedPid, System.Globalization.CultureInfo.InvariantCulture);
+            Assert.Contains(pid, FindProcessesWithArgument(token));
+
+            Assert.Equal(launchedPid, await File.ReadAllTextAsync(Path.Combine(SpawningInstanceDir, "rr.pid")));
+            var runner = Assert.Single(await CreateBackend().DiscoverManagedProcessesAsync());
+            Assert.Equal(SpawningInstanceId, runner.InstanceId);
+            Assert.Equal(pid, runner.ProcessId);
+            Assert.True(runner.IsRunning);
+        }
+        finally
+        {
+            KillProcessesWithArgument(token);
+        }
+    }
+
+    // A runner the kill could not stop is kept discoverable even when the failed write left
+    // no rr.pid: the PID is written once more.
+    [Fact]
+    public async Task Start_WhenThePidFileWriteFailsAndTheKillFails_WritesTheRrPidAgain()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var token = await CreateSpawningAgentAsync();
+        var writes = 0;
+        var backend = new NativeBackend(NullLogger<NativeBackend>.Instance)
+        {
+            DefaultBasePath = DefaultBasePath,
+            WriteTextFileAsync = async (path, contents, ct) =>
+            {
+                if (Interlocked.Increment(ref writes) == 1)
+                {
+                    await File.WriteAllTextAsync(path, "", ct);
+                    throw new IOException("No space left on device");
+                }
+                await File.WriteAllTextAsync(path, contents, ct);
+            },
+            KillProcessTreeAndWaitForExit = (_, _) => throw new InvalidOperationException("Could not kill the process tree")
+        };
+
+        try
+        {
+            var error = await Assert.ThrowsAsync<IOException>(() => StartSpawningRunnerAsync(backend, token));
+            Assert.Equal("No space left on device", error.Message);
+
+            var runner = Assert.Single(await CreateBackend().DiscoverManagedProcessesAsync());
+            Assert.Equal(SpawningInstanceId, runner.InstanceId);
+            Assert.True(runner.IsRunning);
+            Assert.Contains(runner.ProcessId!.Value, FindProcessesWithArgument(token));
+            Assert.Equal(
+                runner.ProcessId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                await File.ReadAllTextAsync(Path.Combine(SpawningInstanceDir, "rr.pid")));
+            Assert.Empty(Directory.GetFiles(SpawningInstanceDir, "rr.pid.*.tmp"));
+        }
+        finally
+        {
+            KillProcessesWithArgument(token);
+        }
+    }
+
     // The PID file is written to a temporary name and renamed into place, so a reader sees a
     // whole PID or none. The temporary file names no runner.
     [Fact]

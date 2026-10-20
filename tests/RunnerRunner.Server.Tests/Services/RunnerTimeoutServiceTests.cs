@@ -729,6 +729,74 @@ public class RunnerTimeoutServiceTests
         Assert.Equal("pending", (await scenario.Store.Get<WebhookEvent>(scenario.Event.Id))!.Status);
     }
 
+    // A Starting record only says RunnerRunner never heard the runner start. With its
+    // RunnerStarted event lost, a runner that registered and took a job stayed Starting, and
+    // the Starting timeout stopped it mid-job and requeued the job.
+    [Fact]
+    public async Task StartingTimeout_ProviderReportsBusy_DoesNotStopFailOrRequeue()
+    {
+        var scenario = await StartingTimeoutScenarioAsync(deployedAgo: TimeSpan.FromMinutes(8));
+        var registrations = new FakeActivity(ProviderRunnerActivity.Busy);
+
+        await ScanAsync(scenario.Store, scenario.HostCommands, registrations);
+
+        Assert.DoesNotContain(scenario.HostCommands.Commands, c => c.Kind == HostCommandKind.StopRunner);
+        var record = await scenario.Store.Get<RunnerInstance>(scenario.Instance.Id);
+        Assert.NotNull(record);
+        Assert.Equal(RunnerInstanceStatus.Starting, record!.Status);
+        var evt = await scenario.Store.Get<WebhookEvent>(scenario.Event.Id);
+        Assert.Equal("provisioned", evt!.Status);
+        Assert.Equal(0, evt.RetryCount);
+        Assert.Equal(1, registrations.Calls);
+    }
+
+    // Guard: a runner the provider no longer knows is stopped and its job requeued as before.
+    [Fact]
+    public async Task StartingTimeout_ProviderReportsNotRegistered_StopsTheRunnerAndRequeues()
+    {
+        var scenario = await StartingTimeoutScenarioAsync(deployedAgo: TimeSpan.FromMinutes(8));
+
+        await ScanAsync(scenario.Store, scenario.HostCommands, new FakeActivity(ProviderRunnerActivity.NotRegistered));
+
+        Assert.Equal("a511f1ea76b5", scenario.HostCommands.SingleCommand<StopRunnerCommand>(HostCommandKind.StopRunner).InstanceHandle);
+        Assert.Null(await scenario.Store.Get<RunnerInstance>(scenario.Instance.Id));
+        Assert.Equal("pending", (await scenario.Store.Get<WebhookEvent>(scenario.Event.Id))!.Status);
+    }
+
+    // Unknown keeps the runner until the Unknown ceiling, like the pickup recycle and the
+    // running backstop; past it the stop goes ahead.
+    [Fact]
+    public async Task StartingTimeout_ProviderReportsUnknown_StopsOnlyPastTheCeiling()
+    {
+        var early = await StartingTimeoutScenarioAsync(deployedAgo: UnknownCeiling - TimeSpan.FromMinutes(1));
+
+        await ScanAsync(early.Store, early.HostCommands, new FakeActivity(ProviderRunnerActivity.Unknown));
+
+        Assert.DoesNotContain(early.HostCommands.Commands, c => c.Kind == HostCommandKind.StopRunner);
+        Assert.Equal(RunnerInstanceStatus.Starting, (await early.Store.Get<RunnerInstance>(early.Instance.Id))!.Status);
+        Assert.Equal("provisioned", (await early.Store.Get<WebhookEvent>(early.Event.Id))!.Status);
+
+        var late = await StartingTimeoutScenarioAsync(deployedAgo: UnknownCeiling + TimeSpan.FromMinutes(1));
+
+        await ScanAsync(late.Store, late.HostCommands, new FakeActivity(ProviderRunnerActivity.Unknown));
+
+        late.HostCommands.SingleCommand<StopRunnerCommand>(HostCommandKind.StopRunner);
+        Assert.Null(await late.Store.Get<RunnerInstance>(late.Instance.Id));
+    }
+
+    // A dynamic runner deployed deployedAgo whose RunnerStarted event never arrived.
+    private static async Task<(IDocumentStore Store, RecordingHostCommandDispatcher HostCommands, RunnerInstance Instance, WebhookEvent Event)> StartingTimeoutScenarioAsync(
+        TimeSpan deployedAgo)
+    {
+        var scenario = await PickupScenarioAsync();
+        scenario.Instance.Status = RunnerInstanceStatus.Starting;
+        scenario.Instance.StartedAt = null;
+        scenario.Instance.DeployedAt = DateTime.UtcNow - deployedAgo;
+        scenario.Instance.LastHealthCheck = null;
+        await scenario.Store.Update(scenario.Instance);
+        return scenario;
+    }
+
     [Fact]
     public async Task StopForInstanceWithNoHostRecord_KeepsTheRecordAndDoesNotRequeue()
     {
