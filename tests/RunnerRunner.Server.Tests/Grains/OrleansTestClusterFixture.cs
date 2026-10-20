@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Orleans.Hosting;
 using Orleans.TestingHost;
+using RunnerRunner.Server.Data;
 using RunnerRunner.Server.Services;
 using RunnerRunner.Server.Tests.TestSupport;
 using Shiny.DocumentDb;
@@ -19,6 +20,8 @@ public sealed class OrleansTestClusterFixture : IDisposable
     public OrleansTestClusterFixture()
     {
         TestServices = new ClusterTestServices();
+        using (var services = new ServiceCollection().AddSingleton(TestServices.DocumentStore).BuildServiceProvider())
+            DatabaseInitializer.EnsureTablesCreatedAsync(services).GetAwaiter().GetResult();
         SiloConfigurator.TestServices = TestServices;
 
         var builder = new TestClusterBuilder();

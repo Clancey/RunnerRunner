@@ -68,7 +68,8 @@ public sealed class GrainStateTests
         var hostId = OrleansTestIds.Create("linux-host");
         var scheduler = _grainFactory.GetGrain<ISchedulerGrain>(CreatePositiveLong());
         var host = _grainFactory.GetGrain<IHostGrain>(hostId);
-        await host.Register("linux-builder", HostPlatform.Linux, "x64", "1.0.0");
+        await host.Register($"{hostId}-name", HostPlatform.Linux, "x64", "1.0.0",
+            new Dictionary<string, string> { ["docker"] = "true" });
         await host.UpdateLabels(new Dictionary<string, string>
         {
             ["pool"] = "default",
@@ -89,7 +90,8 @@ public sealed class GrainStateTests
         var hostId = OrleansTestIds.Create("linux-host");
         var scheduler = _grainFactory.GetGrain<ISchedulerGrain>(CreatePositiveLong());
         var host = _grainFactory.GetGrain<IHostGrain>(hostId);
-        await host.Register("linux-builder", HostPlatform.Linux, "x64", "1.0.0");
+        await host.Register($"{hostId}-name", HostPlatform.Linux, "x64", "1.0.0",
+            new Dictionary<string, string> { ["docker"] = "true" });
         await host.UpdateLabels(new Dictionary<string, string> { ["builder"] = "true" });
         await scheduler.RegisterHost(hostId);
 
@@ -118,7 +120,8 @@ public sealed class GrainStateTests
             ExecutionBackend.Docker));
 
         var host = _grainFactory.GetGrain<IHostGrain>(hostId);
-        await host.Register("linux-builder", HostPlatform.Linux, "x64", "1.0.0");
+        await host.Register($"{hostId}-name", HostPlatform.Linux, "x64", "1.0.0",
+            new Dictionary<string, string> { ["docker"] = "true" });
         await host.UpdateLabels(new Dictionary<string, string> { ["builder"] = "false" });
         await scheduler.RegisterHost(hostId);
 

@@ -54,7 +54,7 @@ public class HostWorkerEventProcessorTests
     }
 
     [Fact]
-    public async Task HandleMessageAsync_StoresObservedTartUsageFromHeartbeat()
+    public async Task HandleMessageAsync_SendsHeartbeatUsageToHostGrainWithoutRewritingDocument()
     {
         var store = TestDocumentStore.Create();
         await store.Insert(new Host
@@ -63,24 +63,131 @@ public class HostWorkerEventProcessorTests
             Name = "mac-mini",
             Platform = HostPlatform.MacOS
         });
-        var processor = CreateProcessor(store);
-        var message = HostWorkerProtocol.CreateMessage(
-            "worker-host",
-            HostWorkerMessageKinds.Heartbeat,
-            new HeartbeatEvent
-            {
-                AgentId = "worker-host",
-                RunningInstanceCount = 0,
-                ResourceUsage = new HostResourceUsage { RunningTartVmCount = 2 }
-            });
+        var hostGrain = Substitute.For<IHostGrain>();
+        var processor = CreateProcessor(store, hostGrain: hostGrain);
 
-        await processor.HandleMessageAsync("canonical-host", message, CancellationToken.None);
+        await processor.HandleMessageAsync("canonical-host", CreateHeartbeatMessage(runningTartVms: 2), CancellationToken.None);
+
+        await hostGrain.Received(1).RecordHeartbeat(
+            "canonical-host", 0, Arg.Is<HostResourceUsage?>(u => u != null && u.RunningTartVmCount == 2));
+        // The grain owns the document write. A read-modify-write here could land a stale
+        // copy of the backend limits on top of a concurrent Hosts page save.
+        var host = await store.Get<Host>("canonical-host");
+        Assert.Null(host!.ObservedResourceUsageAt);
+        Assert.Equal(default, host.LastHeartbeat);
+    }
+
+    [Fact]
+    public async Task HandleMessageAsync_StoresObservedTartUsageWhenHostGrainIsUnavailable()
+    {
+        var store = TestDocumentStore.Create();
+        await store.Insert(new Host
+        {
+            Id = "canonical-host",
+            Name = "mac-mini",
+            Platform = HostPlatform.MacOS
+        });
+        var hostGrain = Substitute.For<IHostGrain>();
+        hostGrain.RecordHeartbeat(Arg.Any<string>(), Arg.Any<int>(), Arg.Any<HostResourceUsage?>())
+            .Returns(Task.FromException(new InvalidOperationException("silo unavailable")));
+        var processor = CreateProcessor(store, hostGrain: hostGrain);
+
+        await processor.HandleMessageAsync("canonical-host", CreateHeartbeatMessage(runningTartVms: 2), CancellationToken.None);
 
         var host = await store.Get<Host>("canonical-host");
         Assert.NotNull(host);
         Assert.Equal(2, host.ObservedRunningTartVMs);
         Assert.NotNull(host.ObservedResourceUsageAt);
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RuntimeWrite_DoesNotRevertConcurrentConfigurationSave(bool heartbeatFallback)
+    {
+        var store = TestDocumentStore.Create();
+        await store.Insert(new Host
+        {
+            Id = "worker-1",
+            Name = "mac-mini",
+            Platform = HostPlatform.MacOS,
+            IsApproved = true,
+            MaxDockerContainers = 10,
+            MaxTartVMs = 0,
+            MaxNativeProcesses = 5
+        });
+
+        async Task SaveConfigurationAsync()
+        {
+            var host = (await store.Get<Host>("worker-1"))!;
+            host.MaxDockerContainers = 0;
+            host.MaxTartVMs = 2;
+            host.MaxNativeProcesses = 0;
+            host.GroupId = "ui-macs";
+            host.Labels["rack"] = "new";
+            await store.Update(host);
+        }
+
+        var racingStore = Substitute.For<IDocumentStore>();
+        var query = Substitute.For<IDocumentQuery<Host>>();
+        racingStore.Query<Host>().Returns(query);
+        query.ToList().Returns(async _ =>
+        {
+            var snapshot = await store.Query<Host>().ToList();
+            await SaveConfigurationAsync();
+            return snapshot;
+        });
+        racingStore.Get<Host>("worker-1").Returns(async _ =>
+        {
+            var snapshot = await store.Get<Host>("worker-1");
+            await SaveConfigurationAsync();
+            return snapshot;
+        });
+        racingStore.Update(Arg.Any<Host>()).Returns(call => store.Update(call.Arg<Host>()));
+        racingStore.RunInTransaction(Arg.Any<Func<IDocumentStore, Task>>())
+            .Returns(call => store.RunInTransaction(call.Arg<Func<IDocumentStore, Task>>()));
+
+        var grain = Substitute.For<IHostGrain>();
+        var processor = CreateProcessor(racingStore, hostGrain: grain);
+        if (heartbeatFallback)
+        {
+            grain.RecordHeartbeat(Arg.Any<string>(), Arg.Any<int>(), Arg.Any<HostResourceUsage?>())
+                .Returns(Task.FromException(new InvalidOperationException("silo unavailable")));
+            await processor.HandleMessageAsync("worker-1", CreateHeartbeatMessage(2), CancellationToken.None);
+        }
+        else
+        {
+            await processor.WorkerConnectedAsync(
+                new AgentInfo
+                {
+                    AgentId = "worker-1",
+                    Name = "mac-mini",
+                    Platform = HostPlatform.MacOS,
+                    Capabilities = ["native", "tart"]
+                },
+                "connection-1",
+                new Dictionary<string, string> { ["tart"] = "true" },
+                null,
+                CancellationToken.None);
+        }
+
+        var saved = (await store.Get<Host>("worker-1"))!;
+        Assert.Equal((0, 2, 0), (saved.MaxDockerContainers, saved.MaxTartVMs, saved.MaxNativeProcesses));
+        Assert.Equal("ui-macs", saved.GroupId);
+        Assert.Equal("new", saved.Labels["rack"]);
+        Assert.NotNull(saved.LastHeartbeat);
+    }
+
+    private static HostWorkerMessage CreateHeartbeatMessage(int runningTartVms) =>
+        HostWorkerProtocol.CreateMessage(
+            "worker-host",
+            HostWorkerMessageKinds.Heartbeat,
+            new HeartbeatEvent
+            {
+                AgentId = "worker-host",
+                RunningInstanceCount = 0,
+                ResourceUsage = new HostResourceUsage { RunningTartVmCount = runningTartVms }
+            });
 
     private static HostWorkerEventProcessor CreateProcessor(HostWorkerLogCache cache)
         => new(
@@ -92,7 +199,7 @@ public class HostWorkerEventProcessorTests
             NullLogger<HostWorkerEventProcessor>.Instance);
 
     [Fact]
-    public async Task WorkerConnectedAsync_EnrollsPendingHostWithHashedToken()
+    public async Task WorkerConnectedAsync_StoresEnrollmentIdentityAndSendsLabelsToGrain()
     {
         var token = HostEnrollmentToken.Create();
         var store = TestDocumentStore.Create();
@@ -102,7 +209,8 @@ public class HostWorkerEventProcessorTests
             EnrollmentTokenHash = HostEnrollmentToken.Hash(token),
             EnrollmentTokenCreatedAt = DateTime.UtcNow
         });
-        var processor = CreateProcessor(store);
+        var grain = Substitute.For<IHostGrain>();
+        var processor = CreateProcessor(store, hostGrain: grain);
 
         var hostId = await processor.WorkerConnectedAsync(
             new AgentInfo
@@ -121,10 +229,9 @@ public class HostWorkerEventProcessorTests
         Assert.NotNull(host);
         Assert.Equal("worker-1", host.WorkerId);
         Assert.Equal("mac-mini-1", host.Name);
-        Assert.True(host.IsApproved);
-        Assert.NotNull(host.EnrolledAt);
         Assert.Null(host.EnrollmentToken);
-        Assert.Equal("mac", host.Labels["pool"]);
+        await grain.Received(1).Register("mac-mini-1", HostPlatform.MacOS, "arm64", "",
+            Arg.Is<Dictionary<string, string>>(labels => labels["pool"] == "mac"));
     }
 
     [Fact]
@@ -286,10 +393,10 @@ public class HostWorkerEventProcessorTests
             CancellationToken.None));
     }
 
-    private static HostWorkerEventProcessor CreateProcessor(IDocumentStore store, LongRunningTaskService? tasks = null)
+    private static HostWorkerEventProcessor CreateProcessor(IDocumentStore store, LongRunningTaskService? tasks = null, IHostGrain? hostGrain = null)
     {
         var grainFactory = Substitute.For<IGrainFactory>();
-        grainFactory.GetGrain<IHostGrain>(Arg.Any<string>(), null).Returns(Substitute.For<IHostGrain>());
+        grainFactory.GetGrain<IHostGrain>(Arg.Any<string>(), null).Returns(hostGrain ?? Substitute.For<IHostGrain>());
         grainFactory.GetGrain<ISchedulerGrain>(Arg.Any<long>(), null).Returns(Substitute.For<ISchedulerGrain>());
 
         return new HostWorkerEventProcessor(

@@ -41,10 +41,6 @@ public class ServerHostRegistrationService : BackgroundService
         try
         {
             var hostGrain = _grainFactory.GetGrain<IHostGrain>(hostId);
-            await hostGrain.Register(hostName, HostPlatform.Linux, 
-                System.Runtime.InteropServices.RuntimeInformation.OSArchitecture.ToString(), 
-                typeof(ServerHostRegistrationService).Assembly.GetName().Version?.ToString() ?? "1.0.0");
-
             var labels = new Dictionary<string, string>
             {
                 ["os"] = "linux",
@@ -53,7 +49,9 @@ public class ServerHostRegistrationService : BackgroundService
                 ["docker"] = "true",
                 ["role"] = "server"
             };
-            await hostGrain.UpdateLabels(labels);
+            await hostGrain.Register(hostName, HostPlatform.Linux,
+                System.Runtime.InteropServices.RuntimeInformation.OSArchitecture.ToString(),
+                typeof(ServerHostRegistrationService).Assembly.GetName().Version?.ToString() ?? "1.0.0", labels);
 
             var scheduler = _grainFactory.GetGrain<ISchedulerGrain>(0);
             await scheduler.RegisterHost(hostId);

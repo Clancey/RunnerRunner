@@ -6,7 +6,9 @@ using RunnerRunner.Core.Models;
 using RunnerRunner.Server.Grains.Events;
 using RunnerRunner.Server.Grains.Interfaces;
 using RunnerRunner.Server.Grains.State;
+using RunnerRunner.Server.Services;
 using Shiny.DocumentDb;
+using System.Linq.Expressions;
 using System.Text.RegularExpressions;
 
 namespace RunnerRunner.Server.Grains;
@@ -36,17 +38,33 @@ public class HostGrain : Grain, IHostGrain
         _serviceProvider = serviceProvider;
     }
 
-    public async Task Register(string name, HostPlatform platform, string? architecture, string agentVersion)
+    public override async Task OnActivateAsync(CancellationToken cancellationToken)
+    {
+        using var scope = _serviceProvider.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<IDocumentStore>();
+        var host = await store.Get<Core.Models.Host>(this.GetPrimaryKeyString());
+        if (host != null)
+            await AdoptConfiguration(host);
+    }
+
+    public async Task Register(
+        string name,
+        HostPlatform platform,
+        string? architecture,
+        string agentVersion,
+        Dictionary<string, string>? labels = null)
     {
         _state.State.Name = name;
         _state.State.Platform = platform;
         _state.State.Architecture = architecture;
         _state.State.AgentVersion = agentVersion;
 
-        // Auto-populate default labels
-        _state.State.Labels["os"] = platform.ToString().ToLowerInvariant();
+        var registrationLabels = labels == null ? new Dictionary<string, string>() : new(labels);
+        registrationLabels["os"] = platform.ToString().ToLowerInvariant();
         if (architecture is not null)
-            _state.State.Labels["arch"] = architecture.ToLowerInvariant();
+            registrationLabels["arch"] = architecture.ToLowerInvariant();
+        foreach (var (key, value) in registrationLabels)
+            _state.State.Labels[key] = value;
 
         _state.State.Status = AgentStatus.Online;
         if (_state.State.CreatedAt == default)
@@ -55,7 +73,8 @@ public class HostGrain : Grain, IHostGrain
 
         await _state.WriteStateAsync();
         StartHeartbeatTimer();
-        await SyncToDocumentDb();
+        await SyncToDocumentDb(initialRegistration: true);
+        await UpdateLabels(registrationLabels);
         await PublishHostStatusChange();
 
         _logger.LogInformation("Host {HostId} registered: {Name} ({Platform}/{Architecture})",
@@ -64,24 +83,83 @@ public class HostGrain : Grain, IHostGrain
 
     public async Task UpdateLabels(Dictionary<string, string> labels)
     {
-        foreach (var kvp in labels)
-            _state.State.Labels[kvp.Key] = kvp.Value;
+        using var scope = _serviceProvider.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<IDocumentStore>();
+        var host = await store.Get<Core.Models.Host>(this.GetPrimaryKeyString());
+        var merged = new Dictionary<string, string>(host?.Labels ?? _state.State.Labels);
+        foreach (var (key, value) in labels)
+            merged[key] = value;
 
+        if (host != null)
+        {
+            host.Labels = merged;
+            host.Capabilities = GetCapabilities(merged);
+            host.UpdatedAt = DateTime.UtcNow;
+            await HostDocumentUpdates.UpdateAsync(store, host, h => h.Labels, h => h.Capabilities, h => h.UpdatedAt);
+        }
+
+        _state.State.Labels = merged;
         await _state.WriteStateAsync();
     }
 
-    public async Task SetResourceLimits(int maxDocker, int maxTart, int maxNative)
-    {
-        _state.State.MaxDockerContainers = maxDocker;
-        _state.State.MaxTartVMs = maxTart;
-        _state.State.MaxNativeProcesses = maxNative;
-        await _state.WriteStateAsync();
-    }
+    public Task SetResourceLimits(int maxDocker, int maxTart, int maxNative)
+        => UpdateConfigurationAsync(host =>
+        {
+            host.MaxDockerContainers = maxDocker;
+            host.MaxTartVMs = maxTart;
+            host.MaxNativeProcesses = maxNative;
+            host.BackendLimitsConfigured = true;
+        });
 
-    public async Task SetGroupId(string? groupId)
+    public Task SetGroupId(string? groupId)
+        => UpdateConfigurationAsync(host => host.GroupId = groupId);
+
+    public Task SetConfiguration(int maxDocker, int maxTart, int maxNative, string? groupId, Dictionary<string, string>? labels = null)
+        => UpdateConfigurationAsync(host =>
+        {
+            host.MaxDockerContainers = maxDocker;
+            host.MaxTartVMs = maxTart;
+            host.MaxNativeProcesses = maxNative;
+            host.BackendLimitsConfigured = true;
+            host.GroupId = groupId;
+            if (labels != null)
+                host.Labels = new Dictionary<string, string>(labels);
+        }, requireExistingHost: true);
+
+    private async Task UpdateConfigurationAsync(Action<Core.Models.Host> update, bool requireExistingHost = false)
     {
-        _state.State.GroupId = groupId;
-        await _state.WriteStateAsync();
+        using var scope = _serviceProvider.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<IDocumentStore>();
+        var hostId = this.GetPrimaryKeyString();
+        var host = await store.Get<Core.Models.Host>(hostId);
+        var exists = host != null;
+        if (!exists && requireExistingHost)
+            throw new InvalidOperationException($"Host '{hostId}' was not found.");
+
+        host ??= new Core.Models.Host
+        {
+            Id = hostId,
+            Name = _state.State.Name,
+            MaxDockerContainers = _state.State.MaxDockerContainers,
+            MaxTartVMs = _state.State.MaxTartVMs,
+            MaxNativeProcesses = _state.State.MaxNativeProcesses,
+            BackendLimitsConfigured = _state.State.BackendLimitsConfigured,
+            GroupId = _state.State.GroupId,
+            Labels = new Dictionary<string, string>(_state.State.Labels)
+        };
+        update(host);
+        ArgumentOutOfRangeException.ThrowIfNegative(host.MaxDockerContainers);
+        ArgumentOutOfRangeException.ThrowIfNegative(host.MaxTartVMs);
+        ArgumentOutOfRangeException.ThrowIfNegative(host.MaxNativeProcesses);
+        host.GroupId = string.IsNullOrWhiteSpace(host.GroupId) ? null : host.GroupId.Trim();
+        host.UpdatedAt = DateTime.UtcNow;
+        if (exists)
+        {
+            await HostDocumentUpdates.UpdateAsync(store, host,
+                h => h.MaxDockerContainers, h => h.MaxTartVMs, h => h.MaxNativeProcesses,
+                h => h.BackendLimitsConfigured, h => h.GroupId, h => h.Labels, h => h.UpdatedAt);
+        }
+        await AdoptConfiguration(host);
     }
 
     public async Task SetDraining(bool isDraining)
@@ -203,13 +281,16 @@ public class HostGrain : Grain, IHostGrain
         _heartbeatTimer = null;
     }
 
-    private async Task SyncToDocumentDb()
+    /// <summary>
+    /// Projects runtime fields only. Configuration is written by explicit UI/grain
+    /// setters and read back here for scheduling; heartbeats never write it.
+    /// </summary>
+    private async Task SyncToDocumentDb(bool initialRegistration = false)
     {
         try
         {
             using var scope = _serviceProvider.CreateScope();
             var store = scope.ServiceProvider.GetRequiredService<IDocumentStore>();
-
             var hostId = this.GetPrimaryKeyString();
             var allHosts = (await store.Query<Core.Models.Host>().ToList()).ToList();
             var existing = allHosts.FirstOrDefault(h => h.Id == hostId);
@@ -222,13 +303,28 @@ public class HostGrain : Grain, IHostGrain
                 {
                     Id = hostId,
                     Name = _state.State.Name,
+                    MaxDockerContainers = _state.State.MaxDockerContainers,
+                    MaxTartVMs = _state.State.MaxTartVMs,
+                    MaxNativeProcesses = _state.State.MaxNativeProcesses,
+                    BackendLimitsConfigured = _state.State.BackendLimitsConfigured,
+                    GroupId = _state.State.GroupId,
+                    EnrolledAt = initialRegistration ? DateTime.UtcNow : null,
                     CreatedAt = _state.State.CreatedAt == default ? DateTime.UtcNow : _state.State.CreatedAt
                 };
 
-                if (legacy != null)
-                    CopyUserManagedFields(legacy, existing);
-
                 ApplyProjection(existing);
+                existing.Capabilities = GetCapabilities(_state.State.Labels);
+                existing.Labels = new Dictionary<string, string>(_state.State.Labels);
+                if (legacy != null)
+                {
+                    CopyUserManagedFields(legacy, existing);
+                    CopyConfiguration(legacy, existing);
+                }
+                else if (!existing.BackendLimitsConfigured)
+                {
+                    HostBackendLimitDefaults.ApplyToNewHost(existing);
+                }
+
                 await store.Insert(existing);
 
                 if (legacy != null)
@@ -239,21 +335,82 @@ public class HostGrain : Grain, IHostGrain
             }
             else
             {
+                var firstEnrollment = initialRegistration && !existing.IsApproved && existing.EnrolledAt == null;
                 if (legacy != null)
                 {
                     CopyUserManagedFields(legacy, existing);
+                    await HostDocumentUpdates.UpdateAsync(store, existing,
+                        h => h.DisplayName, h => h.RunnerBasePath, h => h.WorkDirectory,
+                        h => h.EnvironmentOverrides, h => h.ReportedEnvironment,
+                        h => h.PendingHostWorkerUpdateSource, h => h.PendingHostWorkerUpdateVersion,
+                        h => h.PendingHostWorkerUpdateAllowNonUpgrade, h => h.PendingHostWorkerUpdatePublicBaseUrl,
+                        h => h.PendingHostWorkerUpdateQueuedAt, h => h.PendingHostWorkerUpdateDispatchedAt);
                     await MigrateHostReferences(store, legacy.Id, hostId);
                     await store.Remove<Core.Models.Host>(legacy.Id);
                 }
 
                 ApplyProjection(existing);
-                await store.Update(existing);
+                Expression<Func<Core.Models.Host, object?>>[] properties =
+                [
+                    h => h.Name, h => h.Platform, h => h.Architecture, h => h.AgentVersion,
+                    h => h.AgentStatus, h => h.LastHeartbeat,
+                    h => h.ObservedRunningTartVMs, h => h.ObservedFreeDiskBytes, h => h.ObservedTotalDiskBytes,
+                    h => h.ObservedDiskUsageAt, h => h.ObservedResourceUsageAt,
+                    h => h.IsDraining, h => h.IsApproved, h => h.UpdatedAt
+                ];
+                if (initialRegistration)
+                {
+                    existing.Capabilities = GetCapabilities(_state.State.Labels);
+                    existing.EnrolledAt ??= DateTime.UtcNow;
+                    properties = [.. properties, h => h.Capabilities, h => h.EnrolledAt];
+                    if (firstEnrollment && !existing.BackendLimitsConfigured)
+                    {
+                        HostBackendLimitDefaults.ApplyToNewHost(existing);
+                        properties = [.. properties, h => h.MaxDockerContainers, h => h.MaxTartVMs, h => h.MaxNativeProcesses];
+                    }
+                }
+                await HostDocumentUpdates.UpdateAsync(store, existing, properties);
             }
+
+            await AdoptConfiguration(existing);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to sync Host to DocumentDB");
+            throw;
         }
+    }
+
+    private async Task AdoptConfiguration(Core.Models.Host host)
+    {
+        if (_state.State.MaxDockerContainers == host.MaxDockerContainers
+            && _state.State.MaxTartVMs == host.MaxTartVMs
+            && _state.State.MaxNativeProcesses == host.MaxNativeProcesses
+            && _state.State.BackendLimitsConfigured == host.BackendLimitsConfigured
+            && string.Equals(_state.State.GroupId, host.GroupId, StringComparison.Ordinal)
+            && _state.State.Labels.Count == host.Labels.Count
+            && host.Labels.All(label => _state.State.Labels.TryGetValue(label.Key, out var value) && value == label.Value))
+        {
+            return;
+        }
+
+        _state.State.MaxDockerContainers = host.MaxDockerContainers;
+        _state.State.MaxTartVMs = host.MaxTartVMs;
+        _state.State.MaxNativeProcesses = host.MaxNativeProcesses;
+        _state.State.BackendLimitsConfigured = host.BackendLimitsConfigured;
+        _state.State.GroupId = host.GroupId;
+        _state.State.Labels = new Dictionary<string, string>(host.Labels);
+        await _state.WriteStateAsync();
+    }
+
+    private static void CopyConfiguration(Core.Models.Host source, Core.Models.Host target)
+    {
+        target.MaxDockerContainers = source.MaxDockerContainers;
+        target.MaxTartVMs = source.MaxTartVMs;
+        target.MaxNativeProcesses = source.MaxNativeProcesses;
+        target.BackendLimitsConfigured = source.BackendLimitsConfigured;
+        target.GroupId = source.GroupId;
+        target.Labels = new Dictionary<string, string>(source.Labels);
     }
 
     private void ApplyProjection(Core.Models.Host host)
@@ -264,27 +421,23 @@ public class HostGrain : Grain, IHostGrain
         host.AgentVersion = _state.State.AgentVersion;
         host.AgentStatus = _state.State.Status;
         host.LastHeartbeat = _state.State.LastHeartbeat;
-        host.Labels = new Dictionary<string, string>(_state.State.Labels);
-        host.Capabilities = _state.State.Labels
-            .Where(kv =>
-                kv.Value.Equals("true", StringComparison.OrdinalIgnoreCase) &&
-                kv.Key is not "os" and not "arch" and not "role")
-            .Select(kv => kv.Key)
-            .OrderBy(k => k)
-            .ToList();
-        host.MaxDockerContainers = _state.State.MaxDockerContainers;
-        host.MaxTartVMs = _state.State.MaxTartVMs;
-        host.MaxNativeProcesses = _state.State.MaxNativeProcesses;
         host.ObservedRunningTartVMs = _state.State.ObservedRunningTartVMs;
         host.ObservedFreeDiskBytes = _state.State.ObservedFreeDiskBytes;
         host.ObservedTotalDiskBytes = _state.State.ObservedTotalDiskBytes;
         host.ObservedDiskUsageAt = _state.State.ObservedDiskUsageAt;
         host.ObservedResourceUsageAt = _state.State.ObservedResourceUsageAt;
         host.IsDraining = _state.State.IsDraining;
-        host.GroupId = _state.State.GroupId;
         host.IsApproved = true;
         host.UpdatedAt = DateTime.UtcNow;
     }
+
+    private static List<string> GetCapabilities(Dictionary<string, string> labels)
+        => labels
+            .Where(kv => string.Equals(kv.Value, "true", StringComparison.OrdinalIgnoreCase)
+                         && kv.Key is not "os" and not "arch" and not "role")
+            .Select(kv => kv.Key)
+            .OrderBy(k => k)
+            .ToList();
 
     private void ApplyResourceUsage(HostResourceUsage? resourceUsage)
     {

@@ -39,6 +39,7 @@ public class HostGrainState
     [Id(21)] public long? ObservedFreeDiskBytes { get; set; }
     [Id(22)] public long? ObservedTotalDiskBytes { get; set; }
     [Id(23)] public DateTime? ObservedDiskUsageAt { get; set; }
+    [Id(24)] public bool BackendLimitsConfigured { get; set; }
 }
 
 [GenerateSerializer]

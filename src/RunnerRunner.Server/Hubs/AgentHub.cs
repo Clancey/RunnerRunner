@@ -50,7 +50,7 @@ public class AgentHub : Hub<IAgentHubClient>, IAgentHubServer
             {
                 host.AgentStatus = AgentStatus.Offline;
                 host.UpdatedAt = DateTime.UtcNow;
-                await _store.Update(host);
+                await HostDocumentUpdates.UpdateAsync(_store, host, h => h.AgentStatus, h => h.UpdatedAt);
             }
 
             // Sync with Orleans grains
@@ -102,9 +102,11 @@ public class AgentHub : Hub<IAgentHubClient>, IAgentHubServer
             host.ContainerImage = agentInfo.Runtime?.ContainerImage;
             host.Capabilities = agentInfo.Capabilities;
             host.LastHeartbeat = DateTime.UtcNow;
-            host.IsApproved = true;
             host.UpdatedAt = DateTime.UtcNow;
-            await _store.Update(host);
+            await HostDocumentUpdates.UpdateAsync(_store, host,
+                h => h.AgentStatus, h => h.Platform, h => h.OsVersion, h => h.Architecture, h => h.AgentVersion,
+                h => h.IsContainerized, h => h.ContainerId, h => h.ContainerImage, h => h.Capabilities,
+                h => h.LastHeartbeat, h => h.UpdatedAt);
         }
         else
         {
@@ -131,7 +133,9 @@ public class AgentHub : Hub<IAgentHubClient>, IAgentHubServer
         try
         {
             var hostGrain = _grainFactory.GetGrain<IHostGrain>(agentInfo.AgentId);
-            await hostGrain.Register(agentInfo.Name, agentInfo.Platform, agentInfo.Architecture, agentInfo.AgentVersion ?? "");
+            await hostGrain.Register(agentInfo.Name, agentInfo.Platform, agentInfo.Architecture, agentInfo.AgentVersion ?? "",
+                agentInfo.Capabilities.Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(c => c, _ => "true", StringComparer.OrdinalIgnoreCase));
 
             var scheduler = _grainFactory.GetGrain<ISchedulerGrain>(0);
             await scheduler.RegisterHost(agentInfo.AgentId);
@@ -299,7 +303,10 @@ public class AgentHub : Hub<IAgentHubClient>, IAgentHubServer
                 var now = DateTime.UtcNow;
                 host.LastHeartbeat = now;
                 ApplyResourceUsage(host, evt.ResourceUsage, now);
-                await _store.Update(host);
+                await HostDocumentUpdates.UpdateAsync(_store, host,
+                    h => h.LastHeartbeat, h => h.ObservedRunningTartVMs,
+                    h => h.ObservedFreeDiskBytes, h => h.ObservedTotalDiskBytes,
+                    h => h.ObservedDiskUsageAt, h => h.ObservedResourceUsageAt);
             }
         }
 
@@ -453,7 +460,7 @@ public class AgentHub : Hub<IAgentHubClient>, IAgentHubServer
         {
             host.ReportedEnvironment = evt.EnvironmentVariables;
             host.UpdatedAt = DateTime.UtcNow;
-            await _store.Update(host);
+            await HostDocumentUpdates.UpdateAsync(_store, host, h => h.ReportedEnvironment, h => h.UpdatedAt);
         }
     }
 
