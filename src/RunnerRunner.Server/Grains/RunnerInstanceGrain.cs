@@ -373,12 +373,12 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
         // resource looks like an orphan and gets cleaned up mid-job. Only the host reporting
         // the runner exited (or the provider reporting it idle/gone) may end it.
         var message = $"{HealthStaleMessagePrefix} since {lastSeenAt.Value:u} — awaiting host confirmation";
+        if (string.Equals(_state.State.StatusMessage, message, StringComparison.Ordinal))
+            return;
+
         _logger.LogWarning(
             "Runner instance {InstanceId} health check stale (last seen {LastSeen:u}); keeping it Running until the host confirms it exited",
             this.GetPrimaryKeyString(), lastSeenAt.Value);
-
-        if (string.Equals(_state.State.StatusMessage, message, StringComparison.Ordinal))
-            return;
 
         _state.State.StatusMessage = message;
         await _state.WriteStateAsync();
@@ -448,8 +448,10 @@ public class RunnerInstanceGrain : Grain, IRunnerInstanceGrain
             null,
             new GrainTimerCreationOptions
             {
+                // Periodic: a tick that lands a hair before the timeout finds health not yet
+                // stale and returns, and a one-shot timer would then never check again.
                 DueTime = HealthStaleTimeout,
-                Period = Timeout.InfiniteTimeSpan
+                Period = HealthStaleTimeout
             });
     }
 
