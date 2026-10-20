@@ -1169,6 +1169,53 @@ public class CapacityPlanningServiceTests
     }
 
     [Fact]
+    public void AnalyzeHostSelection_FallsBackFromDisconnectedPreferredHostToConnectedHost()
+    {
+        var disconnected = new Host { Name = "linux-a", Platform = HostPlatform.Linux, AgentStatus = AgentStatus.Online, MaxDockerContainers = 3, Capabilities = ["docker"] };
+        var connected = new Host { Name = "linux-b", Platform = HostPlatform.Linux, AgentStatus = AgentStatus.Online, MaxDockerContainers = 3, Capabilities = ["docker"] };
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker, maxParallelPerHost: 3);
+        var profiles = new Dictionary<string, RunnerProfile> { [profile.Id] = profile };
+
+        var withoutConnectionCheck = CapacityPlanningService.AnalyzeHostSelection(
+            profile, null, [disconnected, connected], profiles, [], requireDispatchReadiness: true);
+        Assert.Equal(disconnected.Id, withoutConnectionCheck.SelectedHost?.Id);
+
+        var analysis = CapacityPlanningService.AnalyzeHostSelection(
+            profile,
+            null,
+            [disconnected, connected],
+            profiles,
+            [],
+            requireDispatchReadiness: true,
+            isHostConnected: hostId => hostId != disconnected.Id);
+
+        Assert.Equal(connected.Id, analysis.SelectedHost?.Id);
+        var skipped = Assert.Single(analysis.Candidates, candidate => candidate.HostId == disconnected.Id);
+        Assert.False(skipped.CanRunNow);
+        Assert.True(skipped.IsHostWorkerDisconnected);
+    }
+
+    [Fact]
+    public void AnalyzeHostSelection_WhenOnlyMatchingHostIsDisconnected_SelectsNothingAndFlagsIt()
+    {
+        var disconnected = new Host { Name = "linux-a", Platform = HostPlatform.Linux, AgentStatus = AgentStatus.Online, MaxDockerContainers = 3, Capabilities = ["docker"] };
+        var profile = CreateProfile("linux-docker", HostPlatform.Linux, ExecutionBackend.Docker, maxParallelPerHost: 3);
+
+        var analysis = CapacityPlanningService.AnalyzeHostSelection(
+            profile,
+            null,
+            [disconnected],
+            new Dictionary<string, RunnerProfile> { [profile.Id] = profile },
+            [],
+            requireDispatchReadiness: true,
+            isHostConnected: _ => false);
+
+        Assert.Null(analysis.SelectedHost);
+        Assert.False(analysis.CapacityBlocked);
+        Assert.True(Assert.Single(analysis.Candidates).IsHostWorkerDisconnected);
+    }
+
+    [Fact]
     public void EvaluateRuleCapacity_StaticRuleCountsOnlyHostsMatchingRuleFilters()
     {
         var targetHost = new Host { Name = "target", Platform = HostPlatform.Linux, GroupId = "pool-a", MaxDockerContainers = 2, Capabilities = ["docker"] };

@@ -104,6 +104,7 @@ public sealed class HostCandidateView
     public bool CanRunNow { get; init; }
     public CapacityBlockerKind BlockedBy { get; init; }
     public string Detail { get; init; } = "";
+    public bool IsHostWorkerDisconnected { get; init; }
 }
 
 public sealed class HostSelectionAnalysis
@@ -296,7 +297,8 @@ public sealed class CapacityPlanningService
         bool requireDispatchReadiness = false,
         IReadOnlyCollection<string>? requestedRunnerLabels = null,
         double minimumFreeDiskGb = 0,
-        DateTime? asOf = null)
+        DateTime? asOf = null,
+        Func<string, bool>? isHostConnected = null)
     {
         var backendName = profile.ExecutionBackend.ToString().ToLowerInvariant();
         var matchingHosts = hosts
@@ -327,6 +329,7 @@ public sealed class CapacityPlanningService
                 var canRunNow = true;
                 var blockedBy = CapacityBlockerKind.None;
                 var detail = $"Ready now: {backendName} {backendUsage.Summary}";
+                var hostWorkerDisconnected = false;
 
                 if (host.IsDraining)
                 {
@@ -352,6 +355,15 @@ public sealed class CapacityPlanningService
                     blockedBy = CapacityBlockerKind.Host;
                     detail = lowDiskDetail;
                 }
+                else if (requireDispatchReadiness && !IsDispatchableHost(host, isHostConnected))
+                {
+                    // Persisted as Online but no live HostWorker connection: fall back to a connected
+                    // candidate rather than selecting a host the dispatcher will refuse.
+                    canRunNow = false;
+                    blockedBy = CapacityBlockerKind.Matching;
+                    detail = "HostWorker is not connected";
+                    hostWorkerDisconnected = true;
+                }
 
                 return new HostCandidateView
                 {
@@ -361,7 +373,8 @@ public sealed class CapacityPlanningService
                     TotalHostLoad = hostInstances.Count,
                     CanRunNow = canRunNow,
                     BlockedBy = blockedBy,
-                    Detail = detail
+                    Detail = detail,
+                    IsHostWorkerDisconnected = hostWorkerDisconnected
                 };
             })
             .OrderBy(candidate => candidate.CanRunNow ? 0 : 1)
@@ -462,9 +475,7 @@ public sealed class CapacityPlanningService
     {
         var blockers = new List<QueuedWorkBlocker>();
         var dispatchableHosts = hosts
-            .Where(host =>
-                host.AgentStatus == AgentStatus.Online
-                && (isHostConnected == null || isHostConnected(host.Id)))
+            .Where(host => IsDispatchableHost(host, isHostConnected))
             .ToList();
         var currentHostIds = GetPlaceableHostIds(currentProfile, currentRule, currentEvent.Labels, dispatchableHosts);
         if (currentHostIds.Count == 0)
@@ -511,6 +522,13 @@ public sealed class CapacityPlanningService
 
         return blockers;
     }
+
+    /// <summary>
+    /// Shared by FIFO lane checks and dispatch host selection so both agree on which hosts can take work.
+    /// </summary>
+    private static bool IsDispatchableHost(Host host, Func<string, bool>? isHostConnected)
+        => host.AgentStatus == AgentStatus.Online
+            && (isHostConnected == null || isHostConnected(host.Id));
 
     private static HashSet<string> GetPlaceableHostIds(
         RunnerProfile profile,

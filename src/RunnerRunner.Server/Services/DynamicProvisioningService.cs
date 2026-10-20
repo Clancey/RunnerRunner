@@ -710,7 +710,8 @@ public class DynamicProvisioningService : BackgroundService
                 hosts,
                 instances,
                 currentEvent.Labels,
-                _minimumFreeDiskGb);
+                _minimumFreeDiskGb,
+                _hostCommands.CanDispatchToHost);
 
             if (hostSelection.Host == null)
             {
@@ -1404,7 +1405,8 @@ public class DynamicProvisioningService : BackgroundService
         List<Host> hosts,
         List<RunnerInstance> instances,
         IReadOnlyCollection<string> requestedRunnerLabels,
-        double minimumFreeDiskGb)
+        double minimumFreeDiskGb,
+        Func<string, bool> isHostConnected)
     {
         var profilesById = (await store.Query<RunnerProfile>().ToList())
             .ToDictionary(p => p.Id, p => p, StringComparer.OrdinalIgnoreCase);
@@ -1418,10 +1420,19 @@ public class DynamicProvisioningService : BackgroundService
             instances,
             requireDispatchReadiness: true,
             requestedRunnerLabels,
-            minimumFreeDiskGb);
+            minimumFreeDiskGb,
+            isHostConnected: isHostConnected);
 
         if (analysis.SelectedHost != null)
             return new HostSelectionResult(analysis.SelectedHost, null, false);
+
+        // A matching host was ready except for its HostWorker connection: keep waiting for it to reconnect.
+        var disconnectedCandidate = analysis.Candidates.FirstOrDefault(candidate => candidate.IsHostWorkerDisconnected);
+        if (disconnectedCandidate != null)
+        {
+            var disconnectedHost = hosts.First(host => string.Equals(host.Id, disconnectedCandidate.HostId, StringComparison.OrdinalIgnoreCase));
+            return new HostSelectionResult(null, BuildHostWorkerDisconnectedReason(disconnectedHost), false);
+        }
 
         if (analysis.CapacityBlocked)
             return new HostSelectionResult(null, analysis.Reason, true);
