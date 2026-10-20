@@ -244,6 +244,19 @@ public class TartBackend : IRunnerBackend
             _logger.LogDebug("Installed Tart job-started hook at {Path}", guestPath);
         }
 
+        // InitStepShellBuilder exports step env verbatim; for a name bash rejects it
+        // would print name=value into the step output (runner.log for PostExit steps).
+        foreach (var step in request.InitSteps)
+        {
+            foreach (var name in step.EnvironmentVariables.Keys.Where(n => !IsShellVariableName(n)).ToList())
+            {
+                _logger.LogWarning(
+                    "Not exporting environment variable {Name} to Tart init step {Step}: not a valid shell variable name",
+                    name, step.Name);
+                step.EnvironmentVariables.Remove(name);
+            }
+        }
+
         // Pre-runner init steps: run via SSH before runner bits are touched.
         var preSteps = request.InitSteps.Where(s => s.Phase == Core.Models.InitStepPhase.PreRunner).ToList();
         if (preSteps.Count > 0)
