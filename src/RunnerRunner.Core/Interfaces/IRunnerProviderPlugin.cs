@@ -16,7 +16,9 @@ public interface IRunnerProviderPlugin
     Task<string> GetRegistrationTokenAsync(ProviderCredential credential, CancellationToken ct = default);
 
     /// <summary>
-    /// Remove/deregister a runner by name from the CI provider.
+    /// Remove/deregister a runner by name from the CI provider. Called only by automatic
+    /// cleanup, so an implementation that can see the runner's current activity must not
+    /// remove a runner that is on a job (or whose activity it cannot read).
     /// </summary>
     Task RemoveRunnerAsync(ProviderCredential credential, string runnerName, CancellationToken ct = default);
 

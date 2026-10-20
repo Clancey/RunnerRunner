@@ -52,6 +52,12 @@ public class ReconciliationService : IHostedService, IDisposable
     private readonly ConcurrentDictionary<string, (ProviderRunnerActivity Activity, DateTime CheckedAt)> _blockingActivity =
         new(StringComparer.Ordinal);
 
+    // host|backend|resource -> the same kind of blocking answer for a running orphan, so an
+    // orphan past its grace period costs one provider lookup every couple of minutes rather
+    // than one per report.
+    private readonly ConcurrentDictionary<string, (ProviderRunnerActivity Activity, DateTime CheckedAt)> _orphanBlockingActivity =
+        new(StringComparer.Ordinal);
+
     private readonly ILogger<ReconciliationService> _logger;
     private readonly IServiceProvider _services;
     private readonly IHostCommandDispatcher _hostCommands;
@@ -182,6 +188,18 @@ public class ReconciliationService : IHostedService, IDisposable
             }
             else if (!IsRunnerStillActive(matchedRunner))
             {
+                // A runner the provider reports busy is on a job somewhere, whatever the host
+                // says about this process (a stale or misread status, say). Ending it would
+                // requeue its job, clean up its resource and deregister it mid-job.
+                var activity = await GetProviderActivityAsync(store, registrationCleanup, instance, nowUtc);
+                if (activity == ProviderRunnerActivity.Busy)
+                {
+                    _logger.LogWarning(
+                        "Host {Host} reports runner {Name} exited ({HostStatus}), but the provider reports it busy; leaving it {Status} for a later report or the timeout service to decide",
+                        reportHostId, instance.RunnerName, matchedRunner.Status, instance.Status);
+                    continue;
+                }
+
                 instance.Status = RunnerInstanceStatus.Stopped;
                 instance.StatusMessage = $"Host reported runner exited ({matchedRunner.Status})";
                 instance.StoppedAt = nowUtc;
@@ -198,14 +216,9 @@ public class ReconciliationService : IHostedService, IDisposable
                     $"Runner exited on the host before the queued job started ({matchedRunner.Status}); provisioning will be retried");
                 await SendCleanupCommandAsync(hostId, matchedRunner);
 
-                // The process is gone, so the record ends whatever the provider says; the
-                // provider soon shows a dead runner offline and not busy. Until it does (or
-                // while it cannot answer), the registration stays.
-                await TryDeregisterRunnerAsync(
-                    store,
-                    registrationCleanup,
-                    instance,
-                    await GetProviderActivityAsync(store, registrationCleanup, instance, nowUtc));
+                // Unknown still ends the record (the host saw the process exit), but only Idle
+                // or NotRegistered lets the registration go.
+                await TryDeregisterRunnerAsync(store, registrationCleanup, instance, activity);
             }
         }
 
@@ -278,16 +291,29 @@ public class ReconciliationService : IHostedService, IDisposable
             // Only the provider saying it is idle or gone (or, for a provider that cannot say,
             // a long enough wait) justifies destroying a resource the host reports running.
             ProviderRunnerActivity? activity;
-            try
+            if (_orphanBlockingActivity.TryGetValue(key, out var cachedOrphan)
+                && nowUtc - cachedOrphan.CheckedAt < RunnerTimeoutService.ProviderActivityCacheDuration)
             {
-                activity = await registrationCleanup.GetOrphanRunnerActivityAsync(store, runner);
+                activity = cachedOrphan.Activity;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            else
             {
-                _logger.LogWarning(ex,
-                    "Not cleaning up {Backend} resource {Resource} on host {Host}: could not ask the provider about runner {RunnerName}",
-                    runner.Backend, resource, reportHostId, runner.RunnerName);
-                continue;
+                try
+                {
+                    activity = await registrationCleanup.GetOrphanRunnerActivityAsync(store, runner);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex,
+                        "Not cleaning up {Backend} resource {Resource} on host {Host}: could not ask the provider about runner {RunnerName}",
+                        runner.Backend, resource, reportHostId, runner.RunnerName);
+                    continue;
+                }
+
+                if (activity is ProviderRunnerActivity.Busy or ProviderRunnerActivity.Unknown)
+                    _orphanBlockingActivity[key] = (activity.Value, nowUtc);
+                else
+                    _orphanBlockingActivity.TryRemove(key, out _);
             }
 
             if (activity is not { } known)
@@ -312,6 +338,7 @@ public class ReconciliationService : IHostedService, IDisposable
                 runner.Backend, resource, reportHostId, runner.IsRunning, runner.Status, firstSeen, known);
             await SendCleanupCommandAsync(hostId, runner);
             _runningOrphanFirstSeen.TryRemove(key, out _);
+            _orphanBlockingActivity.TryRemove(key, out _);
         }
 
         // Forget resources this host no longer reports as running orphans, so a later
@@ -321,6 +348,14 @@ public class ReconciliationService : IHostedService, IDisposable
         {
             if (key.StartsWith(hostPrefix, StringComparison.Ordinal) && !runningOrphanKeys.Contains(key))
                 _runningOrphanFirstSeen.TryRemove(key, out _);
+        }
+        foreach (var (key, cached) in _orphanBlockingActivity)
+        {
+            if ((key.StartsWith(hostPrefix, StringComparison.Ordinal) && !runningOrphanKeys.Contains(key))
+                || nowUtc - cached.CheckedAt >= RunnerTimeoutService.ProviderActivityCacheDuration)
+            {
+                _orphanBlockingActivity.TryRemove(key, out _);
+            }
         }
 
         // Update health for matched runners, and record that the host no longer runs the

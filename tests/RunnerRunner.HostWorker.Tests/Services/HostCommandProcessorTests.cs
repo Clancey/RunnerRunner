@@ -374,6 +374,23 @@ public class HostCommandProcessorTests
         Assert.Equal([ExecutionBackend.Native], report.UnavailableBackends);
     }
 
+    // A PID file that exists but holds no PID was skipped, so a live runner whose PID file
+    // was truncated or garbled was reported nowhere, exactly like one that exited.
+    [Fact]
+    public async Task ReconciliationReport_WhenANativePidFileIsMalformed_FlagsNative()
+    {
+        using var directory = HostWorkerTestDirectory.Create("reconcile-native-bad-pid");
+        var defaultBasePath = Path.Combine(directory.Path, "default-runners");
+        WriteNativeInstance(defaultBasePath, "rr-live", "inst-live", "Macos-jit-live", Environment.ProcessId);
+        await File.WriteAllTextAsync(Path.Combine(defaultBasePath, "instances", "rr-live", "rr.pid"), "not-a-pid");
+        using var processor = CreateProcessor(directory, out _, out _, nativeBackend: CreateNativeBackend(directory));
+
+        var report = await processor.BuildReconciliationReportAsync(CancellationToken.None);
+
+        Assert.Empty(report.Runners);
+        Assert.Equal([ExecutionBackend.Native], report.UnavailableBackends);
+    }
+
     // Guard: a host that never ran a native runner (Tower runs Docker only) reports no
     // native runners and does not flag the backend.
     [Fact]

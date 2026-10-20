@@ -65,6 +65,18 @@ public class GitHubActionsProvider : IRunnerProviderPlugin
         {
             if (string.Equals(runner.Name, runnerName, StringComparison.OrdinalIgnoreCase))
             {
+                // Callers check activity before asking for removal, but GitHub can assign a
+                // job between that check and this DELETE, and deleting a runner on a job
+                // kills the job. Only a listing taken right now that shows the runner not
+                // busy lets it go; busy, or a listing that omits busy, keeps it.
+                if (runner.Busy != false)
+                {
+                    _logger.LogWarning(
+                        "Not removing runner {RunnerName} (id: {RunnerId}) from GitHub: it is {BusyState} in the current listing",
+                        runnerName, runner.Id, runner.Busy == true ? "busy" : "of unknown busy state");
+                    return;
+                }
+
                 await DeleteRunnerAsync(credential, runner.Id, ct);
                 _logger.LogInformation("Runner {RunnerName} (id: {RunnerId}) removed from GitHub", runnerName, runner.Id);
                 return;

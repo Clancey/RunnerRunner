@@ -220,6 +220,30 @@ public class ReconciliationServiceTests
         Assert.True(cleanup.Calls > 0);
     }
 
+    // A running orphan the provider reports busy is in every 30s report; its answer is reused
+    // for a couple of minutes, as for a tracked runner, rather than asked for each time.
+    [Fact]
+    public async Task RunningOrphan_ProviderBusy_IsProbedAgainOnlyAfterTheCacheExpires()
+    {
+        var (service, dispatcher, store, _) = await CreateReconciliationAsync("M4ini");
+        var cleanup = new FakeOrphanActivity(ProviderRunnerActivity.Busy);
+        var report = Report("M4ini", RunningResource(ExecutionBackend.Native));
+        var pastGrace = Now + ReconciliationService.RunningOrphanGracePeriod;
+
+        await service.ProcessReportAsync(report, store, cleanup, Now);
+        await service.ProcessReportAsync(report, store, cleanup, pastGrace);
+        await service.ProcessReportAsync(report, store, cleanup, pastGrace.AddSeconds(30));
+        await service.ProcessReportAsync(report, store, cleanup, pastGrace.AddSeconds(90));
+
+        Assert.Equal(1, cleanup.Calls);
+
+        cleanup.Activity = ProviderRunnerActivity.Idle;
+        await service.ProcessReportAsync(report, store, cleanup, pastGrace.AddMinutes(3));
+
+        Assert.Equal(2, cleanup.Calls);
+        Assert.Equal(3651, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ProcessId);
+    }
+
     [Fact]
     public async Task RunningOrphan_ProviderUnknown_IsKeptUntilTheCeilingFromFirstSeen()
     {
@@ -571,33 +595,62 @@ public class ReconciliationServiceTests
         Assert.Contains(api.Requests, IsDeregistration);
     }
 
-    // The host saw the process exit, so the runner is gone and its record ends. GitHub shows
-    // a dead runner as offline and not busy soon enough; while it still says busy (or cannot
-    // say), the registration is left alone.
+    // The host says the process exited, but GitHub says the runner is on a job: one of the
+    // two is wrong, and acting on the host's word would requeue the job, clean up the
+    // resource and deregister the runner mid-job. Nothing is ended until the provider agrees.
     [Fact]
-    public async Task RunnerReportedExited_ProviderBusy_IsStoppedButNotDeregistered()
+    public async Task RunnerReportedExited_ProviderBusy_IsLeftRunningWithNoCleanupRequeueOrDeregistration()
     {
+        var logger = new CapturingLogger<ReconciliationService>();
         var (service, dispatcher, store, cleanup, api) = await ExitedScenarioAsync(
-            api => api.RespondJson(IsRepoLookup, RunnersJson((LiveNativeRunner, true))));
+            api => api.RespondJson(IsRepoLookup, RunnersJson((LiveNativeRunner, true))),
+            logger);
 
         await service.ProcessReportAsync(Report("M4ini", ExitedLiveNativeRunner()), store, cleanup, Now);
 
         var record = await store.Get<RunnerInstance>(LiveNativeInstanceId);
-        Assert.Equal(RunnerInstanceStatus.Stopped, record!.Status);
-        Assert.Equal(Now, record.HostReportedGoneAt);
-        Assert.Equal(3331, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ProcessId);
+        Assert.Equal(RunnerInstanceStatus.Running, record!.Status);
+        Assert.Null(record.StoppedAt);
+        Assert.Null(record.HostReportedGoneAt);
+        Assert.Equal("provisioned", (await store.Get<WebhookEvent>(LiveNativeEventId))!.Status);
+        Assert.DoesNotContain(dispatcher.Commands, c => c.Kind == HostCommandKind.CleanupOrphan);
         Assert.DoesNotContain(api.Requests, IsDeregistration);
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("exited", StringComparison.Ordinal)
+            && e.Message.Contains("busy", StringComparison.Ordinal));
+    }
+
+    // The probe saw the runner idle, then GitHub assigned it a job before the deregistration
+    // DELETE. The listing RemoveRunnerAsync takes right before deleting shows it busy, so the
+    // registration (and the job on it) survives; the record still ends, as the probe allowed.
+    [Fact]
+    public async Task RunnerReportedExited_ProviderIdleThenBusyAtDeregistration_IsNotDeleted()
+    {
+        var (service, _, store, cleanup, api) = await ExitedScenarioAsync(api => api
+            .RespondJson(r => IsRepoLookup(r) && r.RequestUri!.Query.StartsWith("?name=", StringComparison.Ordinal),
+                RunnersJson((LiveNativeRunner, false)))
+            .RespondJson(r => IsRepoLookup(r) && r.RequestUri!.Query == "?per_page=100",
+                RunnersJson((LiveNativeRunner, true)))
+            .Respond(IsRunnerDelete, _ => new HttpResponseMessage(HttpStatusCode.NoContent)));
+
+        await service.ProcessReportAsync(Report("M4ini", ExitedLiveNativeRunner()), store, cleanup, Now);
+
+        Assert.Equal(RunnerInstanceStatus.Stopped, (await store.Get<RunnerInstance>(LiveNativeInstanceId))!.Status);
+        Assert.Contains(api.Requests, r => r.PathAndQuery == "/repos/Clancey/FashionPactPos/actions/runners?per_page=100");
+        Assert.DoesNotContain(api.Requests, r => r.Method == HttpMethod.Delete);
     }
 
     [Fact]
     public async Task RunnerReportedExited_ProviderUnknown_IsStoppedButNotDeregistered()
     {
-        var (service, _, store, cleanup, api) = await ExitedScenarioAsync(
+        var (service, dispatcher, store, cleanup, api) = await ExitedScenarioAsync(
             api => api.RespondJson(IsRepoLookup, """{"message":"boom"}""", HttpStatusCode.InternalServerError));
 
         await service.ProcessReportAsync(Report("M4ini", ExitedLiveNativeRunner()), store, cleanup, Now);
 
         Assert.Equal(RunnerInstanceStatus.Stopped, (await store.Get<RunnerInstance>(LiveNativeInstanceId))!.Status);
+        Assert.Equal("pending", (await store.Get<WebhookEvent>(LiveNativeEventId))!.Status);
+        Assert.Equal(3331, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ProcessId);
         Assert.DoesNotContain(api.Requests, IsDeregistration);
     }
 
@@ -786,13 +839,15 @@ public class ReconciliationServiceTests
     {
         public int Calls { get; private set; }
 
+        public ProviderRunnerActivity Activity { get; set; } = activity;
+
         public override Task<ProviderRunnerActivity?> GetOrphanRunnerActivityAsync(
             IDocumentStore store,
             DiscoveredRunnerInfo runner,
             CancellationToken ct = default)
         {
             Calls++;
-            return Task.FromResult<ProviderRunnerActivity?>(activity);
+            return Task.FromResult<ProviderRunnerActivity?>(Activity);
         }
     }
 
