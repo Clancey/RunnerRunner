@@ -1372,7 +1372,7 @@ public class DynamicProvisioningService : BackgroundService
         return view.RemainingSlots <= 0;
     }
 
-    private static async Task<bool> HasEarlierQueuedWorkAheadAsync(
+    private async Task<bool> HasEarlierQueuedWorkAheadAsync(
         IDocumentStore store,
         WebhookEvent currentEvent,
         ProvisioningRule? currentRule,
@@ -1384,6 +1384,7 @@ public class DynamicProvisioningService : BackgroundService
             .ToDictionary(p => p.Id, p => p, StringComparer.OrdinalIgnoreCase);
         ProvisioningRuleRunnerResolver.AddMaterializedRunnerProfiles(profiles, rules.Values);
         var events = (await store.Query<WebhookEvent>().ToList()).ToList();
+        var hosts = (await store.Query<Host>().ToList()).ToList();
 
         return CapacityPlanningService.HasEarlierQueuedWorkAhead(
             currentEvent,
@@ -1391,7 +1392,9 @@ public class DynamicProvisioningService : BackgroundService
             currentProfile,
             events,
             rules,
-            profiles);
+            profiles,
+            hosts,
+            _hostCommands.CanDispatchToHost);
     }
 
     private static async Task<HostSelectionResult> SelectHostAsync(

@@ -300,12 +300,7 @@ public sealed class CapacityPlanningService
     {
         var backendName = profile.ExecutionBackend.ToString().ToLowerInvariant();
         var matchingHosts = hosts
-            .Where(host =>
-                HostCanProvideRunnerPlatform(host, profile)
-                && MatchesRuleHostRequirements(host, rule)
-                && MatchesProfileHostRequirements(host, profile)
-                && MatchesRequestedRunnerLabels(host, profile, requestedRunnerLabels)
-                && GetBackendLimit(host, profile.ExecutionBackend) > 0)
+            .Where(host => MatchesPlacementRequirements(host, profile, rule, requestedRunnerLabels))
             .ToList();
 
         if (matchingHosts.Count == 0)
@@ -404,14 +399,18 @@ public sealed class CapacityPlanningService
         RunnerProfile currentProfile,
         IReadOnlyCollection<WebhookEvent> allEvents,
         IReadOnlyDictionary<string, ProvisioningRule> rulesById,
-        IReadOnlyDictionary<string, RunnerProfile> profilesById)
+        IReadOnlyDictionary<string, RunnerProfile> profilesById,
+        IReadOnlyCollection<Host> hosts,
+        Func<string, bool>? isHostConnected = null)
         => GetEarlierQueuedWorkAhead(
             currentEvent,
             currentRule,
             currentProfile,
             allEvents,
             rulesById,
-            profilesById).Count > 0;
+            profilesById,
+            hosts,
+            isHostConnected).Count > 0;
 
     private static List<string> DescribeEarlierQueuedWorkAhead(
         WebhookEvent currentEvent,
@@ -419,7 +418,8 @@ public sealed class CapacityPlanningService
         RunnerProfile currentProfile,
         IReadOnlyCollection<WebhookEvent> allEvents,
         IReadOnlyDictionary<string, ProvisioningRule> rulesById,
-        IReadOnlyDictionary<string, RunnerProfile> profilesById)
+        IReadOnlyDictionary<string, RunnerProfile> profilesById,
+        IReadOnlyCollection<Host> hosts)
     {
         var blockers = GetEarlierQueuedWorkAhead(
             currentEvent,
@@ -427,7 +427,8 @@ public sealed class CapacityPlanningService
             currentProfile,
             allEvents,
             rulesById,
-            profilesById);
+            profilesById,
+            hosts);
 
         var details = blockers
             .Take(5)
@@ -440,15 +441,35 @@ public sealed class CapacityPlanningService
         return details;
     }
 
+    /// <summary>
+    /// Returns the earlier queued jobs that compete with <paramref name="currentEvent"/> for the same
+    /// placeable capacity: same lane (platform + backend + compatible routing) and at least one online
+    /// host that both jobs could be dispatched to. A job that no online host can take (for example one
+    /// requesting a runner label no host advertises) waits on its own and never holds back later jobs.
+    /// Full, low-disk or draining hosts still count, so FIFO holds while jobs wait for the same slots.
+    /// <paramref name="isHostConnected"/> lets the dispatcher also exclude hosts whose persisted status is
+    /// still online but that have no live HostWorker connection (e.g. after a server restart).
+    /// </summary>
     private static List<QueuedWorkBlocker> GetEarlierQueuedWorkAhead(
         WebhookEvent currentEvent,
         ProvisioningRule? currentRule,
         RunnerProfile currentProfile,
         IReadOnlyCollection<WebhookEvent> allEvents,
         IReadOnlyDictionary<string, ProvisioningRule> rulesById,
-        IReadOnlyDictionary<string, RunnerProfile> profilesById)
+        IReadOnlyDictionary<string, RunnerProfile> profilesById,
+        IReadOnlyCollection<Host> hosts,
+        Func<string, bool>? isHostConnected = null)
     {
         var blockers = new List<QueuedWorkBlocker>();
+        var dispatchableHosts = hosts
+            .Where(host =>
+                host.AgentStatus == AgentStatus.Online
+                && (isHostConnected == null || isHostConnected(host.Id)))
+            .ToList();
+        var currentHostIds = GetPlaceableHostIds(currentProfile, currentRule, currentEvent.Labels, dispatchableHosts);
+        if (currentHostIds.Count == 0)
+            return blockers;
+
         var queuedEvents = allEvents
             .Where(e =>
                 e.Action == "queued"
@@ -479,12 +500,38 @@ public sealed class CapacityPlanningService
             if (earlierProfile == null)
                 continue;
 
-            if (SharesCapacityLane(currentRule, currentProfile, earlierRule, earlierProfile))
-                blockers.Add(new QueuedWorkBlocker(earlierEvent, earlierProfile));
+            if (!SharesCapacityLane(currentRule, currentProfile, earlierRule, earlierProfile))
+                continue;
+
+            if (!GetPlaceableHostIds(earlierProfile, earlierRule, earlierEvent.Labels, dispatchableHosts).Overlaps(currentHostIds))
+                continue;
+
+            blockers.Add(new QueuedWorkBlocker(earlierEvent, earlierProfile));
         }
 
         return blockers;
     }
+
+    private static HashSet<string> GetPlaceableHostIds(
+        RunnerProfile profile,
+        ProvisioningRule? rule,
+        IReadOnlyCollection<string>? requestedRunnerLabels,
+        IReadOnlyCollection<Host> hosts)
+        => hosts
+            .Where(host => MatchesPlacementRequirements(host, profile, rule, requestedRunnerLabels))
+            .Select(host => host.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    private static bool MatchesPlacementRequirements(
+        Host host,
+        RunnerProfile profile,
+        ProvisioningRule? rule,
+        IReadOnlyCollection<string>? requestedRunnerLabels)
+        => HostCanProvideRunnerPlatform(host, profile)
+            && MatchesRuleHostRequirements(host, rule)
+            && MatchesProfileHostRequirements(host, profile)
+            && MatchesRequestedRunnerLabels(host, profile, requestedRunnerLabels)
+            && GetBackendLimit(host, profile.ExecutionBackend) > 0;
 
     private static bool SharesCapacityLane(
         ProvisioningRule? currentRule,
@@ -632,14 +679,17 @@ public sealed class CapacityPlanningService
             var (fifoRule, fifoProfile, _) = ResolveProvisioningMatch(evt, evt.MatchedProfileId, rulesById.Values, profilesById);
             var details = fifoProfile == null
                 ? []
-                : DescribeEarlierQueuedWorkAhead(evt, fifoRule, fifoProfile, allEvents, rulesById, profilesById);
+                : DescribeEarlierQueuedWorkAhead(evt, fifoRule, fifoProfile, allEvents, rulesById, profilesById, hosts);
 
-            return new EventCapacityView
+            if (fifoProfile == null || details.Count > 0)
             {
-                BlockedBy = CapacityBlockerKind.Fifo,
-                Summary = BuildFifoSummary(details.Count),
-                Details = details
-            };
+                return new EventCapacityView
+                {
+                    BlockedBy = CapacityBlockerKind.Fifo,
+                    Summary = BuildFifoSummary(details.Count),
+                    Details = details
+                };
+            }
         }
 
         if (evt.Status == "pending_config")
@@ -661,7 +711,7 @@ public sealed class CapacityPlanningService
             };
         }
 
-        var fifoDetails = DescribeEarlierQueuedWorkAhead(evt, rule, profile, allEvents, rulesById, profilesById);
+        var fifoDetails = DescribeEarlierQueuedWorkAhead(evt, rule, profile, allEvents, rulesById, profilesById, hosts);
         if (fifoDetails.Count > 0)
         {
             return new EventCapacityView
