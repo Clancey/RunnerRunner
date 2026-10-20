@@ -1268,7 +1268,6 @@ else
         editRule.AllowedOrgs = editRule.Type == ProvisioningType.Webhook ? [.. editAllowedOrgs] : [];
         editRule.AllowedRepos = editRule.Type == ProvisioningType.Webhook ? [.. editAllowedRepos] : [];
         editRule.RequiredHostLabels = new Dictionary<string, string>(editHostLabels);
-        editRule.TargetHostId = null;
         EnsureRunnersForType();
 
         NormalizeRunnerDefinitions();
@@ -1301,9 +1300,18 @@ else
         editRule.UpdatedAt = DateTime.UtcNow;
 
         if (isEditing)
+        {
+            // The form has no host-pin control, so keep the persisted pin (HostGrain may
+            // have rewritten it on host replacement while the form was open).
+            var persisted = await Store.Get<ProvisioningRule>(editRule.Id);
+            if (persisted is not null)
+                editRule.TargetHostId = persisted.TargetHostId;
             await Store.Update(editRule);
+        }
         else
+        {
             await Store.Insert(editRule);
+        }
 
         await RuleGrainSync.ConfigureRuleAsync(editRule);
         await LoadDataAsync();
