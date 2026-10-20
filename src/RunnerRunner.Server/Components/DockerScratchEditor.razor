@@ -1,0 +1,61 @@
+@using RunnerRunner.Core.Models
+
+<fieldset class="mt-3" aria-describedby="@($"{id}-help")">
+    <legend class="h6">Docker tmpfs scratch</legend>
+    <div class="form-check">
+        <input id="@id" class="form-check-input" type="checkbox" checked="@(Value != null)" @onchange="Toggle" />
+        <label class="form-check-label" for="@id">Use capped RAM scratch (opt-in)</label>
+    </div>
+    <div id="@($"{id}-help")" class="form-text">
+        Linux one-job GitHub JIT runners (webhook rules) only; other dispatches start without scratch. Mounts empty, writable, executable tmpfs (host RAM) at the runner
+        work directory and <code>/tmp</code>, with no host binds or Docker socket. Contents are lost when the container stops.
+        For <code>myoung34/github-runner</code>, use <code>/actions-runner/_work</code>.
+    </div>
+    @if (Value is { } scratch)
+    {
+        <div class="row g-3 mt-1">
+            <div class="col-lg-6">
+                <label class="form-label" for="@($"{id}-work")">Work directory (absolute Linux path)</label>
+                <input id="@($"{id}-work")" class="form-control" @bind="scratch.WorkDirectory" />
+            </div>
+            <div class="col-lg-3">
+                <label class="form-label" for="@($"{id}-work-size")">Work cap (MiB)</label>
+                <input id="@($"{id}-work-size")" class="form-control" type="number" min="1" max="@DockerScratchConfig.MaxSizeMb"
+                       value="@scratch.WorkSizeMb" @onchange="args => scratch.WorkSizeMb = ParseSize(args)" />
+            </div>
+            <div class="col-lg-3">
+                <label class="form-label" for="@($"{id}-tmp-size")">/tmp cap (MiB)</label>
+                <input id="@($"{id}-tmp-size")" class="form-control" type="number" min="1" max="@DockerScratchConfig.MaxSizeMb"
+                       value="@scratch.TempSizeMb" @onchange="args => scratch.TempSizeMb = ParseSize(args)" />
+            </div>
+        </div>
+        <p class="form-text">
+            Budget concurrency × (work cap + /tmp cap), plus runner/process memory and other workloads.
+            Defaults total 5 GiB per runner, or 35 GiB for seven. These are filesystem caps, not total-container memory limits.
+            No memory admission policy is added. NuGet, npm and toolcache paths are not redirected;
+            check <code>AGENT_TOOLSDIRECTORY</code> and image environment settings if tools are unexpectedly installed under scratch.
+        </p>
+        @if (scratch.GetValidationError(Platform, Ephemeral, Provider, JitDispatch) is { } error)
+        {
+            <div class="alert alert-danger py-2" role="alert">@error</div>
+        }
+    }
+</fieldset>
+
+@code {
+    private readonly string id = $"docker-scratch-{Guid.NewGuid():N}";
+    [Parameter] public DockerScratchConfig? Value { get; set; }
+    [Parameter] public EventCallback<DockerScratchConfig?> ValueChanged { get; set; }
+    [Parameter] public HostPlatform Platform { get; set; }
+    [Parameter] public bool Ephemeral { get; set; }
+    [Parameter] public RunnerProvider Provider { get; set; }
+    [Parameter] public bool JitDispatch { get; set; } = true;
+
+    private Task Toggle(ChangeEventArgs args) =>
+        ValueChanged.InvokeAsync(args.Value is true ? new DockerScratchConfig() : null);
+
+    // Unlike int @bind (which restores the last valid value), blank/overflow input
+    // becomes explicitly invalid so the parent cannot silently save the old cap.
+    private static int ParseSize(ChangeEventArgs args) =>
+        int.TryParse(args.Value?.ToString(), out var size) ? size : 0;
+}

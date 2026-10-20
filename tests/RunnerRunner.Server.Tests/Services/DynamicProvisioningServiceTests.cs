@@ -408,7 +408,8 @@ public class DynamicProvisioningServiceTests
             RegistryUrl = "ghcr.io",
             ImageName = "acme/runner",
             Tag = "default",
-            CredentialId = "cred1"
+            CredentialId = "cred1",
+            Scratch = new() { WorkDirectory = "/runner/_work", WorkSizeMb = 2048, TempSizeMb = 128 }
         };
         var profile = new RunnerProfile
         {
@@ -425,6 +426,12 @@ public class DynamicProvisioningServiceTests
         Assert.Equal("ghcr.io", d.RegistryUrl);
         Assert.Equal("acme/runner", d.ImageName);
         Assert.Equal("cred1", d.CredentialId);
+        Assert.NotSame(docker.Scratch, d.Scratch);
+        Assert.Equal("/runner/_work", d.Scratch!.WorkDirectory);
+        Assert.Equal(2048, d.Scratch.WorkSizeMb);
+        Assert.Equal(128, d.Scratch.TempSizeMb);
+        d.Scratch.WorkSizeMb = 1;
+        Assert.Equal(2048, docker.Scratch.WorkSizeMb);
         Assert.Null(t);
         // Shared profile config must not be mutated.
         Assert.Equal("default", docker.Tag);
