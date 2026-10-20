@@ -432,6 +432,69 @@ public sealed class FakeFleetEndToEndTests
     }
 
     [Fact]
+    public async Task StaticRuleGrain_FallsBackFromDisconnectedPreferredHostToConnectedHost()
+    {
+        // ProvisioningRuleGrain (static, scale-set, warm-webhook and JIT rules) must skip a persisted-Online
+        // host with no live HostWorker connection, not pick it on every reconcile and fail the dispatch.
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-rule-pref");
+        var pool = $"{id}-pool";
+        var disconnectedHostId = $"{id}-a";
+        var connectedHostId = $"{id}-b";
+        var profileId = $"{id}-profile";
+        await CreatePooledHostsAsync(pool, disconnectedHostId, connectedHostId);
+        await CreateProfileAsync(profileId, "static-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux", "fleet-static-linux"]);
+        var rule = await CreateStaticRuleGrainAsync($"{id}-rule", profileId, pool);
+        _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: false);
+
+        try
+        {
+            await rule.Reconcile();
+
+            Assert.DoesNotContain(_fixture.HostCommands.Commands, command => command.HostId == disconnectedHostId && command.Kind == HostCommandKind.DeployRunner);
+            var instanceId = Assert.Single((await rule.GetState()).ManagedInstanceIds);
+            var instance = await _grainFactory.GetGrain<IRunnerInstanceGrain>(instanceId).GetState();
+            Assert.True(
+                instance.HostId == connectedHostId,
+                $"Rule should provision on the connected host '{connectedHostId}', but chose '{instance.HostId}' ({instance.Status})");
+            Assert.NotEqual(RunnerInstanceStatus.Failed, instance.Status);
+            FindDeployCommand(connectedHostId, instanceId);
+        }
+        finally
+        {
+            await rule.Disable();
+            _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: true);
+        }
+    }
+
+    [Fact]
+    public async Task StaticRuleGrain_WhenOnlyMatchingHostIsDisconnected_DoesNotDispatch()
+    {
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("fleet-rule-disc");
+        var pool = $"{id}-pool";
+        var disconnectedHostId = $"{id}-a";
+        var profileId = $"{id}-profile";
+        await CreatePooledHostsAsync(pool, disconnectedHostId);
+        await CreateProfileAsync(profileId, "static-docker", RunnerProvider.GitHubActions, HostPlatform.Linux, ExecutionBackend.Docker, ["self-hosted", "linux", "fleet-static-linux"]);
+        var rule = await CreateStaticRuleGrainAsync($"{id}-rule", profileId, pool);
+        _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: false);
+
+        try
+        {
+            await rule.Reconcile();
+
+            Assert.DoesNotContain(_fixture.HostCommands.Commands, command => command.HostId == disconnectedHostId && command.Kind == HostCommandKind.DeployRunner);
+            Assert.Empty((await rule.GetState()).ManagedInstanceIds);
+        }
+        finally
+        {
+            await rule.Disable();
+            _fixture.HostCommands.SetHostConnected(disconnectedHostId, connected: true);
+        }
+    }
+
+    [Fact]
     public async Task GitHubDockerWebhookFleet_LaterJobStaysBehindEarlierJobWaitingForSameSaturatedHost()
     {
         // FIFO guard for #5: relaxing the lane check for unplaceable jobs must not let a later job
@@ -575,6 +638,35 @@ public sealed class FakeFleetEndToEndTests
         await _grainFactory.GetGrain<IProfileGrain>(profileId).SetProfile(profile);
         await _store.Insert(profile);
         return profile;
+    }
+
+    private async Task CreatePooledHostsAsync(string pool, params string[] hostIds)
+    {
+        foreach (var hostId in hostIds)
+        {
+            await CreateHostAsync(hostId, HostPlatform.Linux, ExecutionBackend.Docker);
+            var document = (await _store.Get<Host>(hostId))!;
+            document.Labels["pool"] = pool;
+            await _store.Update(document);
+        }
+    }
+
+    private async Task<IProvisioningRuleGrain> CreateStaticRuleGrainAsync(string ruleId, string profileId, string pool)
+    {
+        var rule = _grainFactory.GetGrain<IProvisioningRuleGrain>(ruleId);
+        await rule.SetConfig(new ProvisioningRuleConfig
+        {
+            Name = "static docker",
+            ProfileId = profileId,
+            Type = ProvisioningType.Static,
+            Enabled = true,
+            DesiredCount = 1,
+            RequiredHostLabels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["pool"] = pool
+            }
+        });
+        return rule;
     }
 
     private async Task CreateWebhookRuleAsync(
