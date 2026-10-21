@@ -8,7 +8,7 @@
     </div>
     <div id="@($"{id}-help")" class="form-text">
         Linux one-job GitHub JIT runners (webhook rules) only; other dispatches start without scratch. Mounts empty, writable, executable tmpfs (host RAM) at the runner
-        work directory and <code>/tmp</code>, with no host binds or Docker socket. Contents are lost when the container stops.
+        work directory and <code>/tmp</code>, without adding host binds or a Docker socket. Contents are lost when the container stops.
         For <code>myoung34/github-runner</code>, use <code>/actions-runner/_work</code>.
     </div>
     @if (Value is { } scratch)

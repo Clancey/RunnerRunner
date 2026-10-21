@@ -21,24 +21,35 @@ public class DockerBackend : IRunnerBackend
     private readonly TimeSpan _availabilityCacheWindow = TimeSpan.FromSeconds(30);
     private DateTime _lastAvailabilityCheckUtc = DateTime.MinValue;
     private bool _cachedAvailability;
+    private readonly DockerHostOptions _hostOptions;
+    private readonly Action<Uri, IReadOnlyList<string>> _verifyBindSources;
 
     public ExecutionBackend BackendType => ExecutionBackend.Docker;
     public DockerClient GetClient() => _client;
 
-    public DockerBackend(ILogger<DockerBackend> logger)
+    public DockerBackend(ILogger<DockerBackend> logger) : this(logger, new DockerHostOptions())
+    {
+    }
+
+    public DockerBackend(ILogger<DockerBackend> logger, DockerHostOptions hostOptions)
     {
         _logger = logger;
         _hasDockerHint = HasDockerInstallHint();
         _endpoint = ResolveDockerEndpoint();
         _client = new DockerClientConfiguration(_endpoint).CreateClient();
+        _hostOptions = hostOptions;
+        _verifyBindSources = LinuxDockerBindVerifier.Verify;
     }
 
-    internal DockerBackend(ILogger<DockerBackend> logger, DockerClient client)
+    internal DockerBackend(ILogger<DockerBackend> logger, DockerClient client,
+        DockerHostOptions? hostOptions = null, Action<Uri, IReadOnlyList<string>>? verifyBindSources = null)
     {
         _logger = logger;
         _client = client;
         _endpoint = client.Configuration.EndpointBaseUri;
         _hasDockerHint = true;
+        _hostOptions = hostOptions ?? new DockerHostOptions();
+        _verifyBindSources = verifyBindSources ?? LinuxDockerBindVerifier.Verify;
     }
 
     public async Task<bool> IsAvailableAsync(CancellationToken ct = default)
@@ -68,6 +79,28 @@ public class DockerBackend : IRunnerBackend
     {
         var config = request.DockerConfig
             ?? throw new InvalidOperationException("DockerConfig is required for Docker backend");
+        var binds = _hostOptions.Resolve(request);
+        var sources = binds.Select(bind => bind.Grant.Source).ToList();
+        if (binds.Count > 0)
+        {
+            if (_endpoint.Scheme == "unix" && sources.Any(source => DockerBindMount.Overlaps(source, _endpoint.LocalPath)))
+                throw new InvalidOperationException("Docker bind sources cannot expose the daemon socket.");
+            _verifyBindSources(_endpoint, sources);
+            var version = await _client.System.GetVersionAsync(ct);
+            if (!System.Version.TryParse(version.APIVersion, out var apiVersion) || apiVersion < new System.Version(1, 40))
+                throw new InvalidOperationException("Verified Docker bind mounts require Docker API 1.40 or newer.");
+        }
+
+        string? networkId = null;
+        if (!string.IsNullOrWhiteSpace(_hostOptions.JobNetwork))
+        {
+            var network = await _client.Networks.InspectNetworkAsync(_hostOptions.JobNetwork, ct);
+            if (network.Driver != "bridge" || network.Scope != "local" || string.IsNullOrEmpty(network.ID)
+                || network.Name is "host" or "none" or "bridge"
+                || (network.Options != null && network.Options.TryGetValue("com.docker.network.bridge.name", out var bridgeName) && bridgeName == "docker0"))
+                throw new InvalidOperationException("Host job network must be an admin-managed custom local Docker bridge.");
+            networkId = network.ID;
+        }
 
         var scratch = config.Scratch;
         if (scratch != null)
@@ -108,14 +141,14 @@ public class DockerBackend : IRunnerBackend
         }
 
         ImageInspectResponse? scratchImage = null;
-        if (scratch != null)
+        if (scratch != null || binds.Count > 0)
         {
             // The container OS (not the worker's OS) decides whether Linux tmpfs applies.
             // Never infer the runner path from WorkingDir. The JIT wrapper discovers
             // run.sh and checks its real working directory before launching the runner.
             scratchImage = await _client.Images.InspectImageAsync(imageName, ct);
             if (!string.Equals(scratchImage.Os, "linux", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("Docker scratch requires a Linux container image.");
+                throw new InvalidOperationException("Docker scratch and verified bind mounts require a Linux container image.");
         }
 
         // Build environment variables
@@ -202,6 +235,15 @@ public class DockerBackend : IRunnerBackend
                 // reconciliation and logs can distinguish "exited" from "never existed".
                 AutoRemove = false,
                 Binds = null,
+                Mounts = binds.Count == 0 ? null : binds.Select(bind => new Mount
+                {
+                    Type = "bind",
+                    Source = bind.Grant.Source,
+                    Target = bind.Mount.ContainerPath,
+                    ReadOnly = bind.Mount.ReadOnly,
+                    BindOptions = new BindOptions { NonRecursive = true, Propagation = "rprivate" }
+                }).ToList(),
+                NetworkMode = networkId,
                 Tmpfs = scratch == null ? null : new Dictionary<string, string>
                 {
                     [scratch.WorkDirectory] = $"rw,exec,nosuid,nodev,size={scratch.WorkSizeMb}m,mode=1777",
@@ -236,6 +278,8 @@ public class DockerBackend : IRunnerBackend
                 imageName, isWindowsContainer ? "Windows" : "Linux", request.InitSteps.Count);
         }
 
+        if (binds.Count > 0)
+            _verifyBindSources(_endpoint, sources);
         var createResponse = await _client.Containers.CreateContainerAsync(createParams, ct);
 
         // Copy the job-started hook script into the container filesystem.
@@ -261,7 +305,27 @@ public class DockerBackend : IRunnerBackend
             }
         }
 
-        await _client.Containers.StartContainerAsync(createResponse.ID, null, ct);
+        try
+        {
+            if (binds.Count > 0)
+                _verifyBindSources(_endpoint, sources);
+            if (!await _client.Containers.StartContainerAsync(createResponse.ID, null, ct))
+                throw new InvalidOperationException("Docker did not start the runner container.");
+        }
+        catch
+        {
+            try
+            {
+                using var cleanupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                await _client.Containers.RemoveContainerAsync(createResponse.ID,
+                    new ContainerRemoveParameters { Force = true, RemoveVolumes = true }, cleanupTimeout.Token);
+            }
+            catch (Exception cleanupError)
+            {
+                _logger.LogError(cleanupError, "Failed to remove rejected runner container {ContainerId}", createResponse.ID);
+            }
+            throw;
+        }
 
         _logger.LogInformation("Container {ContainerId} started for runner {RunnerName}",
             createResponse.ID[..12], request.RunnerName);

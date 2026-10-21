@@ -466,6 +466,8 @@ public class ProvisioningRuleGrain : Grain, IProvisioningRuleGrain, IRemindable
 
         var command = new DeployRunnerCommand
         {
+            ProvisioningRuleId = this.GetPrimaryKeyString(),
+            RunnerDefinitionId = runnerDefinition?.Id,
             InstanceId = instanceId,
             ProfileId = profile.Id,
             RunnerName = runnerName,

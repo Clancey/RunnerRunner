@@ -976,6 +976,10 @@ public sealed class CapacityPlanningService
         if (profile.ExecutionBackend != ExecutionBackend.Docker)
             return true;
 
+        if (profile.DockerConfig?.BindMounts.Count > 0
+            && !GetEffectiveHostCapabilities(host).Contains(DockerBindMount.RequiredHostCapability, StringComparer.OrdinalIgnoreCase))
+            return false;
+
         if (!TryGetHostLabelValue(host, "docker_os", out var dockerOs) || string.IsNullOrWhiteSpace(dockerOs))
             return true;
 

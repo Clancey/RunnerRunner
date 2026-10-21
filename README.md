@@ -564,6 +564,120 @@ In a rule's **runner target → Docker image** (or the legacy **Profiles → Doc
 Verify a live runner with `docker inspect <container> --format '{{json .HostConfig.Tmpfs}}'` and
 `stat -f -c %T /actions-runner/_work` inside it (expect `tmpfs`).
 
+### Scoped Docker host storage (native Linux brokers)
+
+Rule-owned Docker targets can reference **Scoped host storage** grants to read shared inputs and
+write their own persistent outputs/cache. A target stores only `GrantId`, `ContainerPath`, and
+`ReadOnly`; the host administrator owns the source paths, identity allowlist, and job network.
+Workflows cannot supply these settings through labels or environment variables. The editor
+shows the rule and runner-definition IDs needed for the host configuration.
+
+On a **native Linux HostWorker**, configure `appsettings.Production.json` (or equivalent trusted
+host configuration), using real IDs and already-existing daemon-host directories:
+
+```json
+{
+  "HostWorker": {
+    "HostId": "tower-docker",
+    "AllowedBackends": ["Docker"],
+    "Docker": {
+      "JobNetwork": "ci-isolated",
+      "ProtectedSources": ["/mnt/user/appdata/control-plane"],
+      "BindGrants": [
+        {
+          "Id": "project-assets",
+          "ProvisioningRuleId": "<rule-id>",
+          "RunnerDefinitionId": "<runner-definition-id>",
+          "Source": "/mnt/user/shared-assets/catalog",
+          "ReadOnly": true
+        },
+        {
+          "Id": "project-output",
+          "ProvisioningRuleId": "<rule-id>",
+          "RunnerDefinitionId": "<runner-definition-id>",
+          "Source": "/mnt/user/appdata/my-project/ci",
+          "ReadOnly": false
+        }
+      ]
+    }
+  }
+}
+```
+
+The matching target's `DockerConfig.BindMounts` is:
+
+```json
+[
+  {"GrantId": "project-assets", "ContainerPath": "/ci/assets", "ReadOnly": true},
+  {"GrantId": "project-output", "ContainerPath": "/ci/output", "ReadOnly": false}
+]
+```
+
+The grant's `ReadOnly` is an access ceiling: a read-only grant cannot be requested writable.
+Each grant authorizes exactly one rule/definition pair, and the dispatch's profile ID must
+also equal that definition ID. Legacy standalone profile assignments have no rule identity
+and cannot use grants. Separate read-only grant IDs can authorize the same exact shared
+source for different targets; otherwise source trees must be disjoint, including across rules.
+Destinations cannot overlap each other, scratch, system paths, or the hook/control-plane path.
+Root paths, broad `appdata`/`games` parents, socket paths, shallow host parents, and protected
+host trees are rejected. Add all other sensitive control-plane trees to `ProtectedSources`;
+the worker's state and executable directories are protected automatically.
+
+**Host verification and trust boundary:** use the matching self-contained `linux-x64` or
+`linux-arm64` release bundle, including its runtime files and the OS's .NET native dependencies.
+No installed .NET SDK or Docker CLI is required for bind verification/create/start.
+Pin `DOCKER_HOST` to the actual local Unix socket. The verifier authenticates its peer using
+Linux `SO_PEERCRED`, requires a root-owned `dockerd` process, and checks that worker and daemon
+have the same `/proc/.../ns/mnt` identity and host `/` root. The broker needs permission to
+read the daemon's `/proc` metadata. Containerized brokers, remote/proxied daemons, rootless
+daemons, different/chrooted mount views, Windows, and Docker APIs below 1.40 fail closed.
+Do not use a service sandbox that changes its filesystem view independently of dockerd.
+This is a trusted host-admin process: Docker socket access itself is host-admin authority.
+
+Every requested source and ancestor must be an existing real directory, not a symlink.
+Daemon mount topology must parse successfully and contain no submount underneath a source;
+put a required storage mount at the grant root or above it. The containing filesystem mount
+must have mountinfo root `/`: subdirectory bind aliases and non-root subvolume mounts
+(including Btrfs subvolume roots such as `/@`) are conservatively unsupported, rather than
+trusting a lexical alias that might expose another project's tree. Verification repeats before
+container creation and immediately before start. Docker receives typed `bind` mounts with
+`NonRecursive=true`, `rprivate` propagation, and host-directory creation disabled. Missing
+sources fail instead of being created. Rejected starts remove their newly created container.
+The administrator must keep grant configuration, source **parents**, and mount topology
+stable and inaccessible to jobs (including ACLs and SMB identities); only each project's
+leaf contents should be job-writable. Docker accepts path strings, so verification and mount
+are not atomic. This explicitly relies on trusted administrators and stable ancestry, not
+defense against malicious root, concurrent administrative remounts, or uncoordinated share
+writers that can replace source ancestry. It does not change filesystem permissions.
+
+**Network isolation is separate and required:** provision the custom local bridge named by
+`JobNetwork` before enabling grants. Containers use its inspected network ID, not a job-supplied
+network. The bridge setting alone is **not a firewall**. The administrator must deny untrusted
+Docker/VM traffic to Tower SMB (TCP 445/139 and UDP 137/138), all IPv4/IPv6 host addresses and
+aliases, and equivalent broad storage/control-plane endpoints or proxies. Cover both host
+INPUT and routed/FORWARD paths using the actual Docker firewall backend (not just a
+`DOCKER-USER` rule when traffic terminates on the host); apply VM restrictions outside the
+guest too. Scope these rules to untrusted runner networks so trusted broker/server traffic
+remains allowed. Handle existing SMB sessions, and verify denial from representative guests.
+Do not give jobs host networking, extra network attachments, `NET_ADMIN`, privileged mode,
+the Docker socket, or broad share credentials. RunnerRunner adds none of these.
+
+`AllowedBackends` is optional: unset preserves existing advertisement/dispatch; `["Docker"]`
+advertises Docker only and rejects Native/Tart deploys before lifecycle work, while stop/log/
+reconciliation operations remain available for existing runners. It does not affect other
+hosts' native Mac jobs. A configured `JobNetwork` applies to all this broker's Docker jobs;
+bind-enabled jobs require it. With no binds and no host network setting, container creation
+retains its previous storage/network defaults. Bind targets require the worker's
+`docker-verified-binds` capability, so older workers that would ignore new config are excluded
+from placement. Advertised support is not a substitute for per-start source verification.
+
+For a broker cutover, preserve the actual host state directory and HostId, stop and disable
+the old container broker before starting the native service, and never run both with the
+same HostId. Preserve rollback and reconcile existing handles in a no-active-job window.
+Before rollout, verify shared-input write denial, own-output persistence, cross-project
+grant denial, guest SMB denial, and continuing broker/server connectivity. These settings do
+not deploy the service, create directories/networks, change ACLs, or install firewall rules.
+
 ## Environment Variable Composition
 
 Env vars are composed in layers (later layers win on key conflicts):

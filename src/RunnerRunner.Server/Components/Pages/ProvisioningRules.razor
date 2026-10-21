@@ -705,6 +705,8 @@
                                                     <DockerScratchEditor @bind-Value="docker.Scratch" Platform="runner.RequiredHostPlatform"
                                                                          Ephemeral="runner.Ephemeral" Provider="editRule.Provider"
                                                                          JitDispatch="editRule.Type == ProvisioningType.Webhook" />
+                                                    <DockerBindMountEditor @bind-Value="docker.BindMounts" />
+                                                    <div class="form-text">Host grant identity: rule <code>@editRule.Id</code>, runner definition <code>@runner.Id</code>.</div>
                                                 </div>
                                             }
                                             else if (runner.ExecutionBackend == ExecutionBackend.Tart)
@@ -1357,6 +1359,16 @@ else
                 if (docker.Scratch?.GetValidationError(runner.RequiredHostPlatform, runner.Ephemeral, editRule.Provider, editRule.Type == ProvisioningType.Webhook) is { } error)
                 {
                     formError = $"Runner '{runner.Name}': {error}";
+                    return false;
+                }
+                if (docker.BindMounts.Count > 0 && runner.RequiredHostPlatform != HostPlatform.Linux)
+                {
+                    formError = $"Runner '{runner.Name}': verified Docker bind mounts require Linux.";
+                    return false;
+                }
+                if (DockerBindMount.GetValidationError(docker.BindMounts, docker.Scratch) is { } bindError)
+                {
+                    formError = $"Runner '{runner.Name}': {bindError}";
                     return false;
                 }
             }

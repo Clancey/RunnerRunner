@@ -23,7 +23,8 @@ public class DockerScratchPropagationTests
                 {
                     RegistryUrl = "docker.io",
                     ImageName = "myoung34/github-runner",
-                    Scratch = new() { WorkDirectory = "/runner/_work", WorkSizeMb = 8192, TempSizeMb = 512 }
+                    Scratch = new() { WorkDirectory = "/runner/_work", WorkSizeMb = 8192, TempSizeMb = 512 },
+                    BindMounts = [new() { GrantId = "project-output", ContainerPath = "/ci/output", ReadOnly = false }]
                 }
             }
         ]
@@ -48,6 +49,9 @@ public class DockerScratchPropagationTests
             Assert.Equal(JsonSerializer.Serialize(original), JsonSerializer.Serialize(docker));
         }
         copied.RunnerDefinitions[0].DockerConfig!.Scratch!.WorkSizeMb = 1;
+        copied.RunnerDefinitions[0].DockerConfig!.BindMounts[0].ContainerPath = "/changed";
+        Assert.Equal("/ci/output", original.BindMounts[0].ContainerPath);
+        Assert.Equal("/ci/output", config.RunnerDefinitions[0].DockerConfig!.BindMounts[0].ContainerPath);
         Assert.Equal(8192, original.Scratch!.WorkSizeMb);
         Assert.Equal(8192, config.RunnerDefinitions[0].DockerConfig!.Scratch!.WorkSizeMb);
         config.RunnerDefinitions[0].DockerConfig!.Scratch!.TempSizeMb = 1;

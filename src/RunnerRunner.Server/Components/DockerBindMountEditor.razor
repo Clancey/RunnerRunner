@@ -1,0 +1,24 @@
+@using RunnerRunner.Core.Models
+
+<div class="mt-3">
+    <h6>Scoped host storage</h6>
+    <p class="form-text">Linux native brokers only. Grant IDs must be authorized for this rule and runner definition by the host administrator. Shared inputs should be read-only; project outputs can be writable. Host sources and the isolated job network are configured on the broker, never by jobs.</p>
+    @foreach (var mount in Value)
+    {
+        <div class="row g-2 mb-2" @key="mount">
+            <div class="col"><input class="form-control" aria-label="Host grant ID" placeholder="Grant ID" @bind="mount.GrantId" /></div>
+            <div class="col"><input class="form-control" aria-label="Container storage path" placeholder="/ci/output" @bind="mount.ContainerPath" /></div>
+            <div class="col-auto"><label><input type="checkbox" @bind="mount.ReadOnly" /> Read-only</label></div>
+            <div class="col-auto"><button type="button" class="btn btn-outline-danger" @onclick="() => Remove(mount)">Remove</button></div>
+        </div>
+    }
+    <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="Add">Add host grant</button>
+</div>
+
+@code {
+    [Parameter] public List<DockerBindMount> Value { get; set; } = [];
+    [Parameter] public EventCallback<List<DockerBindMount>> ValueChanged { get; set; }
+
+    private Task Add() => ValueChanged.InvokeAsync([.. Value, new DockerBindMount()]);
+    private Task Remove(DockerBindMount mount) => ValueChanged.InvokeAsync(Value.Where(item => item != mount).ToList());
+}

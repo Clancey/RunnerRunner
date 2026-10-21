@@ -33,6 +33,9 @@ public interface IRunnerBackend
 
 public class RunnerStartRequest
 {
+    public string? ProvisioningRuleId { get; set; }
+    public string? RunnerDefinitionId { get; set; }
+    public string ProfileId { get; set; } = "";
     public string InstanceId { get; set; } = "";
     public required string RunnerName { get; set; }
     public RunnerProvider Provider { get; set; }

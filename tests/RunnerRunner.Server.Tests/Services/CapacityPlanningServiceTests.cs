@@ -7,6 +7,28 @@ namespace RunnerRunner.Server.Tests.Services;
 public class CapacityPlanningServiceTests
 {
     [Fact]
+    public void BindTargets_RequireUpdatedHostCapability()
+    {
+        var host = new Host { Name = "linux", Platform = HostPlatform.Linux, MaxDockerContainers = 2, Capabilities = ["docker"] };
+        var runner = new RunnerDefinition
+        {
+            Name = "with-output", RequiredHostPlatform = HostPlatform.Linux, ExecutionBackend = ExecutionBackend.Docker,
+            DockerConfig = new()
+            {
+                RegistryUrl = "docker.io", ImageName = "runner",
+                BindMounts = [new() { GrantId = "output", ContainerPath = "/ci/output", ReadOnly = false }]
+            }
+        };
+        var rule = new ProvisioningRule { Name = "binds", Type = ProvisioningType.Webhook, RunnerDefinitions = [runner] };
+        var profiles = new Dictionary<string, RunnerProfile> { [runner.Id] = runner.ToProfile(rule) };
+        var oldHost = CapacityPlanningService.EvaluateRuleCapacity(rule, [host], profiles, [], []);
+        Assert.Equal(0, Assert.Single(oldHost.MappedRunners).EffectivePoolLimit);
+        host.Capabilities.Add(DockerBindMount.RequiredHostCapability);
+        var updatedHost = CapacityPlanningService.EvaluateRuleCapacity(rule, [host], profiles, [], []);
+        Assert.Equal(2, Assert.Single(updatedHost.MappedRunners).EffectivePoolLimit);
+    }
+
+    [Fact]
     public void EvaluateRuleCapacity_UsesHostBackendPoolWithoutProfilePerHostLimit()
     {
         var hostA = new Host { Name = "linux-a", Platform = HostPlatform.Linux, MaxDockerContainers = 2, Capabilities = ["docker"] };

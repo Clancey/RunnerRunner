@@ -14,6 +14,23 @@ namespace RunnerRunner.Agent.Tests.Backends;
 
 public class DockerScratchTests
 {
+    [Fact]
+    public async Task StartRunnerAsync_UnconfiguredBindGrant_MustNotSilentlyStartWithoutOutputs()
+    {
+        var request = JsonSerializer.Deserialize<RunnerStartRequest>("""
+            {"InstanceId":"bind-repro","RunnerName":"bind-repro","DockerConfig":{
+              "RegistryUrl":"docker.io","ImageName":"runner","PullPolicy":2,
+              "BindMounts":[{"GrantId":"project-output","ContainerPath":"/ci/output","ReadOnly":false}]
+            }}
+            """)!;
+        await using var docker = new DockerHttpStub();
+        using var client = new DockerClientConfiguration(docker.Endpoint).CreateClient();
+        var backend = new DockerBackend(NullLogger<DockerBackend>.Instance, client);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => backend.StartRunnerAsync(request));
+        Assert.Empty(docker.CreateBodies);
+    }
+
     // Deliberately deserialize the new JSON rather than constructing Scratch:
     // this exercises StartRunnerAsync even against the pre-feature model.
     private const string ScratchRequestJson = """
@@ -228,7 +245,7 @@ public class DockerScratchTests
     }
 
     /// <summary>A real per-test HTTP endpoint for Docker.DotNet, never a process-wide DOCKER_HOST.</summary>
-    private sealed class DockerHttpStub : IAsyncDisposable
+    internal sealed class DockerHttpStub : IAsyncDisposable
     {
         private readonly TcpListener listener = new(IPAddress.Loopback, 0);
         private readonly CancellationTokenSource stopped = new(TimeSpan.FromSeconds(30));
@@ -236,6 +253,10 @@ public class DockerScratchTests
         public List<JsonElement> CreateBodies { get; } = [];
         public List<string> Requests { get; } = [];
         public string ImageOs { get; set; } = "linux";
+        public string ApiVersion { get; set; } = "1.47";
+        public string NetworkJson { get; set; } = """{"Id":"ci-network-id","Name":"ci-jobs","Driver":"bridge","Scope":"local"}""";
+        public bool MissingSource { get; set; }
+        public bool FailStart { get; set; }
         public Uri Endpoint { get; }
 
         public DockerHttpStub()
@@ -275,11 +296,34 @@ public class DockerScratchTests
                         CreateBodies.Add(JsonDocument.Parse(new string(body)).RootElement.Clone());
                         status = "201 Created";
                         response = """{"Id":"0123456789abcdef","Warnings":[]}""";
+                        if (MissingSource)
+                        {
+                            status = "400 Bad Request";
+                            response = """{"message":"invalid mount config for type bind: bind source path does not exist"}""";
+                        }
                     }
                     else if (requestLine.Contains("/start", StringComparison.Ordinal))
                     {
                         status = "204 No Content";
                         response = "";
+                        if (FailStart)
+                        {
+                            status = "500 Internal Server Error";
+                            response = """{"message":"bind source disappeared before start"}""";
+                        }
+                    }
+                    else if (requestLine.StartsWith("DELETE ", StringComparison.Ordinal))
+                    {
+                        status = "204 No Content";
+                        response = "";
+                    }
+                    else if (requestLine.Contains("/networks/", StringComparison.Ordinal))
+                    {
+                        response = NetworkJson;
+                    }
+                    else if (requestLine.Contains("/version", StringComparison.Ordinal))
+                    {
+                        response = JsonSerializer.Serialize(new { ApiVersion });
                     }
                     else if (!requestLine.Contains("/images/", StringComparison.Ordinal))
                     {

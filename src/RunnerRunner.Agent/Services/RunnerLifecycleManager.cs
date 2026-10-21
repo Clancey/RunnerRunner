@@ -37,6 +37,9 @@ public class RunnerLifecycleManager
 
         var request = new RunnerStartRequest
         {
+            ProvisioningRuleId = command.ProvisioningRuleId,
+            RunnerDefinitionId = command.RunnerDefinitionId,
+            ProfileId = command.ProfileId,
             InstanceId = command.InstanceId,
             RunnerName = command.RunnerName,
             Provider = command.Provider,

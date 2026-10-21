@@ -863,6 +863,8 @@ public class DynamicProvisioningService : BackgroundService
 
             var command = new DeployRunnerCommand
             {
+                ProvisioningRuleId = rule?.Id,
+                RunnerDefinitionId = matchedRunnerDefinition?.Id,
                 InstanceId = instanceId,
                 ProfileId = profile.Id,
                 RunnerName = runnerName,

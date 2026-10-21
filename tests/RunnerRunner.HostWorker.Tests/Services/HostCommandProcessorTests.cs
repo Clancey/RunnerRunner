@@ -13,6 +13,57 @@ namespace RunnerRunner.HostWorker.Tests.Services;
 
 public class HostCommandProcessorTests
 {
+    [Theory]
+    [InlineData(ExecutionBackend.Native)]
+    [InlineData(ExecutionBackend.Tart)]
+    public async Task DockerOnlyPolicy_RejectsOtherBackendsBeforeLifecycle(ExecutionBackend backend)
+    {
+        using var directory = HostWorkerTestDirectory.Create("docker-only-dispatch");
+        var native = new FakeRunnerBackend { BackendType = ExecutionBackend.Native };
+        var tart = new FakeRunnerBackend { BackendType = ExecutionBackend.Tart };
+        using var processor = CreateProcessor(directory, out var sink, out var lifecycle,
+            nativeBackend: native, tartBackend: tart, allowedBackend: "Docker");
+        await processor.ProcessCommandAsync(CreateCommand("denied", new HostCommandEnvelope
+        {
+            Kind = HostCommandKind.DeployRunner,
+            DeployRunner = new() { RunnerName = "denied", InstanceId = "denied", Backend = backend }
+        }), CancellationToken.None);
+        Assert.Empty(native.StartRequests);
+        Assert.Empty(tart.StartRequests);
+        Assert.Empty(lifecycle.RunningInstances);
+        Assert.Contains(HostWorkerMessageKinds.RunnerStopped, NonLogKinds(sink));
+        Assert.Contains(HostWorkerMessageKinds.CommandRejected, NonLogKinds(sink));
+        Assert.DoesNotContain(HostWorkerMessageKinds.CommandCompleted, NonLogKinds(sink));
+    }
+
+    [Fact]
+    public async Task DockerOnlyPolicy_PreservesGrantIdentityAndConfigThroughProtocolAndLifecycle()
+    {
+        using var directory = HostWorkerTestDirectory.Create("docker-grant-propagation");
+        var docker = new FakeRunnerBackend { BackendType = ExecutionBackend.Docker };
+        using var processor = CreateProcessor(directory, out var sink, out _, dockerBackend: docker, allowedBackend: "Docker");
+        await processor.ProcessCommandAsync(CreateCommand("granted", new HostCommandEnvelope
+        {
+            Kind = HostCommandKind.DeployRunner,
+            DeployRunner = new()
+            {
+                InstanceId = "granted", RunnerName = "granted", Backend = ExecutionBackend.Docker,
+                ProvisioningRuleId = "rule", ProfileId = "target", RunnerDefinitionId = "target",
+                DockerConfig = new()
+                {
+                    RegistryUrl = "docker.io", ImageName = "runner",
+                    BindMounts = [new() { GrantId = "output", ContainerPath = "/ci/output", ReadOnly = false }]
+                }
+            }
+        }), CancellationToken.None);
+        var request = Assert.Single(docker.StartRequests);
+        Assert.Equal("rule", request.ProvisioningRuleId);
+        Assert.Equal("target", request.RunnerDefinitionId);
+        Assert.Equal("target", request.ProfileId);
+        Assert.False(Assert.Single(request.DockerConfig!.BindMounts).ReadOnly);
+        Assert.Contains(HostWorkerMessageKinds.CommandCompleted, NonLogKinds(sink));
+    }
+
     [Fact]
     public async Task DeployRunner_StartSuccess_PublishesHealthStartedAndCompleted()
     {
@@ -362,7 +413,8 @@ public class HostCommandProcessorTests
         IRunnerBackend? dockerBackend = null,
         IRunnerBackend? tartBackend = null,
         IRunnerBackend? nativeBackend = null,
-        string? runnerBasePath = null)
+        string? runnerBasePath = null,
+        string? allowedBackend = null)
     {
         var configValues = new Dictionary<string, string?>
         {
@@ -371,6 +423,8 @@ public class HostCommandProcessorTests
         };
         if (!string.IsNullOrWhiteSpace(runnerBasePath))
             configValues["Runner:BasePath"] = runnerBasePath;
+        if (allowedBackend != null)
+            configValues["HostWorker:AllowedBackends:0"] = allowedBackend;
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(configValues)

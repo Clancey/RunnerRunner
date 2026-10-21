@@ -112,6 +112,10 @@ public class DeployRunnerCommand
     /// </summary>
     [Id(21)]
     public int? BackendCapacityLimit { get; set; }
+    [Id(22)]
+    public string? ProvisioningRuleId { get; set; }
+    [Id(23)]
+    public string? RunnerDefinitionId { get; set; }
 }
 
 [GenerateSerializer]

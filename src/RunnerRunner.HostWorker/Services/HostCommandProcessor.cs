@@ -86,7 +86,11 @@ internal sealed class HostCommandProcessor : BackgroundService
         _selfUpdater = selfUpdater;
         _resourceUsageCollector = resourceUsageCollector;
         _logger = logger;
-        _dockerBackend = dockerBackend ?? new DockerBackend(loggerFactory.CreateLogger<DockerBackend>());
+        var dockerOptions = configuration.GetSection("HostWorker:Docker").Get<DockerHostOptions>() ?? new DockerHostOptions();
+        dockerOptions.ProtectedSources.Add(paths.DataRoot);
+        dockerOptions.ProtectedSources.Add(AppContext.BaseDirectory.TrimEnd('/'));
+        _ = HostBackendPolicy.Read(configuration);
+        _dockerBackend = dockerBackend ?? new DockerBackend(loggerFactory.CreateLogger<DockerBackend>(), dockerOptions);
         _tartBackend = tartBackend ?? new TartBackend(loggerFactory.CreateLogger<TartBackend>());
         _nativeBackend = nativeBackend ?? new NativeBackend(loggerFactory.CreateLogger<NativeBackend>());
     }
@@ -199,6 +203,15 @@ internal sealed class HostCommandProcessor : BackgroundService
 
     private async Task HandleDeployRunnerAsync(DeployRunnerCommand command, CancellationToken ct)
     {
+        if (!HostBackendPolicy.Allows(_configuration, command.Backend))
+        {
+            var error = $"Backend {command.Backend} is not allowed by this HostWorker.";
+            await PublishAsync(HostWorkerMessageKinds.RunnerStopped, new RunnerStoppedEvent
+            {
+                InstanceId = command.InstanceId, Reason = "failed", ErrorMessage = error
+            }, ct);
+            throw new InvalidOperationException(error);
+        }
         _logger.LogInformation("Deploying runner {RunnerName} on HostWorker {HostId} with backend {Backend}",
             command.RunnerName, _identity.HostId, command.Backend);
 

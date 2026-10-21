@@ -11,8 +11,27 @@ namespace RunnerRunner.HostWorker.Tests.Services;
 
 public class HostWorkerConnectionServiceTests
 {
-    [Fact]
-    public void CreateHello_IncludesIdentityEnrollmentRuntimeAndLabels()
+    [Theory]
+    [InlineData(null, true, null, false)]
+    [InlineData("host", true, null, false)]
+    [InlineData("bridge", true, null, false)]
+    [InlineData("ci-isolated", true, "tcp://remote:2375", false)]
+    [InlineData("ci-isolated", false, "unix:///var/run/docker.sock", false)]
+    [InlineData("ci-isolated", true, "unix:///var/run/docker.sock", true)]
+    public void BindCapability_RequiresNativeLocalBrokerAndJobNetwork(string? network, bool nativeLinux, string? endpoint, bool expected)
+    {
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["HostWorker:Docker:JobNetwork"] = network,
+            ["HostWorker:Docker:BindGrants:0:Id"] = "assets"
+        }).Build();
+        Assert.Equal(expected, HostWorkerConnectionService.CanAdvertiseVerifiedBinds(configuration, nativeLinux, endpoint));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CreateHello_IncludesIdentityEnrollmentRuntimeAndLabels(bool dockerOnly)
     {
         using var directory = HostWorkerTestDirectory.Create("connection-hello");
         var configuration = new ConfigurationBuilder()
@@ -20,6 +39,8 @@ public class HostWorkerConnectionServiceTests
             {
                 ["HostWorker:DataRoot"] = directory.Path,
                 ["HostWorker:EnrollmentToken"] = "enroll-token",
+                ["HostWorker:AllowedBackends:0"] = dockerOnly ? "Docker" : "Native",
+                ["HostWorker:AllowedBackends:1"] = "Docker",
                 ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
             })
             .Build();
@@ -79,8 +100,8 @@ public class HostWorkerConnectionServiceTests
         // (HostGrain.ApplyProjection), so every detected capability — not just docker —
         // must appear here too, or static-provisioning's backend-availability check can
         // never match "native"/"tart" even though every host detects "native".
-        Assert.Equal("true", hello.Labels["native"]);
-        Assert.Contains("native", hello.Agent.Capabilities);
+        Assert.Equal(!dockerOnly, hello.Labels.ContainsKey("native"));
+        Assert.Equal(!dockerOnly, hello.Agent.Capabilities.Contains("native"));
         Assert.Contains("docker", hello.Agent.Capabilities);
         Assert.NotNull(hello.Agent.Runtime);
     }

@@ -1,6 +1,7 @@
 using Grpc.Core;
 using Grpc.Net.Client;
 using RunnerRunner.Agent.Services;
+using RunnerRunner.Agent.Backends;
 using RunnerRunner.Core.HostWorkers;
 using RunnerRunner.Core.Hub;
 using RunnerRunner.Core.Models;
@@ -233,7 +234,22 @@ internal sealed class HostWorkerConnectionService : BackgroundService, IHostWork
     }
 
     private IReadOnlyCollection<string> DetectCapabilities()
-        => DetectCapabilities(_identity, _configuration["DOCKER_HOST"], File.Exists, ToolExists);
+    {
+        var capabilities = HostBackendPolicy.Filter(_configuration,
+            DetectCapabilities(_identity, _configuration["DOCKER_HOST"], File.Exists, ToolExists)).ToList();
+        if (capabilities.Contains("docker") && CanAdvertiseVerifiedBinds(_configuration,
+            OperatingSystem.IsLinux() && !HostWorkerRuntimeDetector.IsContainer(),
+            Environment.GetEnvironmentVariable("DOCKER_HOST")))
+            capabilities.Add(DockerBindMount.RequiredHostCapability);
+        return capabilities;
+    }
+
+    internal static bool CanAdvertiseVerifiedBinds(IConfiguration configuration, bool nativeLinux, string? endpoint) =>
+        nativeLinux
+        && Uri.TryCreate(endpoint ?? "unix:///var/run/docker.sock", UriKind.Absolute, out var dockerEndpoint)
+        && dockerEndpoint.Scheme == "unix"
+        && DockerHostOptions.IsCustomJobNetwork(configuration["HostWorker:Docker:JobNetwork"])
+        && configuration.GetSection("HostWorker:Docker:BindGrants").GetChildren().Any();
 
     private Dictionary<string, string> CreateLabels(IReadOnlyCollection<string> capabilities)
     {

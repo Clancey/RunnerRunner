@@ -19,6 +19,8 @@ public class DockerImageConfig
     public string? CredentialId { get; set; }
     [Id(6)]
     public DockerScratchConfig? Scratch { get; set; }
+    [Id(7)]
+    public List<DockerBindMount> BindMounts { get; set; } = [];
 
     public DockerImageConfig Clone() => new()
     {
@@ -28,6 +30,7 @@ public class DockerImageConfig
         Tag = Tag,
         PullPolicy = PullPolicy,
         CredentialId = CredentialId,
-        Scratch = Scratch?.Clone()
+        Scratch = Scratch?.Clone(),
+        BindMounts = BindMounts.Select(mount => mount.Clone()).ToList()
     };
 }
