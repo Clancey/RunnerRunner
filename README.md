@@ -372,6 +372,8 @@ Capacity is calculated from the narrowest remaining limit:
 
 For a runner target in a rule, the effective host capacity is the sum of matching hosts' backend limits for the selected backend. If a webhook rule allows 10 concurrent jobs, and the matching host route has 3 hosts with 4 Docker slots each, the rule cap of 10 is narrower than the host route's 12 slots. A backend limit of `0` disables that backend on that host. HostWorker-advertised capabilities seed default backend limits for new hosts and remain available for optional target-specific routing filters.
 
+To prefer one host without pinning jobs, open **Hosts -> Configure -> Scheduling priority** and give it a higher value (for example, preferred host `10`, fallback host `0`). New static, scale-set, and webhook placements use the highest-priority ready, eligible host before comparing load. All existing routing, backend capacity, and configured disk constraints still apply; full, offline, draining, or otherwise ineligible hosts are skipped. Equal priorities retain least-loaded placement, and the default is `0`. Priority persists on the server across worker heartbeats and reconnects; no HostWorker update is needed, and existing runners are not interrupted.
+
 ### 6. Runner image/backend info in the GHA job log
 
 Every runner deployed by RunnerRunner surfaces its backend, image, host, and

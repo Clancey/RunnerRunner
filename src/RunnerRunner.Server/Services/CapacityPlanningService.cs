@@ -100,6 +100,7 @@ public sealed class HostCandidateView
     public required string HostId { get; init; }
     public required string HostLabel { get; init; }
     public required CapacityCounter BackendCapacity { get; init; }
+    public int SchedulingPriority { get; init; }
     public int TotalHostLoad { get; init; }
     public bool CanRunNow { get; init; }
     public CapacityBlockerKind BlockedBy { get; init; }
@@ -363,6 +364,7 @@ public sealed class CapacityPlanningService
                     HostId = host.Id,
                     HostLabel = host.Label,
                     BackendCapacity = backendUsage,
+                    SchedulingPriority = host.SchedulingPriority,
                     TotalHostLoad = hostInstances.Count,
                     CanRunNow = canRunNow,
                     BlockedBy = blockedBy,
@@ -370,6 +372,7 @@ public sealed class CapacityPlanningService
                 };
             })
             .OrderBy(candidate => candidate.CanRunNow ? 0 : 1)
+            .ThenByDescending(candidate => candidate.SchedulingPriority)
             .ThenBy(candidate => candidate.TotalHostLoad)
             .ThenBy(candidate => candidate.HostLabel, StringComparer.OrdinalIgnoreCase)
             .ToList();

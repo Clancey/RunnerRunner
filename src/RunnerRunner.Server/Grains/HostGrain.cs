@@ -226,7 +226,10 @@ public class HostGrain : Grain, IHostGrain
                 };
 
                 if (legacy != null)
+                {
                     CopyUserManagedFields(legacy, existing);
+                    existing.SchedulingPriority = legacy.SchedulingPriority;
+                }
 
                 ApplyProjection(existing);
                 await store.Insert(existing);
@@ -258,6 +261,7 @@ public class HostGrain : Grain, IHostGrain
 
     private void ApplyProjection(Core.Models.Host host)
     {
+        // SchedulingPriority is document-owned admin configuration, not worker state.
         host.Name = _state.State.Name;
         host.Platform = _state.State.Platform;
         host.Architecture = _state.State.Architecture;

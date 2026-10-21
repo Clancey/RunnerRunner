@@ -106,7 +106,7 @@
                         <h5 id="configure-host-title" class="modal-title">
                             <i class="bi bi-sliders me-2"></i>Configure @configureHost.Label
                         </h5>
-                        <div class="modal-kicker">Tune host matching labels, resource limits, and fleet grouping.</div>
+                        <div class="modal-kicker">Tune host matching labels, resource limits, scheduling priority, and fleet grouping.</div>
                     </div>
                     <button type="button" class="btn-close" @onclick="CloseConfigureHost" aria-label="Close"></button>
                 </div>
@@ -188,6 +188,12 @@
                                         <label class="form-label form-label-sm mb-1 mt-2">Max Native processes</label>
                                         <input type="number" class="form-control form-control-sm" @bind="configureHost.MaxNativeProcesses" min="1" />
                                     }
+                                </div>
+                                <div class="mb-3">
+                                    <label for="host-scheduling-priority" class="form-label form-label-sm mb-1">Scheduling priority</label>
+                                    <input id="host-scheduling-priority" type="number" class="form-control form-control-sm"
+                                           @bind="configureHost.SchedulingPriority" aria-describedby="host-scheduling-priority-help" />
+                                    <div id="host-scheduling-priority-help" class="form-text">Higher values are preferred before load among ready, eligible hosts. Equal values (default 0) use least-loaded placement. Full or unavailable hosts are skipped.</div>
                                 </div>
                                 <div>
                                     <label class="form-label form-label-sm mb-1">Host routing group</label>
@@ -810,7 +816,15 @@
 
     private async Task SaveConfiguration()
     {
-        var host = configureHost ?? throw new InvalidOperationException("No host selected for configuration.");
+        var edited = configureHost ?? throw new InvalidOperationException("No host selected for configuration.");
+        var host = await Store.Get<Host>(edited.Id)
+            ?? throw new InvalidOperationException("The host no longer exists.");
+        host.Labels = new Dictionary<string, string>(edited.Labels);
+        host.MaxDockerContainers = edited.MaxDockerContainers;
+        host.MaxTartVMs = edited.MaxTartVMs;
+        host.MaxNativeProcesses = edited.MaxNativeProcesses;
+        host.GroupId = edited.GroupId;
+        host.SchedulingPriority = edited.SchedulingPriority;
         host.UpdatedAt = DateTime.UtcNow;
         await Store.Update(host);
         configureHost = null;
@@ -855,6 +869,7 @@
         MaxDockerContainers = host.MaxDockerContainers,
         MaxTartVMs = host.MaxTartVMs,
         MaxNativeProcesses = host.MaxNativeProcesses,
+        SchedulingPriority = host.SchedulingPriority,
         ObservedRunningTartVMs = host.ObservedRunningTartVMs,
         ObservedFreeDiskBytes = host.ObservedFreeDiskBytes,
         ObservedTotalDiskBytes = host.ObservedTotalDiskBytes,

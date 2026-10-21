@@ -273,8 +273,17 @@ The host route can run up to `3 * 4 = 12` Docker runners, but the rule's `MaxCon
 When at least one host can run the runner target, host candidates are ordered by:
 
 1. can run now before blocked candidates;
-2. lowest total active host load;
-3. host label/name for deterministic tie-breaking.
+2. highest host `SchedulingPriority` (configured under **Hosts -> Configure**);
+3. lowest total active host load;
+4. host label/name for deterministic tie-breaking.
+
+Priority defaults to `0`, so unconfigured or equally prioritized hosts retain
+least-loaded placement. It is a preference for new placements, not a host pin or
+a capacity override: a preferred host that is full, offline, draining, disk-blocked,
+or ineligible is skipped. Static, scale-set, and webhook placement share this
+ordering; existing runners are not moved. Priority is server-managed host document
+configuration, like the display name: grain heartbeat projections and worker
+reconnects preserve it without adding it to worker-reported or grain-owned state.
 
 If every matching host is out of backend slots, the blocker is `Host`.
 

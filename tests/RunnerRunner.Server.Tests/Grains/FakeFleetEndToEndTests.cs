@@ -32,6 +32,94 @@ public sealed class FakeFleetEndToEndTests
         _store = fixture.DocumentStore;
     }
 
+    [Theory]
+    [InlineData(ProvisioningType.Static)]
+    [InlineData(ProvisioningType.ScaleSet)]
+    [InlineData(ProvisioningType.Webhook)]
+    public async Task MacFleet_PrefersHigherPriorityHostBeforeLoadAndFallsBackWhenFull(ProvisioningType type)
+    {
+        await ClearFleetDocumentsAsync();
+        var id = OrleansTestIds.Create("priority-fleet");
+        var preferredId = $"{id}-m2";
+        var fallbackId = $"{id}-m1";
+        var profileId = $"{id}-profile";
+        var ruleId = $"{id}-rule";
+        var preferred = await CreateHostAsync(preferredId, HostPlatform.MacOS, ExecutionBackend.Native);
+        await CreateHostAsync(fallbackId, HostPlatform.MacOS, ExecutionBackend.Native);
+        await preferred.SetResourceLimits(maxDocker: 0, maxTart: 0, maxNative: 2);
+        foreach (var hostId in new[] { preferredId, fallbackId })
+        {
+            var document = (await _store.Get<Host>(hostId))!;
+            document.GroupId = id;
+            document.SchedulingPriority = hostId == preferredId ? 10 : 0;
+            document.MaxNativeProcesses = hostId == preferredId ? 2 : 1;
+            await _store.Update(document);
+        }
+        var labels = new[] { "self-hosted", "macos", id };
+        await CreateProfileAsync(profileId, id, RunnerProvider.GitHubActions,
+            HostPlatform.MacOS, ExecutionBackend.Native, labels);
+        var existing = new RunnerInstance
+        {
+            RunnerName = $"{id}-existing",
+            HostId = preferredId,
+            ProfileId = profileId,
+            ManagedByRunnerRunner = true,
+            Status = RunnerInstanceStatus.Running
+        };
+        await _store.Insert(existing);
+        var rule = _grainFactory.GetGrain<IProvisioningRuleGrain>(ruleId);
+        if (type == ProvisioningType.Webhook)
+        {
+            await CreateWebhookRuleAsync(ruleId, id, RunnerProvider.GitHubActions,
+                id, "octo/fleet", profileId, labels, preferredId);
+            var document = (await _store.Get<ProvisioningRule>(ruleId))!;
+            document.RequiredHostLabels.Clear();
+            document.TargetGroupId = id;
+            document.MaxConcurrent = 10;
+            await _store.Update(document);
+            var service = CreateDynamicProvisioningService();
+            for (var i = 0; i < 2; i++)
+            {
+                var queued = await ProcessWebhookAsync("github", "queued", NextJobId(), "octo/fleet", labels, id);
+                await service.ProcessQueuedWebhookEventOnceAsync(queued.EventId!, profileId);
+                var evt = (await _store.Get<WebhookEvent>(queued.EventId!))!;
+                var instance = (await _store.Get<RunnerInstance>(evt.InstanceId!))!;
+                Assert.Equal(i == 0 ? preferredId : fallbackId, instance.HostId);
+                FindDeployCommand(instance.HostId, instance.Id);
+            }
+        }
+        else
+        {
+            await rule.SetConfig(new ProvisioningRuleConfig
+            {
+                Name = id,
+                Type = type,
+                Enabled = true,
+                ProfileId = profileId,
+                TargetGroupId = id,
+                DesiredCount = 1,
+                MinReady = 1,
+                MaxInstances = 2
+            });
+            await rule.Reconcile();
+            var firstId = Assert.Single(await rule.GetManagedInstanceIds());
+            Assert.Equal(preferredId, (await _store.Get<RunnerInstance>(firstId))!.HostId);
+            FindDeployCommand(preferredId, firstId);
+
+            var config = (await rule.GetState()).Config;
+            config.DesiredCount = 2;
+            config.MinReady = 2;
+            await rule.SetConfig(config);
+            await rule.Reconcile();
+            var secondId = (await rule.GetManagedInstanceIds()).Single(instanceId => instanceId != firstId);
+            Assert.Equal(fallbackId, (await _store.Get<RunnerInstance>(secondId))!.HostId);
+            FindDeployCommand(fallbackId, secondId);
+            await rule.Disable();
+        }
+
+        Assert.Equal(RunnerInstanceStatus.Running, (await _store.Get<RunnerInstance>(existing.Id))!.Status);
+    }
+
     [Fact]
     public async Task GitHubDockerWebhookFleet_DispatchesProgressesCompletesAndFreesCapacity()
     {

@@ -85,6 +85,12 @@ public class Host
     public int MaxNativeProcesses { get; set; } = 5;
 
     /// <summary>
+    /// Admin-managed placement preference. Higher values are preferred before load
+    /// among ready, eligible hosts; equal values retain least-loaded placement.
+    /// </summary>
+    public int SchedulingPriority { get; set; }
+
+    /// <summary>
     /// Total running Tart VMs observed on the host, including VMs not started by RunnerRunner.
     /// Used to reserve Tart capacity consumed by native jobs or other local workloads.
     /// </summary>
