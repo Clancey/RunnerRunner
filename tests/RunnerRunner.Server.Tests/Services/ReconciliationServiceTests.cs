@@ -799,8 +799,11 @@ public class ReconciliationServiceTests
     {
         var (service, dispatcher, store, cleanup) = await CreateReconciliationAsync("Tower");
         await InsertStaticDockerRunnerAsync(store, RunnerInstanceStatus.Starting, deployedAt: Now.AddMinutes(-10));
+        var report = Report("Tower", DockerRunner("created"));
 
-        await service.ProcessReportAsync(Report("Tower", DockerRunner("created")), store, cleanup, Now);
+        // Listed "created" since just after its deploy.
+        await service.ProcessReportAsync(report, store, cleanup, Now.AddMinutes(-10).AddSeconds(30));
+        await service.ProcessReportAsync(report, store, cleanup, Now);
 
         var record = await store.Get<RunnerInstance>(DockerInstanceId);
         Assert.Equal(RunnerInstanceStatus.Stopped, record!.Status);
@@ -815,15 +818,73 @@ public class ReconciliationServiceTests
     public async Task FailedStaticDockerRecordWhoseContainerIsStillCreated_IsReportedGone()
     {
         var (service, _, store, cleanup) = await CreateReconciliationAsync("Tower");
-        var lastHealth = Now.AddMinutes(-6);
-        await InsertStaticDockerRunnerAsync(
-            store, RunnerInstanceStatus.Failed, deployedAt: Now.AddMinutes(-11), stoppedAt: Now.AddMinutes(-6), lastHealthCheck: lastHealth);
+        var firstReported = Now.AddMinutes(-11).AddSeconds(30);
+        await InsertStaticDockerRunnerAsync(store, RunnerInstanceStatus.Failed, deployedAt: Now.AddMinutes(-11));
+        var report = Report("Tower", DockerRunner("created"));
 
-        await service.ProcessReportAsync(Report("Tower", DockerRunner("created")), store, cleanup, Now);
+        // Listed "created" since just after its deploy.
+        await service.ProcessReportAsync(report, store, cleanup, firstReported);
+        await service.ProcessReportAsync(report, store, cleanup, Now);
 
         var record = await store.Get<RunnerInstance>(DockerInstanceId);
         Assert.Equal(Now, record!.HostReportedGoneAt);
-        Assert.Equal(lastHealth, record.LastHealthCheck);
+        Assert.Equal(firstReported, record.LastHealthCheck);
+    }
+
+    // DeployedAt is stamped when the deploy command is dispatched, before the host queues it,
+    // pulls the image and creates the container. A deploy that spent over 5 minutes on those
+    // had its container judged "created" past the window on the first report that listed
+    // it, seconds after Docker created it: the record was stopped, the container removed and
+    // the runner deregistered as it started (the 07:58:39 kill again). The window runs from
+    // the first report that lists the container "created" when that is later.
+    [Theory]
+    [InlineData(RunnerInstanceStatus.Starting)]
+    [InlineData(RunnerInstanceStatus.Running)]
+    public async Task DockerContainerFirstReportedCreatedLongAfterItsDeploy_IsEndedOnlyAWindowAfterThatReport(RunnerInstanceStatus status)
+    {
+        var (service, dispatcher, store, cleanup, api) = await ExitedScenarioAsync(api => api
+            .RespondJson(IsRepoLookup, RunnersJson((LiveNativeRunner, false)))
+            .Respond(IsRunnerDelete, _ => new HttpResponseMessage(HttpStatusCode.NoContent)));
+        var record = (await store.Get<RunnerInstance>(LiveNativeInstanceId))!;
+        record.ProcessId = null;
+        record.ContainerId = DockerContainerId;
+        record.Status = status;
+        record.DeployedAt = Now.AddMinutes(-10);
+        record.StartedAt = status == RunnerInstanceStatus.Running ? Now.AddMinutes(-1) : null;
+        await store.Update(record);
+        await store.Insert(new Host { Id = "Tower", Name = "Tower", Platform = HostPlatform.Linux, AgentStatus = AgentStatus.Online });
+        var report = Report("M4ini", new DiscoveredRunnerInfo
+        {
+            InstanceId = LiveNativeInstanceId,
+            RunnerName = LiveNativeRunner,
+            ContainerId = DockerContainerId,
+            Backend = ExecutionBackend.Docker,
+            IsRunning = false,
+            Status = "created"
+        });
+
+        await service.ProcessReportAsync(report, store, cleanup, Now);
+        // Another host's report says nothing about M4ini's containers.
+        await service.ProcessReportAsync(Report("Tower"), store, cleanup, Now.AddMinutes(1));
+        await service.ProcessReportAsync(report, store, cleanup, Now.AddMinutes(4));
+
+        record = (await store.Get<RunnerInstance>(LiveNativeInstanceId))!;
+        Assert.Equal(status, record.Status);
+        Assert.Null(record.StoppedAt);
+        Assert.Null(record.HostReportedGoneAt);
+        Assert.Equal(Now.AddMinutes(4), record.LastHealthCheck);
+        Assert.Equal("provisioned", (await store.Get<WebhookEvent>(LiveNativeEventId))!.Status);
+        Assert.DoesNotContain(dispatcher.Commands, c => c.Kind == HostCommandKind.CleanupOrphan);
+        Assert.DoesNotContain(api.Requests, IsDeregistration);
+
+        // Still "created" a whole window after the first report that listed it: it never started.
+        await service.ProcessReportAsync(report, store, cleanup, Now.AddMinutes(5));
+
+        record = (await store.Get<RunnerInstance>(LiveNativeInstanceId))!;
+        Assert.Equal(RunnerInstanceStatus.Stopped, record.Status);
+        Assert.Equal(Now.AddMinutes(5), record.HostReportedGoneAt);
+        Assert.Equal(DockerContainerId, dispatcher.SingleCommand<CleanupOrphanCommand>(HostCommandKind.CleanupOrphan).ContainerId);
+        Assert.Contains(api.Requests, r => r.Method == HttpMethod.Delete);
     }
 
     // Guard: "restarting" and "paused" containers have a process, so they are not ended

@@ -45,6 +45,10 @@ public class ReconciliationService : IHostedService, IDisposable
     // host|backend|resource -> first report that listed it as a running orphan.
     private readonly ConcurrentDictionary<string, DateTime> _runningOrphanFirstSeen = new(StringComparer.Ordinal);
 
+    // host|backend|resource -> first report that listed a Docker container "created". Kept
+    // in memory only: a restart forgets it, which only lengthens a container's window.
+    private readonly ConcurrentDictionary<string, DateTime> _createdFirstSeen = new(StringComparer.Ordinal);
+
     // Instance id -> a Busy provider answer, reused for
     // RunnerTimeoutService.ProviderActivityCacheDuration. A runner left running because the
     // provider reports it busy is missing from every 30s report; this keeps that to one
@@ -124,6 +128,21 @@ public class ReconciliationService : IHostedService, IDisposable
             return;
         }
         var hostId = hosts.First().Id;
+        var hostPrefix = hostId + "|";
+
+        // Only this host's report says which of its containers are still "created".
+        var createdKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var runner in report.Runners.Where(IsDockerCreated))
+        {
+            var key = ResourceKey(hostId, runner);
+            createdKeys.Add(key);
+            _createdFirstSeen.GetOrAdd(key, nowUtc);
+        }
+        foreach (var key in _createdFirstSeen.Keys)
+        {
+            if (key.StartsWith(hostPrefix, StringComparison.Ordinal) && !createdKeys.Contains(key))
+                _createdFirstSeen.TryRemove(key, out _);
+        }
 
         // Load all runner instances for this host
         var dbInstances = (await store.Query<RunnerInstance>().ToList())
@@ -186,7 +205,7 @@ public class ReconciliationService : IHostedService, IDisposable
 
                 await TryDeregisterRunnerAsync(store, registrationCleanup, instance, activity);
             }
-            else if (!IsRunnerStillActive(matchedRunner, instance, nowUtc))
+            else if (!IsRunnerStillActive(matchedRunner, instance, nowUtc, CreatedFirstSeen(hostId, matchedRunner)))
             {
                 // A runner the provider reports busy is on a job somewhere, whatever the host
                 // says about this process (a stale or misread status, say). Ending it would
@@ -247,7 +266,7 @@ public class ReconciliationService : IHostedService, IDisposable
                 continue;
             }
 
-            var key = $"{hostId}|{runner.Backend}|{resource}";
+            var key = ResourceKey(hostId, runner);
             runningOrphanKeys.Add(key);
             var firstSeen = _runningOrphanFirstSeen.GetOrAdd(key, nowUtc);
             if (nowUtc - firstSeen < RunningOrphanGracePeriod)
@@ -361,7 +380,6 @@ public class ReconciliationService : IHostedService, IDisposable
 
         // Forget resources this host no longer reports as running orphans, so a later
         // orphan reusing a name or PID starts its grace period from scratch.
-        var hostPrefix = hostId + "|";
         foreach (var key in _runningOrphanFirstSeen.Keys)
         {
             if (key.StartsWith(hostPrefix, StringComparison.Ordinal) && !runningOrphanKeys.Contains(key))
@@ -383,7 +401,7 @@ public class ReconciliationService : IHostedService, IDisposable
         {
             var matched = report.Runners.FirstOrDefault(r => MatchesRunner(instance, r));
 
-            if (matched != null && IsRunnerStillActive(matched, instance, nowUtc))
+            if (matched != null && IsRunnerStillActive(matched, instance, nowUtc, CreatedFirstSeen(hostId, matched)))
             {
                 instance.LastHealthCheck = nowUtc;
                 await store.Update(instance);
@@ -502,15 +520,36 @@ public class ReconciliationService : IHostedService, IDisposable
         || (runner.Backend == ExecutionBackend.Docker && runner.Status?.Trim() is { } state && DockerStatesNotEnded.Contains(state));
 
     // As above, for the resource that matches a record. A "created" container counts as
-    // starting only for StartingDeployGracePeriod from the record's deploy: the window every
-    // other path gives a deploy (the missing-runner grace, the Starting timeout and the
-    // grain's registration timer), counted from DeployedAt, which precedes the image pull.
-    // Past it the container has ended. Otherwise a static record failed at the Starting
-    // timeout kept matching it and refreshing its health, so neither the record nor the
-    // container was ever removed.
-    internal static bool IsRunnerStillActive(DiscoveredRunnerInfo runner, RunnerInstance instance, DateTime nowUtc) =>
-        IsRunnerStillActive(runner)
-        && !(IsDockerCreated(runner) && nowUtc - (instance.DeployedAt ?? instance.CreatedAt) >= StartingDeployGracePeriod);
+    // starting only for StartingDeployGracePeriod: the window every other path gives a
+    // deploy (the missing-runner grace, the Starting timeout and the grain's registration
+    // timer). Past it the container has ended. Otherwise a static record failed at the
+    // Starting timeout kept matching it and refreshing its health, so neither the record nor
+    // the container was ever removed. The window runs from the record's deploy or, when
+    // later, from the first report that listed the container "created" (createdFirstSeenAt):
+    // DeployedAt is stamped when the deploy command is sent, before the host queues it, pulls
+    // the image and creates the container, so a slow deploy had a container created seconds
+    // earlier judged ended.
+    internal static bool IsRunnerStillActive(
+        DiscoveredRunnerInfo runner,
+        RunnerInstance instance,
+        DateTime nowUtc,
+        DateTime? createdFirstSeenAt)
+    {
+        if (!IsRunnerStillActive(runner))
+            return false;
+        if (!IsDockerCreated(runner))
+            return true;
+
+        var deployedAt = instance.DeployedAt ?? instance.CreatedAt;
+        var windowStart = createdFirstSeenAt is { } firstSeen && firstSeen > deployedAt ? firstSeen : deployedAt;
+        return nowUtc - windowStart < StartingDeployGracePeriod;
+    }
+
+    private DateTime? CreatedFirstSeen(string hostId, DiscoveredRunnerInfo runner) =>
+        _createdFirstSeen.TryGetValue(ResourceKey(hostId, runner), out var firstSeen) ? firstSeen : null;
+
+    private static string ResourceKey(string hostId, DiscoveredRunnerInfo runner) =>
+        $"{hostId}|{runner.Backend}|{DescribeResource(runner)}";
 
     private static bool IsDockerCreated(DiscoveredRunnerInfo runner) =>
         runner.Backend == ExecutionBackend.Docker
