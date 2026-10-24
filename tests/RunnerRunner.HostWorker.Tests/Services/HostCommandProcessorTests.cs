@@ -274,6 +274,153 @@ public class HostCommandProcessorTests
         Assert.Empty(listed.UnavailableBackends);
     }
 
+    // Host.RunnerBasePath (set per host in Hosts.razor) and the HostWorker's own
+    // Runner:BasePath both put native runners outside the default base path, which was the
+    // only one discovery scanned. Every live runner there was missing from the report, so
+    // the server marked it crashed, requeued its job and deregistered it mid-job.
+    [Fact]
+    public async Task ReconciliationReport_ListsLiveNativeRunnersUnderTheConfiguredRunnerBasePath()
+    {
+        using var directory = HostWorkerTestDirectory.Create("reconcile-native-configured-path");
+        var configuredBasePath = Path.Combine(directory.Path, "configured-runners");
+        WriteNativeInstance(configuredBasePath, "rr-live", "inst-live", "Macos-jit-live", Environment.ProcessId);
+        using var processor = CreateProcessor(
+            directory, out _, out _,
+            nativeBackend: CreateNativeBackend(directory),
+            runnerBasePath: configuredBasePath);
+
+        var report = await processor.BuildReconciliationReportAsync(CancellationToken.None);
+
+        var runner = Assert.Single(report.Runners);
+        Assert.Equal("inst-live", runner.InstanceId);
+        Assert.Equal(Environment.ProcessId, runner.ProcessId);
+        Assert.True(runner.IsRunning);
+        Assert.Empty(report.UnavailableBackends);
+    }
+
+    [Fact]
+    public async Task ReconciliationReport_ListsLiveNativeRunnersUnderTheHostBasePathADeployUsed_AfterARestart()
+    {
+        using var directory = HostWorkerTestDirectory.Create("reconcile-native-host-path");
+        var hostBasePath = Path.Combine(directory.Path, "host-runners");
+        // A cached agent without config scripts fails the deploy after it has picked the
+        // base path but before it downloads or deploys anything.
+        var agentDir = Path.Combine(hostBasePath, "agents", "githubactions", "2.999.0");
+        Directory.CreateDirectory(agentDir);
+        await File.WriteAllTextAsync(Path.Combine(agentDir, "placeholder"), "");
+        using (var processor = CreateProcessor(directory, out var sink, out _, nativeBackend: CreateNativeBackend(directory)))
+        {
+            await processor.ProcessCommandAsync(CreateCommand("cmd-deploy-host-path", new HostCommandEnvelope
+            {
+                Kind = HostCommandKind.DeployRunner,
+                DeployRunner = new DeployRunnerCommand
+                {
+                    InstanceId = "inst-live",
+                    ProfileId = "profile-1",
+                    RunnerName = "Macos-jit-live",
+                    Backend = ExecutionBackend.Native,
+                    Provider = RunnerProvider.GitHubActions,
+                    RunnerAgentVersion = "2.999.0",
+                    RunnerBasePath = hostBasePath
+                }
+            }), CancellationToken.None);
+            Assert.Contains("missing config scripts", SinglePayload<RunnerStoppedEvent>(sink, HostWorkerMessageKinds.RunnerStopped).ErrorMessage);
+        }
+        WriteNativeInstance(hostBasePath, "rr-live", "inst-live", "Macos-jit-live", Environment.ProcessId);
+
+        using var restarted = CreateProcessor(directory, out _, out _, nativeBackend: CreateNativeBackend(directory));
+        var report = await restarted.BuildReconciliationReportAsync(CancellationToken.None);
+
+        var runner = Assert.Single(report.Runners);
+        Assert.Equal("inst-live", runner.InstanceId);
+        Assert.True(runner.IsRunning);
+        Assert.Empty(report.UnavailableBackends);
+    }
+
+    // A native instances directory that exists but cannot be listed made discovery return
+    // nothing, which the server reads as every native runner having exited.
+    [Fact]
+    public async Task ReconciliationReport_WhenANativeInstancesDirectoryCannotBeListed_FlagsNative()
+    {
+        using var directory = HostWorkerTestDirectory.Create("reconcile-native-dir-error");
+        var configuredBasePath = Path.Combine(directory.Path, "configured-runners");
+        Directory.CreateDirectory(configuredBasePath);
+        await File.WriteAllTextAsync(Path.Combine(configuredBasePath, "instances"), "not a directory");
+        using var processor = CreateProcessor(
+            directory, out _, out _,
+            nativeBackend: CreateNativeBackend(directory),
+            runnerBasePath: configuredBasePath);
+
+        var report = await processor.BuildReconciliationReportAsync(CancellationToken.None);
+
+        Assert.Empty(report.Runners);
+        Assert.Equal([ExecutionBackend.Native], report.UnavailableBackends);
+    }
+
+    // A live runner whose instance files could not be read was skipped with a warning and
+    // reported nowhere, exactly like a runner that exited.
+    [Fact]
+    public async Task ReconciliationReport_WhenANativeInstanceCannotBeRead_FlagsNative()
+    {
+        using var directory = HostWorkerTestDirectory.Create("reconcile-native-file-error");
+        var defaultBasePath = Path.Combine(directory.Path, "default-runners");
+        WriteNativeInstance(defaultBasePath, "rr-live", "inst-live", "Macos-jit-live", Environment.ProcessId);
+        await File.WriteAllTextAsync(Path.Combine(defaultBasePath, "instances", "rr-live", "rr-instance.json"), "{ truncated");
+        using var processor = CreateProcessor(directory, out _, out _, nativeBackend: CreateNativeBackend(directory));
+
+        var report = await processor.BuildReconciliationReportAsync(CancellationToken.None);
+
+        Assert.Empty(report.Runners);
+        Assert.Equal([ExecutionBackend.Native], report.UnavailableBackends);
+    }
+
+    // A PID file that exists but holds no PID was skipped, so a live runner whose PID file
+    // was truncated or garbled was reported nowhere, exactly like one that exited.
+    [Fact]
+    public async Task ReconciliationReport_WhenANativePidFileIsMalformed_FlagsNative()
+    {
+        using var directory = HostWorkerTestDirectory.Create("reconcile-native-bad-pid");
+        var defaultBasePath = Path.Combine(directory.Path, "default-runners");
+        WriteNativeInstance(defaultBasePath, "rr-live", "inst-live", "Macos-jit-live", Environment.ProcessId);
+        await File.WriteAllTextAsync(Path.Combine(defaultBasePath, "instances", "rr-live", "rr.pid"), "not-a-pid");
+        using var processor = CreateProcessor(directory, out _, out _, nativeBackend: CreateNativeBackend(directory));
+
+        var report = await processor.BuildReconciliationReportAsync(CancellationToken.None);
+
+        Assert.Empty(report.Runners);
+        Assert.Equal([ExecutionBackend.Native], report.UnavailableBackends);
+    }
+
+    // Guard: a host that never ran a native runner (Tower runs Docker only) reports no
+    // native runners and does not flag the backend.
+    [Fact]
+    public async Task ReconciliationReport_OnAHostThatNeverRanNativeRunners_DoesNotFlagNative()
+    {
+        using var directory = HostWorkerTestDirectory.Create("reconcile-native-none");
+        using var processor = CreateProcessor(
+            directory, out _, out _,
+            nativeBackend: CreateNativeBackend(directory),
+            runnerBasePath: Path.Combine(directory.Path, "configured-runners"));
+
+        var report = await processor.BuildReconciliationReportAsync(CancellationToken.None);
+
+        Assert.Empty(report.Runners);
+        Assert.Empty(report.UnavailableBackends);
+    }
+
+    private static NativeBackend CreateNativeBackend(HostWorkerTestDirectory directory) =>
+        new(NullLogger<NativeBackend>.Instance) { DefaultBasePath = Path.Combine(directory.Path, "default-runners") };
+
+    private static void WriteNativeInstance(string basePath, string directoryName, string instanceId, string runnerName, int pid)
+    {
+        var dir = Path.Combine(basePath, "instances", directoryName);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(
+            Path.Combine(dir, "rr-instance.json"),
+            $$"""{"InstanceId":"{{instanceId}}","RunnerName":"{{runnerName}}"}""");
+        File.WriteAllText(Path.Combine(dir, "rr.pid"), pid.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
+
     [Fact]
     public async Task MalformedCommandEnvelope_PublishesRejectedStatus()
     {

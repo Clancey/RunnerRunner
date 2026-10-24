@@ -49,6 +49,7 @@ public class NativeBackend : IRunnerBackend
     public async Task<RunnerInstanceInfo> StartRunnerAsync(RunnerStartRequest request, CancellationToken ct = default)
     {
         var basePath = request.RunnerBasePath ?? GetDefaultRunnerBasePath();
+        RecordRunnerBasePath(basePath);
         var provider = request.Provider;
         var agentVersion = await ResolveAgentVersionAsync(provider, request.RunnerAgentVersion, ct);
         var runnerDirectoryName = CreateSafeRunnerDirectoryName(request.RunnerName, request.InstanceId);
@@ -185,7 +186,48 @@ public class NativeBackend : IRunnerBackend
         }
 
         var instanceHandle = runProcess.Id.ToString();
-        await File.WriteAllTextAsync(Path.Combine(instanceDir, "rr.pid"), runProcess.Id.ToString());
+        var pidFile = Path.Combine(instanceDir, PidFileName);
+        try
+        {
+            await WritePidFileAsync(pidFile, instanceHandle);
+        }
+        catch (Exception ex)
+        {
+            // Without its PID file discovery never reports this runner, so nothing would ever
+            // stop it, and it could take a job no one sees. Stop it before failing the start.
+            _logger.LogError(ex, "Could not write the PID file for native runner {RunnerName} (PID: {PID}); stopping it", request.RunnerName, runProcess.Id);
+            var exited = false;
+            try
+            {
+                exited = KillProcessTreeAndWaitForExit(runProcess, TimeSpan.FromSeconds(30));
+                if (!exited)
+                    _logger.LogError("Native runner {RunnerName} (PID: {PID}) did not exit after being killed", request.RunnerName, runProcess.Id);
+            }
+            catch (Exception killEx) when (killEx is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException or AggregateException)
+            {
+                _logger.LogError(killEx, "Could not stop native runner {RunnerName} (PID: {PID}) after its PID file write failed", request.RunnerName, runProcess.Id);
+            }
+
+            if (exited)
+            {
+                runProcess.Dispose();
+                // An rr.pid left here names no runner of ours, but discovery would read it as a
+                // live runner's on every scan, and fail each one if it is damaged.
+                TryDeletePidFile(pidFile);
+            }
+            else
+            {
+                // The runner may still be running and could take a job. Its rr.pid is the only
+                // way discovery reports it, so it is kept, and written again if it holds no PID.
+                // Its output is still drained, or it would block once the pipe filled.
+                _ = Task.Run(() => PipeOutputToLogFile(runProcess, instanceLogFile), CancellationToken.None);
+                await TryKeepPidFileForUnstoppedRunnerAsync(pidFile, instanceHandle);
+                _logger.LogError(
+                    "Native runner {RunnerName} (PID: {PID}) in {InstanceDir} may still be running after its PID file write failed; its PID file is kept so discovery reports it",
+                    request.RunnerName, runProcess.Id, instanceDir);
+            }
+            throw;
+        }
         _runners[instanceHandle] = new ManagedNativeRunner
         {
             Process = runProcess,
@@ -372,61 +414,363 @@ public class NativeBackend : IRunnerBackend
         return Task.FromResult(new RunnerHealthStatus { IsRunning = false, Status = "not_found" });
     }
 
+    // Each base path a deploy used is recorded as its own marker file in this directory under
+    // the default base path, named by a hash of the path and holding the path. The Agent and
+    // the HostWorker (or two HostWorker versions) record paths from separate processes, so a
+    // writer only ever creates its own marker and never rewrites anyone else's.
+    private const string RecordedBasePathsDirectoryName = "native-base-paths";
+    private const string RecordedBasePathMarkerExtension = ".path";
+    private static readonly StringComparer BasePathComparer =
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+    private readonly Lock _recordedBasePathsLock = new();
+    private readonly HashSet<string> _recordedBasePaths = new(BasePathComparer);
+
+    // Where runners go when a start request names no base path. Settable so tests can keep
+    // discovery away from the real ~/.runnerrunner.
+    internal string DefaultBasePath { get; init; } = GetDefaultRunnerBasePath();
+
+    // Writes the PID file's text. Settable so tests can make that write fail.
+    internal Func<string, string, CancellationToken, Task> WriteTextFileAsync { get; init; } =
+        (path, contents, ct) => File.WriteAllTextAsync(path, contents, ct);
+
+    // Kills a runner's process tree and returns whether it exited within the timeout.
+    // Settable so tests can make the kill fail to stop it.
+    internal Func<Process, TimeSpan, bool> KillProcessTreeAndWaitForExit { get; init; } =
+        (process, timeout) =>
+        {
+            process.Kill(entireProcessTree: true);
+            return process.WaitForExit(timeout);
+        };
+
+    private const string PidFileName = "rr.pid";
+
+    // Discovery reads every rr.pid as a live runner's PID, and fails its scan on one that holds
+    // none, so a reader must see a whole PID or no file. The PID goes to a temporary file in
+    // the same directory, which discovery does not read, and is renamed into place.
+    private async Task WritePidFileAsync(string pidFile, string pid)
+    {
+        var tempFile = $"{pidFile}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            await WriteTextFileAsync(tempFile, pid, CancellationToken.None);
+            File.Move(tempFile, pidFile, overwrite: true);
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(tempFile);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogWarning(ex, "Could not remove temporary PID file {File}", tempFile);
+            }
+        }
+    }
+
+    // For a runner that may still be running after its PID file write failed. An rr.pid that
+    // holds a PID is left alone; one that is missing or holds none is written once more.
+    private async Task TryKeepPidFileForUnstoppedRunnerAsync(string pidFile, string pid)
+    {
+        try
+        {
+            if (File.Exists(pidFile) && TryParsePid(await File.ReadAllTextAsync(pidFile), out _))
+                return;
+
+            await WritePidFileAsync(pidFile, pid);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Could not write PID file {File} for native runner PID {PID}; discovery will not report it", pidFile, pid);
+        }
+    }
+
+    private static bool TryParsePid(string pidText, out int pid) =>
+        int.TryParse(pidText.Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out pid) && pid > 0;
+
+    // Removes only the PID file, never the instance directory, which can hold mounts that a
+    // recursive delete would follow.
+    private void TryDeletePidFile(string pidFile)
+    {
+        try
+        {
+            if (File.Exists(pidFile))
+                File.Delete(pidFile);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Could not remove PID file {File}; native runner discovery will report it until it is removed", pidFile);
+        }
+    }
+
+    private string RecordedBasePathsDirectory => Path.Combine(DefaultBasePath, RecordedBasePathsDirectoryName);
+
+    /// <summary>
+    /// Records a base path a runner is being deployed under, so discovery scans it from now on,
+    /// including after a restart. The default base path is always scanned and is not recorded.
+    /// Throws when the path cannot be persisted: a runner discovery cannot find later would be
+    /// reported gone while it still runs.
+    /// </summary>
+    internal void RecordRunnerBasePath(string basePath)
+    {
+        var normalized = NormalizeBasePath(basePath);
+        if (BasePathComparer.Equals(normalized, NormalizeBasePath(DefaultBasePath)))
+            return;
+
+        lock (_recordedBasePathsLock)
+        {
+            var marker = GetRecordedBasePathMarker(normalized);
+            if (_recordedBasePaths.Contains(normalized) && File.Exists(marker))
+                return;
+
+            WriteRecordedBasePathMarker(marker, normalized);
+            _recordedBasePaths.Add(normalized);
+        }
+    }
+
     /// <summary>
     /// Discovers RunnerRunner-managed native processes by scanning instance directories for PID files.
     /// </summary>
-    public async Task<List<DiscoveredRunner>> DiscoverManagedProcessesAsync(CancellationToken ct = default)
+    public Task<List<DiscoveredRunner>> DiscoverManagedProcessesAsync(CancellationToken ct = default)
+        => DiscoverManagedProcessesAsync([], ct);
+
+    /// <summary>
+    /// Discovers RunnerRunner-managed native processes by scanning the instance directories under
+    /// the default base path, <paramref name="additionalBasePaths"/>, and every base path a start
+    /// has used. Throws when any of them exists but cannot be fully scanned: a partial result
+    /// would report the runners it missed as gone.
+    /// </summary>
+    public async Task<List<DiscoveredRunner>> DiscoverManagedProcessesAsync(
+        IEnumerable<string?> additionalBasePaths, CancellationToken ct = default)
     {
         var result = new List<DiscoveredRunner>();
-        var basePath = GetDefaultRunnerBasePath();
-        var instancesDir = Path.Combine(basePath, "instances");
+        var errors = new List<Exception>();
 
-        if (!Directory.Exists(instancesDir))
-            return result;
+        foreach (var basePath in GetBasePathsToScan(additionalBasePaths, errors))
+            await DiscoverUnderBasePathAsync(basePath, result, errors, ct);
 
-        foreach (var dir in Directory.GetDirectories(instancesDir))
+        if (errors.Count > 0)
         {
-            var pidFile = Path.Combine(dir, "rr.pid");
-            if (!File.Exists(pidFile))
-                continue;
-
-            try
-            {
-                var pidText = await File.ReadAllTextAsync(pidFile, ct);
-                if (!int.TryParse(pidText.Trim(), out var pid))
-                    continue;
-
-                var isRunning = false;
-                try
-                {
-                    var proc = Process.GetProcessById(pid);
-                    isRunning = !proc.HasExited;
-                }
-                catch
-                {
-                    // Process not found — not running
-                }
-
-                var metadata = await ReadInstanceMetadataAsync(dir, ct);
-                result.Add(new DiscoveredRunner
-                {
-                    InstanceId = metadata?.InstanceId ?? "",
-                    ProcessId = pid,
-                    RunnerName = metadata?.RunnerName ?? Path.GetFileName(dir),
-                    InstanceDir = dir,
-                    Backend = ExecutionBackend.Native,
-                    IsRunning = isRunning,
-                    Status = isRunning ? "running" : "exited"
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to discover native runner in {Dir}", dir);
-            }
+            throw new AggregateException(
+                $"Native runner discovery could not scan everything ({errors.Count} error(s)); its result would be incomplete.",
+                errors);
         }
 
         return result;
     }
+
+    private List<string> GetBasePathsToScan(IEnumerable<string?> additionalBasePaths, List<Exception> errors)
+    {
+        var candidates = new List<string> { DefaultBasePath };
+        candidates.AddRange(additionalBasePaths.Where(p => !string.IsNullOrWhiteSpace(p))!);
+
+        lock (_recordedBasePathsLock)
+            candidates.AddRange(_recordedBasePaths);
+        candidates.AddRange(ReadRecordedBasePaths(errors));
+
+        var seen = new HashSet<string>(BasePathComparer);
+        var basePaths = new List<string>();
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                var normalized = NormalizeBasePath(candidate);
+                if (seen.Add(normalized))
+                    basePaths.Add(normalized);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Ignoring invalid native runner base path {BasePath}", candidate);
+                errors.Add(ex);
+            }
+        }
+
+        return basePaths;
+    }
+
+    private async Task DiscoverUnderBasePathAsync(
+        string basePath, List<DiscoveredRunner> result, List<Exception> errors, CancellationToken ct)
+    {
+        var instancesDir = Path.Combine(basePath, "instances");
+        string[] instanceDirs;
+        try
+        {
+            instanceDirs = Directory.GetDirectories(instancesDir);
+        }
+        catch (DirectoryNotFoundException) when (!Path.Exists(instancesDir))
+        {
+            // No native runner was ever deployed under this base path.
+            return;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Failed to list native runner instances in {Dir}", instancesDir);
+            errors.Add(ex);
+            return;
+        }
+
+        foreach (var dir in instanceDirs)
+        {
+            try
+            {
+                var runner = await ReadDiscoveredRunnerAsync(dir, ct);
+                if (runner != null)
+                    result.Add(runner);
+            }
+            catch (Exception ex) when ((ex is DirectoryNotFoundException or FileNotFoundException) && !Directory.Exists(dir))
+            {
+                // Removed while we scanned it, so nothing runs from it any more.
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Failed to discover native runner in {Dir}", dir);
+                errors.Add(ex);
+            }
+        }
+    }
+
+    private async Task<DiscoveredRunner?> ReadDiscoveredRunnerAsync(string dir, CancellationToken ct)
+    {
+        string pidText;
+        try
+        {
+            pidText = await File.ReadAllTextAsync(Path.Combine(dir, "rr.pid"), ct);
+        }
+        catch (FileNotFoundException)
+        {
+            // The runner process has not been started from this directory.
+            return null;
+        }
+
+        if (!int.TryParse(pidText.Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var pid) || pid <= 0)
+        {
+            // A PID file is written once, after the runner launched, so one that names no
+            // process is damaged, and the runner it was written for may still be running.
+            throw new InvalidDataException($"Native runner PID file in {dir} does not hold a process id.");
+        }
+
+        var isRunning = IsDiscoveredProcessRunning(pid);
+        NativeRunnerInstanceMetadata? metadata;
+        try
+        {
+            metadata = await ReadInstanceMetadataAsync(dir, ct);
+        }
+        catch (Exception ex) when (!isRunning && ex is not OperationCanceledException)
+        {
+            // The runner is gone, so its unreadable leftovers cannot hide a live one.
+            _logger.LogWarning(ex, "Skipping exited native runner in {Dir}: its metadata cannot be read", dir);
+            return null;
+        }
+
+        return new DiscoveredRunner
+        {
+            InstanceId = metadata?.InstanceId ?? "",
+            ProcessId = pid,
+            RunnerName = metadata?.RunnerName ?? Path.GetFileName(dir),
+            InstanceDir = dir,
+            Backend = ExecutionBackend.Native,
+            IsRunning = isRunning,
+            Status = isRunning ? "running" : "exited"
+        };
+    }
+
+    private static bool IsDiscoveredProcessRunning(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private string GetRecordedBasePathMarker(string normalizedBasePath)
+    {
+        var key = OperatingSystem.IsWindows() ? normalizedBasePath.ToUpperInvariant() : normalizedBasePath;
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(key));
+        return Path.Combine(
+            RecordedBasePathsDirectory,
+            Convert.ToHexString(hash).ToLowerInvariant() + RecordedBasePathMarkerExtension);
+    }
+
+    // Writes only this path's marker, atomically, without reading any other marker: two
+    // writers can never lose each other's paths, and a damaged marker cannot block a deploy.
+    private static void WriteRecordedBasePathMarker(string marker, string normalizedBasePath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(marker)!);
+        var temp = $"{marker}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(temp, normalizedBasePath);
+            File.Move(temp, marker, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+                File.Delete(temp);
+        }
+    }
+
+    // Every recorded base path, or an error in errors for each marker that cannot be read
+    // (discovery then fails rather than miss the runners under that path).
+    private List<string> ReadRecordedBasePaths(List<Exception> errors)
+    {
+        var directory = RecordedBasePathsDirectory;
+        string[] entries;
+        try
+        {
+            entries = Directory.GetFileSystemEntries(directory);
+        }
+        catch (DirectoryNotFoundException) when (!Path.Exists(directory))
+        {
+            // No deploy has used a base path other than the default.
+            return [];
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Failed to list the recorded native runner base paths in {Dir}", directory);
+            errors.Add(ex);
+            return [];
+        }
+
+        var basePaths = new List<string>();
+        foreach (var marker in entries)
+        {
+            if (!marker.EndsWith(RecordedBasePathMarkerExtension, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                var basePath = File.ReadAllText(marker).Trim();
+                if (basePath.Length == 0)
+                    throw new InvalidDataException($"Recorded native runner base path marker {marker} is empty.");
+                basePaths.Add(basePath);
+            }
+            catch (Exception ex) when ((ex is FileNotFoundException or DirectoryNotFoundException) && !Path.Exists(marker))
+            {
+                // Removed while we scanned.
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Failed to read the recorded native runner base path marker {Marker}", marker);
+                errors.Add(ex);
+            }
+        }
+
+        return basePaths;
+    }
+
+    // StartRunnerAsync combines an empty base path with relative names, so it means the
+    // current directory.
+    private static string NormalizeBasePath(string basePath) =>
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath(basePath.Length == 0 ? "." : basePath));
 
     internal static string CreateSafeRunnerDirectoryName(string runnerName, string instanceId)
     {

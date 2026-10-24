@@ -381,8 +381,8 @@ public class GitHubActionsProviderTests
                 {
                     runners = new[]
                     {
-                        new { id = 42, name = "my-runner" },
-                        new { id = 43, name = "other-runner" }
+                        new { id = 42, name = "my-runner", busy = false },
+                        new { id = 43, name = "other-runner", busy = true }
                     }
                 };
                 return new HttpResponseMessage(HttpStatusCode.OK)
@@ -405,6 +405,43 @@ public class GitHubActionsProviderTests
 
         Assert.Equal(2, callCount); // GET list + DELETE
         Assert.Contains("/42", deleteUrl);
+    }
+
+    [Fact]
+    public async Task RemoveRunner_RunnerBusyInTheListing_IsNotDeleted()
+    {
+        // The caller checked activity a moment ago and saw idle; GitHub has since assigned a
+        // job. The listing taken right before the DELETE is the last word.
+        var api = new FakeProviderHttpApi()
+            .RespondJson(
+                req => req.Method == HttpMethod.Get,
+                """{ "runners": [ { "id": 42, "name": "my-runner", "status": "online", "busy": true } ] }""")
+            .Respond(req => req.Method == HttpMethod.Delete, _ => new HttpResponseMessage(HttpStatusCode.NoContent));
+        var provider = new GitHubActionsProvider(api, new GitHubAuthenticationService(api, _authLogger), _logger);
+
+        await provider.RemoveRunnerAsync(
+            new ProviderCredential { Name = "test", GitHubOrg = "org", GitHubToken = "tok" },
+            "my-runner");
+
+        Assert.Contains(api.Requests, request => request.Method == HttpMethod.Get);
+        Assert.DoesNotContain(api.Requests, request => request.Method == HttpMethod.Delete);
+    }
+
+    [Fact]
+    public async Task RemoveRunner_ListingWithoutBusy_IsNotDeleted()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(
+                req => req.Method == HttpMethod.Get,
+                """{ "runners": [ { "id": 42, "name": "my-runner", "status": "online" } ] }""")
+            .Respond(req => req.Method == HttpMethod.Delete, _ => new HttpResponseMessage(HttpStatusCode.NoContent));
+        var provider = new GitHubActionsProvider(api, new GitHubAuthenticationService(api, _authLogger), _logger);
+
+        await provider.RemoveRunnerAsync(
+            new ProviderCredential { Name = "test", GitHubOrg = "org", GitHubToken = "tok" },
+            "my-runner");
+
+        Assert.DoesNotContain(api.Requests, request => request.Method == HttpMethod.Delete);
     }
 
     [Fact]
@@ -468,5 +505,34 @@ public class GitHubActionsProviderTests
         Assert.Equal(1, removed);
         Assert.Equal(["/orgs/octo-org/actions/runners/10"], deletedPaths);
         Assert.All(api.Requests, request => Assert.Equal("Bearer", request.Authorization?.Scheme));
+    }
+
+    [Fact]
+    public async Task RemoveOfflineDynamicRunners_KeepsARegistrationWhoseBusyStateIsMissing()
+    {
+        var api = new FakeProviderHttpApi()
+            .Respond(
+                req => req.Method == HttpMethod.Get,
+                _ => FakeProviderHttpApi.JsonResponse("""
+                {
+                  "runners": [
+                    { "id": 15, "name": "rr-jit-no-busy", "status": "offline" }
+                  ]
+                }
+                """))
+            .Respond(req => req.Method == HttpMethod.Delete, _ => new HttpResponseMessage(HttpStatusCode.NoContent));
+        var provider = new GitHubActionsProvider(api, new GitHubAuthenticationService(api, _authLogger), _logger);
+
+        var removed = await provider.RemoveOfflineDynamicRunnersAsync(
+            new ProviderCredential
+            {
+                Name = "github",
+                GitHubOrg = "octo-org",
+                GitHubToken = "ghp_test"
+            },
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
+        Assert.Equal(0, removed);
+        Assert.DoesNotContain(api.Requests, request => request.Method == HttpMethod.Delete);
     }
 }

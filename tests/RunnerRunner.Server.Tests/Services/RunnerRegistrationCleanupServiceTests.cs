@@ -233,6 +233,18 @@ public class RunnerRegistrationCleanupServiceTests
         Assert.Equal($"/repos/Clancey/FashionPactPos/actions/runners?name={ProbedRunner}&per_page=100", request.PathAndQuery);
     }
 
+    // A listing that omits "busy" says nothing about whether the runner is on a job; reading
+    // it as idle let callers stop or deregister a runner that may be building.
+    [Fact]
+    public async Task GetProviderRunnerActivity_RegistrationWithoutABusyField_IsUnknownNeverIdle()
+    {
+        var api = new FakeProviderHttpApi()
+            .RespondJson(IsRepoLookup, $$"""{"total_count":1,"runners":[{"id":1,"name":"{{ProbedRunner}}","os":"Linux","status":"online"}]}""");
+        var (service, store, instance) = await ActivityScenarioAsync(api);
+
+        Assert.Equal(ProviderRunnerActivity.Unknown, await service.GetProviderRunnerActivityAsync(store, instance));
+    }
+
     [Fact]
     public async Task GetProviderRunnerActivity_PersonalAccountWithNoRepositoryRegistration_IsNotRegistered()
     {

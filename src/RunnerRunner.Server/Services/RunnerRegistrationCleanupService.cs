@@ -152,7 +152,14 @@ public class RunnerRegistrationCleanupService
                 var registration = await github.FindRunnerRegistrationAsync(
                     lookup.Credential, lookup.Repository, lookup.Owner, instance.RunnerName, ct, lookup.InstallationId);
                 if (registration != null)
-                    return registration.Busy ? ProviderRunnerActivity.Busy : ProviderRunnerActivity.Idle;
+                {
+                    return registration.Busy switch
+                    {
+                        true => ProviderRunnerActivity.Busy,
+                        false => ProviderRunnerActivity.Idle,
+                        null => ProviderRunnerActivity.Unknown
+                    };
+                }
             }
             catch (HttpRequestException ex) when (lookup.Repository == null && ex.StatusCode == System.Net.HttpStatusCode.NotFound)
             {

@@ -17,7 +17,6 @@ public class RunnerTimeoutService : BackgroundService
     private static readonly TimeSpan PendingTimeout = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan StartingTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan DynamicPickupTimeout = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan DefaultDynamicRunningTimeout = TimeSpan.FromHours(6);
     private static readonly TimeSpan StoppingTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan HealthCheckStaleTimeout = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan DynamicTerminalRetention = TimeSpan.FromMinutes(10);
@@ -29,7 +28,7 @@ public class RunnerTimeoutService : BackgroundService
     // How long a provider answer that blocks a stop (Busy, Unknown) is reused. The scan runs
     // every 30s and each lookup costs up to two GitHub API calls per runner; a busy runner
     // stays busy for minutes, and acting on Idle is never delayed because Idle is not cached.
-    private static readonly TimeSpan ProviderActivityCacheDuration = TimeSpan.FromMinutes(2);
+    internal static readonly TimeSpan ProviderActivityCacheDuration = TimeSpan.FromMinutes(2);
 
     // "pending" (WebhookEvent.ScheduleRetry's default status) is one of the open-ended queue
     // statuses that WebhookEvent.EnsureLifecycleWindow/ScheduleRetry deliberately never expire
@@ -43,15 +42,14 @@ public class RunnerTimeoutService : BackgroundService
     private readonly ILogger<RunnerTimeoutService> _logger;
     private readonly IServiceProvider _services;
     private readonly IHostCommandDispatcher _hostCommands;
+    // Instance id -> a provider answer that keeps a runner (Busy, Unknown), reused for
+    // ProviderActivityCacheDuration. See GetProviderActivityAsync.
     private readonly ConcurrentDictionary<string, (ProviderRunnerActivity Activity, DateTime CheckedAt)> _blockingActivity =
         new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Backstop for dynamic runners whose completion webhook was lost. It must stay above
-    /// the longest job the pool can legitimately run: a runner that trips this is killed
-    /// and its workspace deleted, so a value below a real job's timeout destroys healthy
-    /// builds mid-step and reports it as a build failure. Runners that really exited are
-    /// caught far sooner by the host reporting them gone, so this only needs to be generous.
+    /// Backstop for dynamic runners whose completion webhook was lost; see
+    /// <see cref="DynamicRunnerTimeouts.GetRunningTimeout"/>.
     /// </summary>
     private readonly TimeSpan _dynamicRunningTimeout;
 
@@ -65,11 +63,7 @@ public class RunnerTimeoutService : BackgroundService
         _services = services;
         _hostCommands = hostCommands;
 
-        var configuredMinutes = configuration.GetValue(
-            "DynamicProvisioning:RunningTimeoutMinutes",
-            (int)DefaultDynamicRunningTimeout.TotalMinutes);
-
-        _dynamicRunningTimeout = TimeSpan.FromMinutes(Math.Max(1, configuredMinutes));
+        _dynamicRunningTimeout = DynamicRunnerTimeouts.GetRunningTimeout(configuration);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -123,7 +117,7 @@ public class RunnerTimeoutService : BackgroundService
                         continue;
                     break;
                 case RunnerInstanceStatus.Starting:
-                    if (await CheckStartingTimeout(store, instance, now))
+                    if (await CheckStartingTimeout(store, registrations, instance, now, ct))
                         continue;
                     break;
                 case RunnerInstanceStatus.Running:
@@ -184,7 +178,12 @@ public class RunnerTimeoutService : BackgroundService
     }
 
     /// <returns>True when the instance's record was removed or must be left as it is.</returns>
-    private async Task<bool> CheckStartingTimeout(IDocumentStore store, RunnerInstance instance, DateTime now)
+    private async Task<bool> CheckStartingTimeout(
+        IDocumentStore store,
+        RunnerRegistrationCleanupService? registrations,
+        RunnerInstance instance,
+        DateTime now,
+        CancellationToken ct)
     {
         var referenceTime = instance.StartedAt ?? instance.DeployedAt;
         if (referenceTime == null || now - referenceTime.Value <= StartingTimeout)
@@ -194,8 +193,32 @@ public class RunnerTimeoutService : BackgroundService
             "Runner {RunnerName} ({Id}) timed out in Starting state after {Elapsed}",
             instance.RunnerName, instance.Id, now - referenceTime.Value);
 
-        if (instance.ProvisioningMode == "dynamic" && !await TrySendStopRunner(store, instance))
-            return true;
+        if (instance.ProvisioningMode == "dynamic")
+        {
+            // A Starting record only says RunnerRunner never heard the runner start: the
+            // RunnerStarted event can be lost while the runner registers and takes a job.
+            // Stopping it then killed that job, and requeuing ran it twice.
+            var pastUnknownCeiling = IsPastUnknownActivityCeiling(referenceTime.Value, now);
+            var activity = await GetProviderActivityAsync(registrations, store, instance, unknownAllowsStop: pastUnknownCeiling, ct);
+            if (activity == ProviderRunnerActivity.Busy)
+            {
+                _logger.LogWarning(
+                    "Runner {RunnerName} ({Id}) timed out in Starting state, but the provider reports it running a job; leaving it Starting",
+                    instance.RunnerName, instance.Id);
+                return true;
+            }
+
+            if (activity == ProviderRunnerActivity.Unknown && !pastUnknownCeiling)
+            {
+                _logger.LogWarning(
+                    "Runner {RunnerName} ({Id}) timed out in Starting state, but the provider cannot say whether it is running a job; leaving it Starting until {Ceiling} have passed",
+                    instance.RunnerName, instance.Id, UnknownActivityCeiling);
+                return true;
+            }
+
+            if (!await TrySendStopRunner(store, instance))
+                return true;
+        }
 
         instance.Status = RunnerInstanceStatus.Failed;
         instance.StatusMessage = "Registration timeout — runner did not connect to provider";
@@ -248,7 +271,7 @@ public class RunnerTimeoutService : BackgroundService
                         "Dynamic runner {RunnerName} ({Id}) is not bound to resolved event job {EventJobId} (claim: {JobId}); leaving it running",
                         instance.RunnerName, instance.Id, linkedEvent?.JobId, instance.JobId ?? "released");
                 }
-                else if (await GetProviderActivityAsync(registrations, store, instance, ct) is var resolvedActivity
+                else if (await GetProviderActivityAsync(registrations, store, instance, unknownAllowsStop: false, ct) is var resolvedActivity
                     && !ProviderAllowsRecycle(resolvedActivity))
                 {
                     // A matching claim is RunnerRunner's belief, and it goes stale whenever the
@@ -289,7 +312,7 @@ public class RunnerTimeoutService : BackgroundService
                         "Dynamic runner {RunnerName} ({Id}) did not pick up job {EventJobId} and no longer holds that claim (now {JobId}); leaving it running",
                         instance.RunnerName, instance.Id, linkedEvent?.JobId, instance.JobId ?? "released");
                 }
-                else if (await GetProviderActivityAsync(registrations, store, instance, ct) is var pickupActivity
+                else if (await GetProviderActivityAsync(registrations, store, instance, unknownAllowsStop: false, ct) is var pickupActivity
                     && !ProviderAllowsRecycle(pickupActivity))
                 {
                     // Without webhooks the claim never moves, so "never picked up" really means
@@ -328,7 +351,10 @@ public class RunnerTimeoutService : BackgroundService
             && instance.StartedAt != null
             && now - instance.StartedAt.Value > _dynamicRunningTimeout)
         {
-            var activity = await GetProviderActivityAsync(registrations, store, instance, ct);
+            var activity = await GetProviderActivityAsync(
+                registrations, store, instance,
+                unknownAllowsStop: IsPastUnknownActivityCeiling(instance.StartedAt.Value, now),
+                ct);
             if (activity == ProviderRunnerActivity.Busy)
             {
                 _logger.LogWarning(
@@ -389,10 +415,14 @@ public class RunnerTimeoutService : BackgroundService
         return false;
     }
 
+    // A cached answer may only keep a runner. When the caller stops the runner on Unknown
+    // (unknownAllowsStop: it is past the Unknown ceiling), a cached Unknown is not reused: it
+    // may predate the provider giving the runner a job, so the stop waits for a fresh answer.
     private async Task<ProviderRunnerActivity> GetProviderActivityAsync(
         RunnerRegistrationCleanupService? registrations,
         IDocumentStore store,
         RunnerInstance instance,
+        bool unknownAllowsStop,
         CancellationToken ct)
     {
         if (registrations == null)
@@ -400,7 +430,8 @@ public class RunnerTimeoutService : BackgroundService
 
         var now = DateTime.UtcNow;
         if (_blockingActivity.TryGetValue(instance.Id, out var cached)
-            && now - cached.CheckedAt < ProviderActivityCacheDuration)
+            && now - cached.CheckedAt < ProviderActivityCacheDuration
+            && !(cached.Activity == ProviderRunnerActivity.Unknown && unknownAllowsStop))
         {
             return cached.Activity;
         }
@@ -434,11 +465,10 @@ public class RunnerTimeoutService : BackgroundService
             or ProviderRunnerActivity.NotSupported;
 
     /// <summary>
-    /// How long a runner the provider cannot answer about (Unknown) is left alone. Busy is
-    /// never stopped; Unknown is usually a GitHub outage or a credential problem, so it waits
-    /// well past any job the backstop allows before giving up on the runner.
+    /// How long a runner the provider cannot answer about (Unknown) is left alone; shared with
+    /// <see cref="ReconciliationService"/>'s orphan cleanup.
     /// </summary>
-    private TimeSpan UnknownActivityCeiling => _dynamicRunningTimeout * 2;
+    private TimeSpan UnknownActivityCeiling => DynamicRunnerTimeouts.GetUnknownActivityCeiling(_dynamicRunningTimeout);
 
     private bool IsPastUnknownActivityCeiling(DateTime startedAt, DateTime now) =>
         now - startedAt > UnknownActivityCeiling;
@@ -630,10 +660,11 @@ public class RunnerTimeoutService : BackgroundService
 
         var hostReportsIt = HostStillReportsActive(instance, terminalSince, now);
 
-        var activity = await GetProviderActivityAsync(registrations, store, instance, ct);
         var startedAt = instance.StartedAt ?? instance.DeployedAt ?? instance.CreatedAt;
+        var pastUnknownCeiling = IsPastUnknownActivityCeiling(startedAt, now);
+        var activity = await GetProviderActivityAsync(registrations, store, instance, unknownAllowsStop: pastUnknownCeiling, ct);
         if (!ProviderAllowsRecycle(activity)
-            && !(activity == ProviderRunnerActivity.Unknown && IsPastUnknownActivityCeiling(startedAt, now)))
+            && !(activity == ProviderRunnerActivity.Unknown && pastUnknownCeiling))
         {
             _logger.LogInformation(
                 "Keeping {Status} record for runner {RunnerName} ({Id}): the host {HostView} and the provider reports it {Activity}",
