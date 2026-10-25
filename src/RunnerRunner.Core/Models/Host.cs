@@ -84,6 +84,9 @@ public class Host
     public int MaxTartVMs { get; set; }
     public int MaxNativeProcesses { get; set; } = 5;
 
+    /// <summary>Preserves operator-selected limits even before this host first enrolls.</summary>
+    public bool BackendLimitsConfigured { get; set; }
+
     /// <summary>
     /// Total running Tart VMs observed on the host, including VMs not started by RunnerRunner.
     /// Used to reserve Tart capacity consumed by native jobs or other local workloads.

@@ -173,7 +173,9 @@ public sealed class HostWorkerUpdateService
             host.UpdateMessage = $"HostWorker {HostWorkerUpdateSelector.FormatVersionWithCommit(availability.Release!.Version, availability.Release.CommitSha)} is available from {selection.Source.ToDisplayName()}.";
         }
 
-        await _store.Update(host);
+        await HostDocumentUpdates.UpdateAsync(_store, host,
+            h => h.LastUpdateCheckAt, h => h.LatestAvailableVersion, h => h.LatestAvailableCommitSha,
+            h => h.UpdateStatus, h => h.UpdateMessage);
     }
 
     public async Task QueueUpdateAsync(string hostId, bool force, CancellationToken ct = default)
@@ -239,7 +241,7 @@ public sealed class HostWorkerUpdateService
         {
             host.UpdateStatus = "Draining";
             host.UpdateMessage = "Waiting for HostWorker to reconnect before applying drained update.";
-            await _store.Update(host);
+            await SaveUpdateStateAsync(host);
             _tasks.UpdateHostWorkerUpdate(
                 host,
                 host.UpdateStatus,
@@ -254,7 +256,7 @@ public sealed class HostWorkerUpdateService
         {
             host.UpdateStatus = "Draining";
             host.UpdateMessage = $"Draining {activeRunners.Count} active runner(s) before updating HostWorker.";
-            await _store.Update(host);
+            await SaveUpdateStateAsync(host);
             _tasks.UpdateHostWorkerUpdate(
                 host,
                 host.UpdateStatus,
@@ -298,7 +300,7 @@ public sealed class HostWorkerUpdateService
             host.LastUpdateCompletedAt = DateTime.UtcNow;
             await SetHostDrainingAsync(host, false);
             ClearPendingUpdate(host);
-            await _store.Update(host);
+            await SaveUpdateStateAsync(host);
             _tasks.MarkHostWorkerUpdateSucceeded(host, host.UpdateMessage);
             return false;
         }
@@ -318,7 +320,7 @@ public sealed class HostWorkerUpdateService
             host.PendingHostWorkerUpdateDispatchedAt = null;
             host.UpdateStatus = "Draining";
             host.UpdateMessage = $"Drained but failed to dispatch update: {ex.Message}";
-            await _store.Update(host);
+            await SaveUpdateStateAsync(host);
             _tasks.UpdateHostWorkerUpdate(
                 host,
                 host.UpdateStatus,
@@ -348,7 +350,7 @@ public sealed class HostWorkerUpdateService
         host.PendingHostWorkerUpdatePublicBaseUrl = selection.PublicBaseUrl;
         host.PendingHostWorkerUpdateQueuedAt = DateTime.UtcNow;
         host.PendingHostWorkerUpdateDispatchedAt = null;
-        await _store.Update(host);
+        await SaveUpdateStateAsync(host);
         _tasks.TrackHostWorkerUpdate(
             host,
             availability.Release.Version,
@@ -375,7 +377,7 @@ public sealed class HostWorkerUpdateService
         host.LastUpdateStartedAt = DateTime.UtcNow;
         if (isPendingDrain)
             host.PendingHostWorkerUpdateDispatchedAt = DateTime.UtcNow;
-        await _store.Update(host);
+        await SaveUpdateStateAsync(host);
         _tasks.TrackHostWorkerUpdate(
             host,
             availability.Release.Version,
@@ -397,7 +399,7 @@ public sealed class HostWorkerUpdateService
                 host.UpdateStatus = "Failed";
                 host.UpdateMessage = $"Failed to dispatch update: {ex.Message}";
                 host.LastUpdateCompletedAt = DateTime.UtcNow;
-                await _store.Update(host);
+                await SaveUpdateStateAsync(host);
                 _tasks.MarkHostWorkerUpdateFailed(host, host.UpdateMessage);
             }
 
@@ -494,9 +496,17 @@ public sealed class HostWorkerUpdateService
         host.UpdateStatus = "Failed";
         host.UpdateMessage = message;
         host.LastUpdateCompletedAt = DateTime.UtcNow;
-        await _store.Update(host);
+        await SaveUpdateStateAsync(host);
         _tasks.MarkHostWorkerUpdateFailed(host, message);
     }
+
+    private Task SaveUpdateStateAsync(Host host)
+        => HostDocumentUpdates.UpdateAsync(_store, host,
+            h => h.UpdateStatus, h => h.UpdateMessage, h => h.LatestAvailableVersion, h => h.LatestAvailableCommitSha,
+            h => h.LastUpdateStartedAt, h => h.LastUpdateCompletedAt, h => h.IsDraining,
+            h => h.PendingHostWorkerUpdateSource, h => h.PendingHostWorkerUpdateVersion,
+            h => h.PendingHostWorkerUpdateAllowNonUpgrade, h => h.PendingHostWorkerUpdatePublicBaseUrl,
+            h => h.PendingHostWorkerUpdateQueuedAt, h => h.PendingHostWorkerUpdateDispatchedAt);
 
     private async Task SetHostDrainingAsync(Host host, bool isDraining)
     {

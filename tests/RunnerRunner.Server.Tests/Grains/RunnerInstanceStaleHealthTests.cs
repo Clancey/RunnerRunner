@@ -4,6 +4,7 @@ using Orleans.Hosting;
 using Orleans.TestingHost;
 using RunnerRunner.Core.Hub;
 using RunnerRunner.Core.Models;
+using RunnerRunner.Server.Data;
 using RunnerRunner.Server.Grains;
 using RunnerRunner.Server.Grains.Interfaces;
 using RunnerRunner.Server.Grains.State;
@@ -32,6 +33,9 @@ public sealed class ShortHealthTimeoutClusterFixture : IDisposable
 
     public ShortHealthTimeoutClusterFixture()
     {
+        using (var services = new ServiceCollection().AddSingleton(DocumentStore).BuildServiceProvider())
+            DatabaseInitializer.EnsureTablesCreatedAsync(services).GetAwaiter().GetResult();
+
         var builder = new TestClusterBuilder();
         builder.Options.InitialSilosCount = 1;
         builder.AddSiloBuilderConfigurator<SiloConfigurator>();

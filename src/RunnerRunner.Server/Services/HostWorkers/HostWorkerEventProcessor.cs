@@ -42,14 +42,14 @@ public sealed class HostWorkerEventProcessor
         string? enrollmentToken,
         CancellationToken ct)
     {
-        var host = await ResolveOrCreateHostAsync(agentInfo, labels, enrollmentToken, ct);
+        var host = await ResolveOrCreateHostAsync(agentInfo, enrollmentToken, ct);
         var hostId = host.Id;
 
+        var registrationLabels = new Dictionary<string, string>(labels);
+        foreach (var capability in agentInfo.Capabilities)
+            registrationLabels[capability] = "true";
         var hostGrain = _grainFactory.GetGrain<IHostGrain>(hostId);
-        await hostGrain.Register(agentInfo.Name, agentInfo.Platform, agentInfo.Architecture, agentInfo.AgentVersion ?? "");
-
-        if (labels.Count > 0)
-            await hostGrain.UpdateLabels(new Dictionary<string, string>(labels));
+        await hostGrain.Register(agentInfo.Name, agentInfo.Platform, agentInfo.Architecture, agentInfo.AgentVersion ?? "", registrationLabels);
 
         await hostGrain.SetDraining(host.IsDraining);
         await hostGrain.RecordHeartbeat(connectionId, agentInfo.CurrentRunners.Count, null);
@@ -69,7 +69,7 @@ public sealed class HostWorkerEventProcessor
         {
             host.AgentStatus = AgentStatus.Offline;
             host.UpdatedAt = DateTime.UtcNow;
-            await _store.Update(host);
+            await HostDocumentUpdates.UpdateAsync(_store, host, h => h.AgentStatus, h => h.UpdatedAt);
         }
 
         try
@@ -164,7 +164,6 @@ public sealed class HostWorkerEventProcessor
 
     private async Task<Host> ResolveOrCreateHostAsync(
         AgentInfo agentInfo,
-        IReadOnlyDictionary<string, string> labels,
         string? enrollmentToken,
         CancellationToken ct)
     {
@@ -184,7 +183,6 @@ public sealed class HostWorkerEventProcessor
                 Name = agentInfo.Name,
                 Platform = agentInfo.Platform,
                 Capabilities = [.. agentInfo.Capabilities],
-                IsApproved = true,
                 CreatedAt = DateTime.UtcNow
             };
             HostBackendLimitDefaults.ApplyToNewHost(host);
@@ -204,8 +202,6 @@ public sealed class HostWorkerEventProcessor
         host.ContainerId = agentInfo.Runtime?.ContainerId;
         host.ContainerImage = agentInfo.Runtime?.ContainerImage;
         host.Capabilities = agentInfo.Capabilities;
-        host.IsApproved = true;
-        host.EnrolledAt ??= DateTime.UtcNow;
         if (!string.IsNullOrWhiteSpace(host.EnrollmentToken) && string.IsNullOrWhiteSpace(host.EnrollmentTokenHash))
         {
             host.EnrollmentTokenHash = HostEnrollmentToken.Hash(host.EnrollmentToken);
@@ -213,12 +209,19 @@ public sealed class HostWorkerEventProcessor
         }
         host.LastHeartbeat = DateTime.UtcNow;
         host.UpdatedAt = DateTime.UtcNow;
-        foreach (var (key, value) in labels)
-            host.Labels[key] = value;
         if (MarkUpdateCurrentIfTargetMatches(host))
             _tasks.MarkHostWorkerUpdateSucceeded(host, host.UpdateMessage);
 
-        await _store.Update(host);
+        await HostDocumentUpdates.UpdateAsync(_store, host,
+            h => h.WorkerId, h => h.Name, h => h.AgentStatus, h => h.Platform, h => h.OsVersion,
+            h => h.Architecture, h => h.AgentVersion, h => h.AgentCommitSha, h => h.AgentBuildTag,
+            h => h.IsContainerized, h => h.ContainerId, h => h.ContainerImage, h => h.Capabilities,
+            h => h.EnrollmentTokenHash, h => h.EnrollmentToken,
+            h => h.LastHeartbeat, h => h.UpdatedAt, h => h.UpdateStatus, h => h.UpdateMessage,
+            h => h.LastUpdateCompletedAt, h => h.IsDraining,
+            h => h.PendingHostWorkerUpdateSource, h => h.PendingHostWorkerUpdateVersion,
+            h => h.PendingHostWorkerUpdateAllowNonUpgrade, h => h.PendingHostWorkerUpdatePublicBaseUrl,
+            h => h.PendingHostWorkerUpdateQueuedAt, h => h.PendingHostWorkerUpdateDispatchedAt);
         return host;
     }
 
@@ -264,6 +267,17 @@ public sealed class HostWorkerEventProcessor
 
     private async Task HeartbeatAsync(string hostId, HeartbeatEvent evt)
     {
+        try
+        {
+            var hostGrain = _grainFactory.GetGrain<IHostGrain>(hostId);
+            await hostGrain.RecordHeartbeat(hostId, evt.RunningInstanceCount, evt.ResourceUsage);
+            return;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to sync HostWorker heartbeat for {HostId}", hostId);
+        }
+
         var host = await _store.Get<Host>(hostId);
         if (host != null)
         {
@@ -272,17 +286,10 @@ public sealed class HostWorkerEventProcessor
             host.AgentStatus = AgentStatus.Online;
             host.UpdatedAt = now;
             ApplyResourceUsage(host, evt.ResourceUsage, now);
-            await _store.Update(host);
-        }
-
-        try
-        {
-            var hostGrain = _grainFactory.GetGrain<IHostGrain>(hostId);
-            await hostGrain.RecordHeartbeat(hostId, evt.RunningInstanceCount, evt.ResourceUsage);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to sync HostWorker heartbeat for {HostId}", hostId);
+            await HostDocumentUpdates.UpdateAsync(_store, host,
+                h => h.LastHeartbeat, h => h.AgentStatus, h => h.UpdatedAt,
+                h => h.ObservedRunningTartVMs, h => h.ObservedFreeDiskBytes, h => h.ObservedTotalDiskBytes,
+                h => h.ObservedDiskUsageAt, h => h.ObservedResourceUsageAt);
         }
     }
 
@@ -517,7 +524,12 @@ public sealed class HostWorkerEventProcessor
                 host.LatestAvailableCommitSha);
         }
 
-        await _store.Update(host);
+        await HostDocumentUpdates.UpdateAsync(_store, host,
+            h => h.UpdateStatus, h => h.UpdateMessage, h => h.LatestAvailableVersion, h => h.LatestAvailableCommitSha,
+            h => h.AgentVersion, h => h.AgentCommitSha, h => h.LastUpdateStartedAt, h => h.LastUpdateCompletedAt,
+            h => h.IsDraining, h => h.PendingHostWorkerUpdateSource, h => h.PendingHostWorkerUpdateVersion,
+            h => h.PendingHostWorkerUpdateAllowNonUpgrade, h => h.PendingHostWorkerUpdatePublicBaseUrl,
+            h => h.PendingHostWorkerUpdateQueuedAt, h => h.PendingHostWorkerUpdateDispatchedAt);
         AgentHub.NotifyQueueRelevantChange();
     }
 

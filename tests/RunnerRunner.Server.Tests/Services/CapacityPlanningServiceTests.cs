@@ -671,7 +671,7 @@ public class CapacityPlanningServiceTests
     }
 
     [Fact]
-    public void HostBackendLimitDefaults_DisablesUnsupportedBackendsForNewHosts()
+    public void HostBackendLimitDefaults_NewHostsPreferIsolatedBackendsOverNative()
     {
         var linuxHost = new Host
         {
@@ -683,18 +683,26 @@ public class CapacityPlanningServiceTests
         {
             Name = "mac-worker",
             Platform = HostPlatform.MacOS,
-            Capabilities = ["native", "tart"]
+            Capabilities = ["native", "tart", "docker"]
         };
-
+        var nativeOnlyHost = new Host
+        {
+            Name = "windows-worker",
+            Platform = HostPlatform.Windows,
+            Capabilities = ["native"]
+        };
         HostBackendLimitDefaults.ApplyToNewHost(linuxHost);
         HostBackendLimitDefaults.ApplyToNewHost(macHost);
+        HostBackendLimitDefaults.ApplyToNewHost(nativeOnlyHost);
 
         Assert.Equal(10, linuxHost.MaxDockerContainers);
         Assert.Equal(0, linuxHost.MaxTartVMs);
-        Assert.Equal(5, linuxHost.MaxNativeProcesses);
+        Assert.Equal(0, linuxHost.MaxNativeProcesses);
         Assert.Equal(0, macHost.MaxDockerContainers);
         Assert.Equal(3, macHost.MaxTartVMs);
-        Assert.Equal(5, macHost.MaxNativeProcesses);
+        Assert.Equal(0, macHost.MaxNativeProcesses);
+        Assert.Equal(0, nativeOnlyHost.MaxDockerContainers);
+        Assert.Equal(5, nativeOnlyHost.MaxNativeProcesses);
     }
 
     [Fact]

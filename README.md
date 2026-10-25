@@ -116,6 +116,10 @@ If workers should connect through a DNS name, public IP, reverse proxy, or custo
 
 For recovery updates when an older HostWorker cannot accept a web UI update command, use **Hosts** -> **Manual update** on that host. The same wizard shows copyable update commands, can run them over SSH, preserves existing worker configuration, and waits for a fresh heartbeat from the updated worker.
 
+Use **Hosts** -> **Configure** to enable or disable Docker, Tart, and Native independently and set their limits. Saving updates both the persisted settings and the scheduler immediately; heartbeats only update runtime information and cannot reset those choices. A limit of `0` prevents new runners on that backend without stopping active jobs. Native can remain enabled alongside Tart on any host that needs both; no host-name exceptions or deployment configuration are required.
+
+New hosts prefer Tart on macOS (when installed) or Docker on other platforms, with Native enabled only when no preferred isolated backend is available. Docker starts disabled on macOS. Existing hosts are not automatically migrated. Backend switches control scheduling, not installation: Tart still needs to be installed and runner targets must select a Tart image to run jobs in VMs.
+
 ### Linux
 
 Use the installer script when the Linux worker should run in the same compose stack as the server:

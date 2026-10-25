@@ -11,10 +11,12 @@ namespace RunnerRunner.Server.Grains.Interfaces;
 public interface IHostGrain : IGrainWithStringKey
 {
     Task<HostGrainState> GetState();
-    Task Register(string name, HostPlatform platform, string? architecture, string agentVersion);
+    Task Register(string name, HostPlatform platform, string? architecture, string agentVersion, Dictionary<string, string>? labels = null);
     Task UpdateLabels(Dictionary<string, string> labels);
     Task SetResourceLimits(int maxDocker, int maxTart, int maxNative);
     Task SetGroupId(string? groupId);
+    /// <summary>Persists UI-edited limits, routing group and labels, then updates scheduling state.</summary>
+    Task SetConfiguration(int maxDocker, int maxTart, int maxNative, string? groupId, Dictionary<string, string>? labels = null);
     Task RecordHeartbeat(string connectionId, int runningCount, HostResourceUsage? resourceUsage);
     Task MarkOffline();
     Task SetDraining(bool isDraining);
