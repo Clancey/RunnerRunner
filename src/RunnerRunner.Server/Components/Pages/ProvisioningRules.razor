@@ -717,17 +717,18 @@
                                                             <i class="bi bi-search me-1"></i>Find image
                                                         </button>
                                                     </div>
+                                                    <p class="form-text">For a local VM, enter its exact name from <code>tart list</code> and leave registry and tag blank. The VM must exist on each eligible host. For an OCI image, enter its registry, image path, and tag.</p>
                                                     <div class="row g-3">
                                                         <div class="col-lg-3">
-                                                            <label class="form-label" for="tartRegistry-@runner.Id">OCI registry</label>
+                                                            <label class="form-label" for="tartRegistry-@runner.Id">OCI registry (optional)</label>
                                                             <SmartAutocomplete Value="@tart.RegistryUrl"
                                                                                ValueChanged="@(value => OnTartRegistryChangedAsync(tart, value))"
                                                                                Suggestions="@GetRegistrySuggestions(RegistryType.Tart)"
                                                                                Placeholder="ghcr.io"
-                                                                               AriaLabel="Tart OCI registry" />
+                                                                               AriaLabel="Tart OCI registry (optional)" />
                                                         </div>
                                                         <div class="col-lg-4">
-                                                            <label class="form-label" for="tartImage-@runner.Id">Image</label>
+                                                            <label class="form-label" for="tartImage-@runner.Id">Local VM name or OCI image</label>
                                                             <SmartAutocomplete Value="@tart.ImageName"
                                                                                ValueChanged="@(value => OnTartImageNameChangedAsync(tart, value))"
                                                                                Suggestions="@GetImageNameSuggestions(RegistryType.Tart)"
@@ -735,7 +736,7 @@
                                                                                AriaLabel="Tart image" />
                                                         </div>
                                                         <div class="col-lg-2">
-                                                            <label class="form-label" for="tartTag-@runner.Id">Tag</label>
+                                                            <label class="form-label" for="tartTag-@runner.Id">Tag (blank for local VM)</label>
                                                             <SmartAutocomplete Value="@tart.Tag"
                                                                                ValueChanged="value => tart.Tag = value ?? string.Empty"
                                                                                Suggestions="@GetImageTagSuggestions(RegistryType.Tart, tart.RegistryUrl, tart.ImageName, tart.Tag)"
@@ -1364,9 +1365,9 @@ else
             if (runner.ExecutionBackend == ExecutionBackend.Tart)
             {
                 var tart = EnsureTartConfig(runner);
-                if (string.IsNullOrWhiteSpace(tart.RegistryUrl) || string.IsNullOrWhiteSpace(tart.ImageName))
+                if (string.IsNullOrWhiteSpace(tart.ImageName))
                 {
-                    formError = $"Tart runner '{runner.Name}' needs an OCI registry and image name.";
+                    formError = $"Tart runner '{runner.Name}' needs an image name.";
                     return false;
                 }
             }
