@@ -205,9 +205,35 @@ Run `fastlane` directly (not `bundle exec`) so the image's locked bundle is used
 bundle includes `supply`, `pilot` and `deliver`. Meta's `ovr-platform-util` and Steam's `steamcmd.sh` are on `PATH`. The first `steamcmd.sh` run in a job self-updates
 from Valve's unpinned CDN; that update lives only in the job's container, never in the image.
 
+## Docker-host capacity: proposal, not implemented
+
+Every job's writes (`_work`, `/tmp`, Gradle copy-ups under `/opt/gradle-home`, the SDK fetch and `/opt/apple-sdk`) land
+in the container writable layer, which is on the Docker filesystem unless RunnerRunner's tmpfs `scratch` is set. Exited
+containers keep those bytes until RunnerRunner removes them. Every automatic removal path needs a healthy Server,
+Postgres and HostWorker connection. After a normally reported exit, the container stays at least 10 minutes. On Tower,
+Postgres reportedly shares that filesystem, which was reported full on 2026-10-28 (reported, not verified here).
+
+Proposed, for Clancey's decision (no RunnerRunner, daemon or target change is made here):
+
+- Reserve floor `R = max(30 GiB, 10%)` of the Docker filesystem, never budgeted. Admit a job only if
+  `free − reservations of admitted, not-yet-removed jobs − its reservation ≥ R`, per host, failing closed on a missing
+  or stale reading. A job reserves its budget if a writable-layer quota enforces it, and twice its budget otherwise.
+  Without a quota, admission cannot stop a runaway job from consuming `R`. Today's
+  `DynamicProvisioning:MinimumFreeDiskGb` is global, defaults to off and fails open.
+- Provisional budgets: 12 GiB per non-Apple job; 16 GiB per Apple job, which includes the 2 GiB SDK scratch above.
+  Replace them with measured peak × 1.5.
+- HostWorker removes exited managed containers itself, after persisting the exit record and bounded logs, keeping at
+  most one failed container per target for 24 h. This needs idempotent, acknowledged exit events.
+- Cap job writes with a per-container writable-layer quota, or move them to per-job scratch on a separate filesystem.
+  Relocate Postgres off the Docker filesystem.
+
+The full design, with thresholds, budgets and the decision tree, is in the session design document (§12), summarised in
+the Tower build packet.
+
 ## Building on Tower
 
-See the Tower build packet. Execution needs owner approval and an exclusive window: Home holds all runner admission;
+See the Tower build packet. Building needs owner approval **and** confirmed Docker-root headroom (at least the
+`build.sh` gate) after any user-approved cleanup. It also needs an exclusive window: Home holds all runner admission;
 no other CI, image/tag operations, builds, or pruning may run. Finish the isolated Cooking proof and its disk-peak
 measurement first. The following commands are templates, not permission to run:
 
