@@ -37,8 +37,9 @@ done <<EOF
 $(python3 "$UE/lib/lockctl.py" --lock "$UE/toolchain.lock.json" build-args)
 EOF
 grep -Eq -- "-t rr-universal-export:ue-tmp-ue-t1-[0-9]+ \.$" "$OUT" || fail "dry run does not build to the temporary tag ue-tmp-ue-t1-<pid>"
-grep -Eq -- "^! docker image inspect rr-universal-export:ue-t1 && docker tag rr-universal-export:ue-tmp-ue-t1-[0-9]+ rr-universal-export:ue-t1 && docker rmi rr-universal-export:ue-tmp-ue-t1-[0-9]+$" "$OUT" \
-  || fail "dry run does not move the temporary tag to rr-universal-export:ue-t1"
+grep -Eq -- "^! docker image inspect rr-universal-export:ue-t1 && docker tag rr-universal-export:ue-tmp-ue-t1-[0-9]+ rr-universal-export:ue-t1$" "$OUT" \
+  || fail "dry run does not tag the candidate while retaining the temporary tag"
+grep -qF "only after verified smoke and completed watchdog" "$OUT" || fail "temporary tag removal must wait for smoke"
 if ! grep -F -- "/opt/universal-export/receipt.json" "$OUT" | grep -qF "rr-universal-export:ue-t1 "; then
   fail "the receipt must come from the final tag"
 fi
@@ -90,6 +91,8 @@ cat > "$E2E/shim/docker" <<'EOF2'
 echo "docker $*" >> "$E2E_DOCKER_LOG"
 img() { printf '%s/%s' "$E2E_IMAGES" "$1"; }
 case $1 in
+  ps) exit 0 ;;
+  info) echo /fake/docker; exit 0 ;;
   build)
     prev=""
     for a in "$@"; do
@@ -131,11 +134,18 @@ exit 0
 EOF2
 printf '#!/bin/sh\nexit 0\n' > "$E2E/shim/rsync"
 chmod +x "$E2E/shim/ssh" "$E2E/shim/docker" "$E2E/shim/rsync"
-export E2E_REMOTE="$E2E/remote" E2E_SMOKED="$E2E/smoked" E2E_IMAGES="$E2E/images" E2E_DOCKER_LOG="$E2E/docker.log"
+for probe in realpath df timeout; do
+  cp "$HERE/build_probe_shim.py" "$E2E/shim/$probe"
+  chmod +x "$E2E/shim/$probe"
+done
+E2E_REMOTE="$(cd "$E2E" && pwd -P)/remote"
+export E2E_REMOTE E2E_SMOKED="$E2E/smoked" E2E_IMAGES="$E2E/images" E2E_DOCKER_LOG="$E2E/docker.log"
 e2e() { # want desc pack|nopack smoke_rc report [fail_clear [logs [race]]]
   local want=$1 desc=$2 rc=0 mode=--allow-no-apple-smoke pack=""
   [ "$3" = pack ] && { mode=--apple-pack-remote; pack=/mnt/x/apple-sdk.tar.zst; }
-  rm -rf "$E2E/ue/logs" "$E2E_SMOKED" "$E2E_IMAGES" "$E2E_DOCKER_LOG"
+  # Every case is a fresh, fully local fake host (failed smoke now retains
+  # UNKNOWN locks and tmp evidence; never clean up a real build this way).
+  rm -rf "$E2E/ue/logs" "$E2E/ue/.build-lock" "$E2E_REMOTE" "$E2E_SMOKED" "$E2E_IMAGES" "$E2E_DOCKER_LOG"
   mkdir -p "$E2E_IMAGES"
   (
     export PATH="$E2E/shim:$PATH" BUILD_PROJECTED_BYTES=0 BUILD_TIMEOUT_SECONDS=0 SMOKE_TIMEOUT_SECONDS=0

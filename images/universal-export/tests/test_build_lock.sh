@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR/..
 # shellcheck disable=SC2030,SC2031  # PATH shims are subshell-local on purpose
 # Mock tests for build-lock.sh: live contention, age-never-evidence,
 # death-established takeover, foreign-host and ownerless refusal, trap
@@ -273,8 +274,8 @@ echo "ok: kill -9 after remote submission leaves a marked, unacquirable lock"
 #     both locks (nothing was submitted). Runs a copy of the recipe tree
 #     against a shim PATH: ssh drops its options and host, refuses every
 #     marker write, accepts cas.sh, and executes everything else locally
-#     with the Tower root rewritten into the sandbox; rsync is a stub; disk
-#     admission and timeout(1) are disabled by env.
+#     with the Tower root rewritten into the sandbox; rsync, Docker, disk,
+#     realpath and timeout probes are all local shims (admission stays on).
 E2E="$TMP/e2e"; mkdir -p "$E2E/shim"
 cp -R "$UE" "$E2E/ue"
 safe_rm "$E2E/ue/tests"
@@ -297,7 +298,12 @@ exec bash -c "$cmd"
 EOF
 printf '#!/bin/sh\nexit 0\n' > "$E2E/shim/rsync"
 chmod +x "$E2E/shim/ssh" "$E2E/shim/rsync"
-export E2E_REMOTE="$E2E/remote"
+for probe in realpath df timeout docker; do
+  cp "$HERE/build_probe_shim.py" "$E2E/shim/$probe"
+  chmod +x "$E2E/shim/$probe"
+done
+E2E_REMOTE="$(cd "$E2E" && pwd -P)/remote"
+export E2E_REMOTE
 export E2E_SUBMITTED="$TMP/e2e-submitted"
 rm -f "$E2E_SUBMITTED"
 rc=0
