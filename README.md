@@ -564,6 +564,64 @@ In a rule's **runner target → Docker image** (or the legacy **Profiles → Doc
 Verify a live runner with `docker inspect <container> --format '{{json .HostConfig.Tmpfs}}'` and
 `stat -f -c %T /actions-runner/_work` inside it (expect `tmpfs`).
 
+### Host-owned Docker bind grants
+
+By default a Docker runner's checkout, build outputs and tool caches all land on the container's
+writable layer, which on Unraid lives inside the loopback `docker.img`. A **bind grant** lets the
+host administrator give one runner definition a real host directory instead. Grants live only in
+the HostWorker's own configuration (`HostWorker:Docker:BindGrants`); nothing in a rule, a workflow
+or a job can add, change or widen one, and a profile without a grant starts exactly as before.
+
+```json
+{
+  "HostWorker": {
+    "Docker": {
+      "BindGrants": [
+        {
+          "Id": "ao-work",
+          "ProfileId": "<runner definition id>",
+          "Source": "/mnt/cache_nvme/appdata/ascension-ci/work",
+          "Target": "/actions-runner/_work",
+          "PerRunner": true
+        },
+        {
+          "Id": "ao-gradle",
+          "ProfileId": "<runner definition id>",
+          "Source": "/mnt/cache_nvme/appdata/ascension-ci/gradle-home",
+          "Target": "/opt/gradle-home"
+        }
+      ]
+    }
+  }
+}
+```
+
+With environment variables the same grant is `HostWorker__Docker__BindGrants__0__Id`,
+`HostWorker__Docker__BindGrants__0__ProfileId`, and so on. The runner definition id is the
+`ProfileId` the server sends with every dispatch of that target (the rule editor shows it; it is
+also the `runnerDefinitions[].id` of the rule document).
+
+- `Source` is the directory as the **Docker daemon** sees it. The HostWorker must see the same path:
+  a containerized worker needs the grant's source (or a parent) bound into it at the identical path,
+  because the worker creates and deletes per-runner directories with ordinary filesystem calls.
+- `PerRunner: true` gives each runner its own empty `Source/<runner name>` (mode `1777`), created
+  before the container starts, emptied first if a crash left one behind, and deleted when the
+  container is stopped or cleaned up as an orphan. The directory is recorded on the container
+  (label `runnerrunner.bind-cleanup`) so the delete survives a worker restart, and only paths
+  directly inside a configured per-runner source are ever deleted. Discovery also sweeps per-runner
+  directories that no managed container owns and that have not been written to for ten minutes.
+- Without `PerRunner`, the directory is shared by every runner of that profile (a Gradle, NuGet or
+  pip home, for example). It is never created or deleted by RunnerRunner; a missing source fails the start.
+- `ReadOnly: true` mounts the directory read-only; it cannot be combined with `PerRunner`.
+- Mounts are typed `bind` mounts with `NonRecursive` and `rprivate` propagation. Sources under
+  system paths, Docker's own state, home directories or sockets, and targets under system paths,
+  `/tmp` or `/runnerrunner` are rejected; so is a target that overlaps the tmpfs scratch of the same target.
+- Grants require a Linux container image. An invalid grant is logged at startup and fails every start
+  of that profile rather than running the job on the container root.
+
+Verify a live runner with `docker inspect <container> --format '{{json .HostConfig.Mounts}}'` and
+`findmnt /actions-runner/_work` inside it.
+
 ## Environment Variable Composition
 
 Env vars are composed in layers (later layers win on key conflicts):
@@ -629,6 +687,7 @@ After composition, `$VAR` and `${VAR}` references are expanded so values can cha
 | `HostWorker:RestartCommand` | *(empty)* | Optional Unix command run by the self-update handoff script after files are copied |
 | `HostWorker:WindowsServiceName` | `RunnerRunnerHostWorker` | Windows service name used by the self-update handoff script |
 | `HostWorker:ContainerImage` | *(empty)* | Optional image reference reported by containerized HostWorkers so the Hosts page can show the currently configured container image |
+| `HostWorker:Docker:BindGrants` | *(empty)* | Host-owned bind mounts per runner definition; see [Host-owned Docker bind grants](#host-owned-docker-bind-grants) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | Optional OTLP endpoint for logs, metrics, and traces |
 | `Logging:Console:FormatterName` | `json` outside Development; compose bundles set `simple` | Console log format; set to `simple` for Docker/Dockhand-style text logs or `json` for stdout log shippers |
 | `Logging:Console:IncludeScopes` | `true` for JSON, `false` in compose bundles | Include activity/request scopes in console logs |

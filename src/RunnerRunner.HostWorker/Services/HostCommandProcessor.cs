@@ -86,9 +86,28 @@ internal sealed class HostCommandProcessor : BackgroundService
         _selfUpdater = selfUpdater;
         _resourceUsageCollector = resourceUsageCollector;
         _logger = logger;
-        _dockerBackend = dockerBackend ?? new DockerBackend(loggerFactory.CreateLogger<DockerBackend>());
+        _dockerBackend = dockerBackend ?? new DockerBackend(loggerFactory.CreateLogger<DockerBackend>(), ReadDockerHostOptions(configuration, logger));
         _tartBackend = tartBackend ?? new TartBackend(loggerFactory.CreateLogger<TartBackend>());
         _nativeBackend = nativeBackend ?? new NativeBackend(loggerFactory.CreateLogger<NativeBackend>());
+    }
+
+    /// <summary>
+    /// Host-owned Docker settings from <c>HostWorker:Docker</c>. Grants are validated at startup so
+    /// a typo shows up in the worker log immediately rather than at the next job start.
+    /// </summary>
+    internal static DockerHostOptions ReadDockerHostOptions(IConfiguration configuration, ILogger logger)
+    {
+        var options = configuration.GetSection("HostWorker:Docker").Get<DockerHostOptions>() ?? new DockerHostOptions();
+        foreach (var grant in options.BindGrants)
+        {
+            if (grant.GetValidationError() is { } error)
+                logger.LogError("Docker bind grant '{GrantId}' is invalid and will fail every start of profile {ProfileId}: {Error}",
+                    grant.Id, grant.ProfileId, error);
+            else
+                logger.LogInformation("Docker bind grant '{GrantId}': profile {ProfileId} mounts {Source}{PerRunner} at {Target}{ReadOnly}",
+                    grant.Id, grant.ProfileId, grant.Source, grant.PerRunner ? "/<runner>" : "", grant.Target, grant.ReadOnly ? " (read-only)" : "");
+        }
+        return options;
     }
 
     public ValueTask EnqueueAsync(HostWorkerMessage message, CancellationToken cancellationToken)

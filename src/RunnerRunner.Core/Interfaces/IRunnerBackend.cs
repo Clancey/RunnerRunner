@@ -33,6 +33,8 @@ public interface IRunnerBackend
 
 public class RunnerStartRequest
 {
+    /// <summary>Runner definition (profile) id the dispatch came from; host-side bind grants key on it.</summary>
+    public string ProfileId { get; set; } = "";
     public string InstanceId { get; set; } = "";
     public required string RunnerName { get; set; }
     public RunnerProvider Provider { get; set; }

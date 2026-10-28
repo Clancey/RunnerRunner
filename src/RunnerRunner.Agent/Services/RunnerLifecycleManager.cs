@@ -37,6 +37,7 @@ public class RunnerLifecycleManager
 
         var request = new RunnerStartRequest
         {
+            ProfileId = command.ProfileId,
             InstanceId = command.InstanceId,
             RunnerName = command.RunnerName,
             Provider = command.Provider,

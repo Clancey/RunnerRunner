@@ -21,24 +21,39 @@ public class DockerBackend : IRunnerBackend
     private readonly TimeSpan _availabilityCacheWindow = TimeSpan.FromSeconds(30);
     private DateTime _lastAvailabilityCheckUtc = DateTime.MinValue;
     private bool _cachedAvailability;
+    private readonly DockerHostOptions _hostOptions;
+    private readonly Services.MountSafeDirectoryDeleter _deleter;
+
+    /// <summary>Container label listing the per-runner host directories to delete with the container.</summary>
+    internal const string BindCleanupLabel = "runnerrunner.bind-cleanup";
+    private const char BindCleanupSeparator = ';';
+    private static readonly TimeSpan OrphanBindDirectoryAge = TimeSpan.FromMinutes(10);
 
     public ExecutionBackend BackendType => ExecutionBackend.Docker;
     public DockerClient GetClient() => _client;
 
-    public DockerBackend(ILogger<DockerBackend> logger)
+    public DockerBackend(ILogger<DockerBackend> logger) : this(logger, new DockerHostOptions())
+    {
+    }
+
+    public DockerBackend(ILogger<DockerBackend> logger, DockerHostOptions hostOptions)
     {
         _logger = logger;
         _hasDockerHint = HasDockerInstallHint();
         _endpoint = ResolveDockerEndpoint();
         _client = new DockerClientConfiguration(_endpoint).CreateClient();
+        _hostOptions = hostOptions;
+        _deleter = new Services.MountSafeDirectoryDeleter(logger);
     }
 
-    internal DockerBackend(ILogger<DockerBackend> logger, DockerClient client)
+    internal DockerBackend(ILogger<DockerBackend> logger, DockerClient client, DockerHostOptions? hostOptions = null)
     {
         _logger = logger;
         _client = client;
         _endpoint = client.Configuration.EndpointBaseUri;
         _hasDockerHint = true;
+        _hostOptions = hostOptions ?? new DockerHostOptions();
+        _deleter = new Services.MountSafeDirectoryDeleter(logger);
     }
 
     public async Task<bool> IsAvailableAsync(CancellationToken ct = default)
@@ -84,6 +99,18 @@ public class DockerBackend : IRunnerBackend
             }
         }
 
+        // Host-configured bind mounts for this runner definition. Resolved before any Docker
+        // request so a misconfigured grant fails the start without creating anything.
+        var binds = _hostOptions.Resolve(request);
+        if (scratch != null)
+        {
+            foreach (var bind in binds)
+            {
+                if (DockerBindGrant.Overlaps(bind.Target, scratch.WorkDirectory) || DockerBindGrant.Overlaps(bind.Target, "/tmp"))
+                    throw new InvalidOperationException($"Docker bind grant '{bind.Grant.Id}' targets '{bind.Target}', which overlaps the tmpfs scratch mounts.");
+            }
+        }
+
         var imageName = ImageReference.Build(config.RegistryUrl, config.ImageName, config.Tag);
         var repository = ImageReference.BuildRepository(config.RegistryUrl, config.ImageName);
 
@@ -108,15 +135,22 @@ public class DockerBackend : IRunnerBackend
         }
 
         ImageInspectResponse? scratchImage = null;
-        if (scratch != null)
+        if (scratch != null || binds.Count > 0)
         {
             // The container OS (not the worker's OS) decides whether Linux tmpfs applies.
             // Never infer the runner path from WorkingDir. The JIT wrapper discovers
             // run.sh and checks its real working directory before launching the runner.
             scratchImage = await _client.Images.InspectImageAsync(imageName, ct);
             if (!string.Equals(scratchImage.Os, "linux", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("Docker scratch requires a Linux container image.");
+                throw new InvalidOperationException(scratch != null
+                    ? "Docker scratch requires a Linux container image."
+                    : "Docker bind grants require a Linux container image.");
         }
+
+        // Per-runner host directories start empty, even after a crash left an old one behind.
+        var perRunnerDirectories = binds.Where(bind => bind.PerRunner).Select(bind => bind.Source).ToList();
+        foreach (var directory in perRunnerDirectories)
+            PreparePerRunnerDirectory(directory);
 
         // Build environment variables
         var envVars = request.EnvironmentVariables
@@ -202,6 +236,14 @@ public class DockerBackend : IRunnerBackend
                 // reconciliation and logs can distinguish "exited" from "never existed".
                 AutoRemove = false,
                 Binds = null,
+                Mounts = binds.Count == 0 ? null : binds.Select(bind => new Mount
+                {
+                    Type = "bind",
+                    Source = bind.Source,
+                    Target = bind.Target,
+                    ReadOnly = bind.ReadOnly,
+                    BindOptions = new BindOptions { NonRecursive = true, Propagation = "rprivate" }
+                }).ToList(),
                 Tmpfs = scratch == null ? null : new Dictionary<string, string>
                 {
                     [scratch.WorkDirectory] = $"rw,exec,nosuid,nodev,size={scratch.WorkSizeMb}m,mode=1777",
@@ -236,7 +278,22 @@ public class DockerBackend : IRunnerBackend
                 imageName, isWindowsContainer ? "Windows" : "Linux", request.InitSteps.Count);
         }
 
-        var createResponse = await _client.Containers.CreateContainerAsync(createParams, ct);
+        if (perRunnerDirectories.Count > 0)
+            createParams.Labels[BindCleanupLabel] = string.Join(BindCleanupSeparator, perRunnerDirectories);
+        if (binds.Count > 0)
+            _logger.LogInformation("Runner {RunnerName} mounts {Count} host bind grant(s): {Binds}",
+                request.RunnerName, binds.Count, string.Join(", ", binds.Select(bind => $"{bind.Source}:{bind.Target}{(bind.ReadOnly ? ":ro" : "")}")));
+
+        CreateContainerResponse createResponse;
+        try
+        {
+            createResponse = await _client.Containers.CreateContainerAsync(createParams, ct);
+        }
+        catch
+        {
+            DeleteBindDirectories(perRunnerDirectories);
+            throw;
+        }
 
         // Copy the job-started hook script into the container filesystem.
         // This avoids any dependency on host-side paths being visible to dockerd.
@@ -261,7 +318,25 @@ public class DockerBackend : IRunnerBackend
             }
         }
 
-        await _client.Containers.StartContainerAsync(createResponse.ID, null, ct);
+        try
+        {
+            await _client.Containers.StartContainerAsync(createResponse.ID, null, ct);
+        }
+        catch when (perRunnerDirectories.Count > 0)
+        {
+            try
+            {
+                using var cleanupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                await _client.Containers.RemoveContainerAsync(createResponse.ID,
+                    new ContainerRemoveParameters { Force = true }, cleanupTimeout.Token);
+            }
+            catch (Exception cleanupError)
+            {
+                _logger.LogError(cleanupError, "Failed to remove unstarted runner container {ContainerId}", createResponse.ID);
+            }
+            DeleteBindDirectories(perRunnerDirectories);
+            throw;
+        }
 
         _logger.LogInformation("Container {ContainerId} started for runner {RunnerName}",
             createResponse.ID[..12], request.RunnerName);
@@ -276,6 +351,7 @@ public class DockerBackend : IRunnerBackend
     public async Task StopRunnerAsync(string instanceHandle, CancellationToken ct = default)
     {
         _logger.LogInformation("Stopping container {ContainerId}", instanceHandle[..12]);
+        var bindDirectories = await ReadBindCleanupDirectoriesAsync(instanceHandle, ct);
 
         // Send SIGTERM first for graceful runner deregistration
         await _client.Containers.StopContainerAsync(instanceHandle,
@@ -290,6 +366,107 @@ public class DockerBackend : IRunnerBackend
         catch (DockerContainerNotFoundException)
         {
             // Already removed (auto-remove was on)
+        }
+
+        DeleteBindDirectories(bindDirectories);
+    }
+
+    /// <summary>
+    /// Per-runner bind directories recorded on the container at creation. Only directories that a
+    /// currently configured per-runner grant owns are deleted later, so a tampered label cannot steer deletes.
+    /// </summary>
+    private async Task<List<string>> ReadBindCleanupDirectoriesAsync(string containerId, CancellationToken ct)
+    {
+        if (!_hostOptions.BindGrants.Any(grant => grant.PerRunner))
+            return [];
+        try
+        {
+            var inspect = await _client.Containers.InspectContainerAsync(containerId, ct);
+            if (inspect.Config?.Labels is not { } labels || !labels.TryGetValue(BindCleanupLabel, out var value))
+                return [];
+            return value.Split(BindCleanupSeparator, StringSplitOptions.RemoveEmptyEntries).ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not read bind cleanup label from container {ContainerId}", containerId);
+            return [];
+        }
+    }
+
+    /// <summary>The per-runner grant whose source directly contains <paramref name="path"/>, if any.</summary>
+    private DockerBindGrant? OwningPerRunnerGrant(string path)
+    {
+        if (!DockerBindGrant.IsCanonicalPath(path))
+            return null;
+        var slash = path.LastIndexOf('/');
+        var parent = path[..slash];
+        var leaf = path[(slash + 1)..];
+        if (!DockerBindGrant.IsSafeDirectoryName(leaf))
+            return null;
+        return _hostOptions.BindGrants.FirstOrDefault(grant => grant.PerRunner && grant.Source == parent && grant.GetValidationError() == null);
+    }
+
+    private void PreparePerRunnerDirectory(string directory)
+    {
+        if (OwningPerRunnerGrant(directory) == null)
+            throw new InvalidOperationException($"Refusing to prepare '{directory}': it is not inside a per-runner bind grant.");
+        var parent = Path.GetDirectoryName(directory)!;
+        if (!Directory.Exists(parent))
+            throw new InvalidOperationException($"Docker bind grant source '{parent}' does not exist on this HostWorker. Bind it into the worker at the same path as the daemon sees it.");
+        if (Directory.Exists(directory) || File.Exists(directory))
+        {
+            _logger.LogWarning("Removing stale per-runner directory {Directory} before reuse", directory);
+            _deleter.DeleteOrThrow(directory);
+        }
+        Directory.CreateDirectory(directory);
+        if (!OperatingSystem.IsWindows())
+        {
+            // World-writable with the sticky bit, like the tmpfs scratch, so images that run the
+            // runner as a non-root user can still write their work directory.
+            File.SetUnixFileMode(directory, (UnixFileMode)0x1FF | UnixFileMode.StickyBit);
+        }
+    }
+
+    private void DeleteBindDirectories(IReadOnlyList<string> directories)
+    {
+        foreach (var directory in directories)
+        {
+            if (OwningPerRunnerGrant(directory) == null)
+            {
+                _logger.LogWarning("Not deleting {Directory}: it is not inside a configured per-runner bind grant", directory);
+                continue;
+            }
+            if (!Directory.Exists(directory))
+                continue;
+            var result = _deleter.Delete(directory);
+            if (result.Completed)
+                _logger.LogInformation("Deleted per-runner bind directory {Directory}", directory);
+            else
+                _logger.LogWarning("Per-runner bind directory {Directory} was not fully deleted: {Details}", directory, result.Describe());
+        }
+    }
+
+    /// <summary>
+    /// Deletes per-runner bind directories whose container no longer exists. Runs with the container
+    /// list from discovery; directories written to within the last ten minutes are left alone because their
+    /// container may still be in the middle of creation.
+    /// </summary>
+    internal void SweepOrphanBindDirectories(IReadOnlyCollection<string> liveRunnerNames)
+    {
+        foreach (var grant in _hostOptions.BindGrants.Where(grant => grant.PerRunner && grant.GetValidationError() == null))
+        {
+            if (!Directory.Exists(grant.Source))
+                continue;
+            foreach (var directory in Directory.EnumerateDirectories(grant.Source))
+            {
+                var name = Path.GetFileName(directory);
+                if (liveRunnerNames.Contains(name) || !DockerBindGrant.IsSafeDirectoryName(name))
+                    continue;
+                if (DateTime.UtcNow - Directory.GetLastWriteTimeUtc(directory) < OrphanBindDirectoryAge)
+                    continue;
+                _logger.LogInformation("Sweeping orphaned per-runner bind directory {Directory} (grant {GrantId})", directory, grant.Id);
+                DeleteBindDirectories([directory]);
+            }
         }
     }
 
@@ -352,6 +529,18 @@ public class DockerBackend : IRunnerBackend
             }
         }, ct);
 
+        try
+        {
+            SweepOrphanBindDirectories(containers
+                .Select(container => container.Labels.TryGetValue("runnerrunner.runner-name", out var name) ? name : "")
+                .Where(name => name.Length > 0)
+                .ToHashSet(StringComparer.Ordinal));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to sweep orphaned per-runner bind directories");
+        }
+
         foreach (var container in containers)
         {
             container.Labels.TryGetValue("runnerrunner.instance-id", out var instanceId);
@@ -374,8 +563,10 @@ public class DockerBackend : IRunnerBackend
     public async Task CleanupOrphanContainerAsync(string containerId, CancellationToken ct = default)
     {
         _logger.LogInformation("Cleaning up orphaned container {Id}", containerId[..Math.Min(12, containerId.Length)]);
+        var bindDirectories = await ReadBindCleanupDirectoriesAsync(containerId, ct);
         try { await _client.Containers.StopContainerAsync(containerId, new ContainerStopParameters { WaitBeforeKillSeconds = 10 }, ct); } catch { }
         try { await _client.Containers.RemoveContainerAsync(containerId, new ContainerRemoveParameters { Force = true }, ct); } catch { }
+        DeleteBindDirectories(bindDirectories);
     }
 
     private async Task<bool> ImageExistsAsync(string imageName, CancellationToken ct)
