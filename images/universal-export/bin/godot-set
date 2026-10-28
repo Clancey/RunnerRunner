@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""godot-set: select and verify the Godot builds baked into the universal export image.
+
+  godot-set list [--ids]
+  godot-set env <set|default>          # eval "$(godot-set env fork-c064)"
+  godot-set github-env <set|default>   # appends to $GITHUB_ENV / $GITHUB_PATH
+  godot-set verify <set|default>|--all [--no-exec]
+  godot-set exec <set|default> -- cmd [args...]
+
+Pins come only from the lock next to this script (<bin>/../toolchain.lock.json);
+set.json is a build-time index that is re-checked against the lock and the disk.
+Exit codes: 0 ok, 1 verification/missing set, 2 usage or unknown set.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+UE = Path(os.path.realpath(__file__)).parent.parent
+LOCK = UE / "toolchain.lock.json"
+sys.path.insert(0, str(UE / "lib"))
+from lockctl import sha256_file  # noqa: E402
+
+FORK_VARS = ("GODOT_FORK", "VISIONOS_GODOT", "VISIONOS_TEMPLATE")
+
+
+class Usage(Exception):
+    pass
+
+
+class Broken(Exception):
+    pass
+
+
+def sets_root() -> Path:
+    return Path(os.environ.get("GODOT_SETS_ROOT") or "/opt/godot/sets")
+
+
+def lock_sets() -> dict:
+    return json.loads(LOCK.read_text())["godot_sets"]
+
+
+def resolve(sid: str, sets: dict) -> str:
+    if sid == "default":
+        return next(k for k, v in sets.items() if v.get("default"))
+    if sid not in sets:
+        raise Usage(f"unknown Godot set {sid!r} (known: {', '.join(sets)})")
+    return sid
+
+
+def load_set(sid: str) -> dict:
+    p = sets_root() / sid / "set.json"
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        raise Broken(f"{sid}: cannot read {p}: {exc}") from None
+    if d.get("schema") != 1 or d.get("id") != sid:
+        raise Broken(f"{sid}: {p} has schema {d.get('schema')} id {d.get('id')!r}")
+    return d
+
+
+def env_pairs(d: dict) -> list[tuple[str, str]]:
+    pairs = [
+        ("GODOT", d["editor"]["path"]),
+        ("GODOT_SET", d["id"]),
+        ("GODOT_SET_VERSION", d["version"]),
+        ("GODOT_SET_COMMIT", d["commit"]),
+        ("XDG_DATA_HOME", d["data_dir"]),
+        ("GODOT_TEMPLATES_DIR", d["templates"]["dir"]),
+        ("GODOT_ANDROID_KEYSTORE_DEBUG_PATH", d["keystore"]["path"]),
+    ]
+    if d.get("visionos"):
+        pairs += [("GODOT_FORK", d["editor"]["path"]), ("VISIONOS_GODOT", d["editor"]["path"]),
+                  ("VISIONOS_TEMPLATE", d["visionos"]["path"])]
+    return pairs
+
+
+def verify(sid: str, pin: dict, run_editor: bool) -> list[str]:
+    try:
+        d = load_set(sid)
+    except Broken as exc:
+        return [str(exc)]
+    errs: list[str] = []
+    e = errs.append
+    for key in ("version", "version_regex", "commit"):
+        if d.get(key) != pin.get(key):
+            e(f"{key} in set.json ({d.get(key)!r}) differs from the lock ({pin.get(key)!r})")
+    editor = Path(d["editor"]["path"])
+    if d["editor"]["sha256"] != pin["editor"]["sha256"]:
+        e("editor sha256 in set.json differs from the lock pin")
+    if not editor.is_file():
+        e(f"editor {editor} missing")
+    else:
+        got = sha256_file(editor)
+        if got != pin["editor"]["sha256"] or editor.stat().st_size != pin["editor"]["size"]:
+            e(f"editor {editor} sha256 {got} does not match the lock pin")
+        if not os.access(editor, os.X_OK):
+            e(f"editor {editor} is not executable")
+
+    tdir = Path(d["templates"]["dir"])
+    want = d["templates"]["files"]
+    for req in pin["templates"]["required"]:
+        if req not in want:
+            e(f"required template {req} missing from set.json")
+    have = {}
+    if tdir.is_dir():
+        for dp, _, names in os.walk(tdir):
+            for n in names:
+                f = Path(dp) / n
+                have[f.relative_to(tdir).as_posix()] = f
+    else:
+        e(f"templates dir {tdir} missing")
+    for rel in sorted(set(have) - set(want)):
+        e(f"unexpected template file {rel} in {tdir}")
+    for rel, digest in sorted(want.items()):
+        if rel not in have:
+            e(f"template {rel} missing from {tdir}")
+        elif sha256_file(have[rel]) != digest:
+            e(f"template {rel} sha256 differs from set.json")
+    vt = tdir / "version.txt"
+    if vt.is_file() and vt.read_text().strip() != pin["version"]:
+        e(f"templates version.txt is {vt.read_text().strip()!r}, lock says {pin['version']!r}")
+
+    pv = pin.get("visionos")
+    if bool(pv) != bool(d.get("visionos")):
+        e("visionos presence in set.json differs from the lock")
+    elif pv:
+        vp = Path(d["visionos"]["path"])
+        if d["visionos"]["sha256"] != pv["sha256"] or not vp.is_file() or sha256_file(vp) != pv["sha256"]:
+            e(f"visionos template {vp} does not match the lock pin")
+        elif not same_inode(vp, tdir / pv["template"]):
+            e(f"visionos {vp} is not the same inode as templates/{pv['template']}")
+
+    ks = Path(d["keystore"]["path"])
+    if not ks.is_file() or sha256_file(ks) != d["keystore"]["sha256"]:
+        e(f"debug keystore {ks} differs from set.json")
+
+    leg = pin.get("legacy", {})
+    for p in leg.get("editor", []):
+        if not same_inode(Path(p), editor):
+            e(f"legacy editor {p} is not the same inode as {editor}")
+    for p in leg.get("visionos", []):
+        if pv and not same_inode(Path(p), Path(d["visionos"]["path"])):
+            e(f"legacy visionos {p} is not the same inode as the set's visionos.zip")
+    for p in leg.get("templates", []):
+        lp = Path(p)
+        names = {f.relative_to(lp).as_posix() for f in lp.rglob("*") if not f.is_dir()} if lp.is_dir() else set()
+        if not lp.is_dir():
+            e(f"legacy templates dir {lp} missing")
+        for rel in sorted(names - set(have)):
+            e(f"legacy templates dir {lp} has extra file {rel}")
+        for rel in sorted(set(have)):
+            if not same_inode(lp / rel, have[rel]):
+                e(f"legacy template {lp / rel} is not the same inode as the set's {rel}")
+
+    if run_editor and not errs:
+        env = {**os.environ, **dict(env_pairs(d)), "HOME": os.environ.get("HOME", "/root")}
+        try:
+            p = subprocess.run([str(editor), "--headless", "--version"], capture_output=True, text=True,
+                               timeout=120, env=env, stdin=subprocess.DEVNULL)
+            out = p.stdout.strip().splitlines()
+            line = out[-1].strip() if out else ""
+            if p.returncode != 0 or not re.match(pin["version_regex"], line):
+                e(f"editor --version printed {line!r} (rc {p.returncode}); expected /{pin['version_regex']}/")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            e(f"editor --version failed: {exc}")
+    return errs
+
+
+def same_inode(a: Path, b: Path) -> bool:
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    sets = lock_sets()
+    if cmd == "list":
+        for sid, s in sets.items():
+            if rest == ["--ids"]:
+                print(sid)
+            else:
+                print(f"{sid}\t{s['version']}\t{'default' if s.get('default') else '-'}\t{sets_root() / sid}")
+        return 0
+    if cmd == "verify":
+        run_editor = "--no-exec" not in rest
+        targets = [a for a in rest if a != "--no-exec"]
+        if len(targets) != 1:
+            raise Usage("verify needs exactly one set id or --all")
+        errs: list[str] = []
+        if targets[0] == "--all":
+            chosen = list(sets)
+            root = sets_root()
+            if root.is_dir():
+                for extra in sorted(p.name for p in root.iterdir() if p.name not in sets):
+                    errs.append(f"{root / extra} is not a set pinned in the lock")
+        else:
+            chosen = [resolve(targets[0], sets)]
+        for sid in chosen:
+            set_errs = verify(sid, sets[sid], run_editor)
+            errs += [f"{sid}: {x}" for x in set_errs]
+            if not set_errs:
+                print(f"OK {sid} {sets[sid]['version']}")
+        for x in errs:
+            print(f"godot-set: {x}", file=sys.stderr)
+        return 1 if errs else 0
+    if cmd in ("env", "github-env", "exec"):
+        if not rest:
+            raise Usage(f"{cmd} needs a set id")
+        sid = resolve(rest[0], sets)
+        if cmd == "exec":
+            if rest[1:2] != ["--"] or len(rest) < 3:
+                raise Usage("usage: godot-set exec <set> -- cmd [args...]")
+        elif len(rest) != 1:
+            raise Usage(f"usage: godot-set {cmd} <set>")
+        d = load_set(sid)
+        pairs = env_pairs(d)
+        if cmd == "env":
+            for k, v in pairs:
+                print(f"export {k}={shlex.quote(v)}")
+            print(f"export PATH={shlex.quote(d['root'])}\"${{PATH:+:$PATH}}\"")
+            return 0
+        if cmd == "github-env":
+            ge, gp = os.environ.get("GITHUB_ENV"), os.environ.get("GITHUB_PATH")
+            if not ge or not gp:
+                raise Usage("github-env needs GITHUB_ENV and GITHUB_PATH (run it inside a workflow step)")
+            if any("\n" in v for _, v in pairs):
+                raise Broken("refusing to write a multi-line value to GITHUB_ENV")
+            with open(ge, "a") as f:
+                f.writelines(f"{k}={v}\n" for k, v in pairs)
+            with open(gp, "a") as f:
+                f.write(d["root"] + "\n")
+            return 0
+        env = {**os.environ, **dict(pairs)}
+        env["PATH"] = d["root"] + (":" + env["PATH"] if env.get("PATH") else "")
+        cmdv = rest[2:]
+        try:
+            os.execvpe(cmdv[0], cmdv, env)
+        except OSError as exc:
+            print(f"godot-set: cannot exec {cmdv[0]}: {exc}", file=sys.stderr)
+            return 127
+    raise Usage(f"unknown command {cmd!r}")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Usage as exc:
+        print(f"godot-set: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except Broken as exc:
+        print(f"godot-set: {exc}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,82 @@
+#!/bin/bash
+# Evidence of what an Apple build in this container can reach. Run inside the
+# job container (normally with --network none for the Apple stage):
+#   isolation-check            full report (exit 1 on a bad SDK state, a
+#                              reachable network, or a forbidden executable)
+#   isolation-check sdk-state  just the Apple SDK state (exit 1 on a bad state)
+# Apple Mach-O executables cannot run here, so every tool must be an ELF (or
+# script) from the image, never from the SDK.
+set -uo pipefail
+
+APPLE_SDK=${APPLE_SDK:-/opt/apple-sdk}
+IC_MOUNTINFO=${IC_MOUNTINFO:-/proc/self/mountinfo}
+IC_SDK_ADMIT=${IC_SDK_ADMIT:-/opt/universal-export/bin/apple-sdk-admit}
+
+# Jobs run as root, where a write probe always succeeds, so the SDK state comes
+# from mountinfo (bind-mounted pack tree) or the admission sidecar written by
+# apple-sdk-admit (unpacked copy, made read-only; re-verified here).
+sdk_state() {
+  local opts sidecar build
+  sidecar="$(dirname "$APPLE_SDK")/.$(basename "$APPLE_SDK")-admission.json"
+  opts=$(awk -v mp="$APPLE_SDK" '$5 == mp {o = $6} END {print o}' "$IC_MOUNTINFO" 2>/dev/null)
+  if [ -n "$opts" ]; then
+    case ",$opts," in
+      *,ro,*) echo "apple-sdk: mounted read-only (ok)"; return 0 ;;
+      *) echo "apple-sdk: mounted WRITABLE (fail)"; return 1 ;;
+    esac
+  fi
+  if [ -f "$sidecar" ]; then
+    if [ -L "$APPLE_SDK" ] || [ ! -d "$APPLE_SDK" ]; then
+      echo "apple-sdk: admission record without an admitted tree (fail)"; return 1
+    fi
+    build=$(python3 -c 'import json, sys
+b = json.load(open(sys.argv[1])).get("build")
+print(b if isinstance(b, str) else "")' "$sidecar" 2>/dev/null)
+    if [ -z "$build" ]; then
+      echo "apple-sdk: unreadable admission record (fail)"; return 1
+    fi
+    if "$IC_SDK_ADMIT" verify --build "$build" --dest "$APPLE_SDK" >&2; then
+      echo "apple-sdk: admitted copy of $build (verified)"; return 0
+    fi
+    echo "apple-sdk: admitted copy of $build FAILS verification (fail)"; return 1
+  fi
+  if [ -e "$APPLE_SDK" ]; then
+    echo "apple-sdk: present but neither mounted nor admitted (fail)"; return 1
+  fi
+  echo "apple-sdk: absent"
+}
+
+if [ "${1:-}" = sdk-state ]; then
+  sdk_state
+  exit $?
+fi
+
+rc=0
+echo "## uname"; uname -srm
+echo "## mounts (non-proc/sys/dev)"
+awk '$5 !~ "^/(proc|sys|dev)" {print $5, $6, $9, $4}' "$IC_MOUNTINFO" | sort
+echo "## apple sdk"
+sdk_state || rc=1
+echo "## network interfaces"; ls /sys/class/net
+echo "## outbound network probe"
+if timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo "REACHABLE (fail)"; rc=1; else echo "unreachable"; fi
+echo "## binfmt_misc handlers"
+find /proc/sys/fs/binfmt_misc -mindepth 1 -maxdepth 1 ! -name register ! -name status -printf '%f\n' 2>/dev/null | grep . || echo "(none visible)"
+echo "## ELF executables inside the SDK (expect 0)"
+elf=$(find "$APPLE_SDK" -type f -perm -u+x -print0 2>/dev/null | xargs -0 file -b /dev/null | grep -c '^ELF')
+echo "${elf:-0}"
+if [ "${elf:-0}" != 0 ]; then echo "FORBIDDEN: ELF executables inside the SDK (fail)"; rc=1; fi
+sdk_real=$(readlink -f "$APPLE_SDK" 2>/dev/null || echo "$APPLE_SDK")
+in_sdk() { case "$1" in "$APPLE_SDK"/*|"$sdk_real"/*) return 0 ;; esac; return 1; }
+echo "## tools invoked by the build"
+for t in xcrun swiftc swift-frontend clang clang++ llvm-strip llvm-objcopy rcodesign apple-bundle-util python3; do
+  p=$(command -v "$t" || echo MISSING); r=$(readlink -f "$p" 2>/dev/null || echo "$p")
+  printf '%-18s %s -> %s: %s\n' "$t" "$p" "$r" "$(file -b "$r" | cut -c1-60)"
+  if in_sdk "$p" || in_sdk "$r"; then echo "FORBIDDEN: $t resolves into the SDK (fail)"; rc=1; fi
+done
+for t in ld dsymutil libtool; do
+  p=$(xcrun -f "$t"); r=$(readlink -f "$p" 2>/dev/null || echo "$p")
+  printf 'xcrun -f %-9s %s: %s\n' "$t" "$p" "$(file -b "$p" | cut -c1-60)"
+  if in_sdk "$p" || in_sdk "$r"; then echo "FORBIDDEN: xcrun -f $t resolves into the SDK (fail)"; rc=1; fi
+done
+exit "$rc"

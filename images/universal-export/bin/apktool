@@ -1,0 +1,3 @@
+#!/bin/sh
+# apktool from the pinned jar (toolchain.lock.json inputs.apktool).
+exec java -jar /opt/apktool.jar "$@"

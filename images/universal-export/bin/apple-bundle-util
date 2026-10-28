@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Bundle steps Xcode does with builtin tools, for the linux-apple-toolchain image.
+
+  apple-bundle-util info-plist --sdk xros --src Info.plist --out App.app/Info.plist \
+      [--pkginfo App.app/PkgInfo] [--setting KEY=VALUE ...] [--merge partial.plist ...] \
+      --min-os 26.0 --device-family 7 [--format binary|xml]
+  apple-bundle-util strings --src en.lproj/InfoPlist.strings --out App.app/en.lproj/InfoPlist.strings
+
+info-plist mirrors ProcessInfoPlistFile (builtin-infoPlistUtility -expandbuildsettings
+-format binary -additionalcontentfile ...): expands $(VAR) / ${VAR[:modifier]}, merges the
+actool partial plist, adds the DT*/platform keys Xcode adds from the SDK and Xcode version,
+drops an empty CFBundleSignature, and writes PkgInfo. BuildMachineOSBuild is the macOS build
+of the Mac that packed the SDK bundle (apple-sdk.info), unless --build-machine-os-build is given.
+"""
+import argparse, json, os, plistlib, re, sys
+
+APPLE_SDK = os.environ.get("APPLE_SDK", "/opt/apple-sdk")
+PLATFORMS = {"xros": "XROS", "xrsimulator": "XRSimulator",
+             "iphoneos": "iPhoneOS", "iphonesimulator": "iPhoneSimulator"}
+
+
+def sdk_path(name):
+    if "/" in name:
+        return name
+    base = re.sub(r"[0-9.]+$", "", name)
+    if base not in PLATFORMS:
+        sys.exit(f"apple-bundle-util: unsupported SDK {name}")
+    p = PLATFORMS[base]
+    return f"{APPLE_SDK}/Developer/Platforms/{p}.platform/Developer/SDKs/{p}.sdk"
+
+
+def bundle_info():
+    info = {}
+    try:
+        for line in open(f"{APPLE_SDK}/apple-sdk.info"):
+            k, _, v = line.strip().partition("=")
+            info[k] = v
+    except FileNotFoundError:
+        pass
+    return info
+
+
+def dt_xcode(short_version):
+    parts = [int(x) for x in short_version.split(".")] + [0, 0]
+    return f"{parts[0]:02d}{parts[1]}{parts[2]}"
+
+
+MODIFIERS = {
+    "rfc1034identifier": lambda s: re.sub(r"[^A-Za-z0-9.-]", "-", s),
+    "c99extidentifier": lambda s: re.sub(r"[^A-Za-z0-9_]", "_", s),
+    "identifier": lambda s: re.sub(r"[^A-Za-z0-9_]", "_", s),
+    "lower": str.lower,
+    "upper": str.upper,
+}
+VAR = re.compile(r"\$(?:\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z0-9_,]+))?\)|\{([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z0-9_,]+))?\})")
+
+
+def expand(value, settings, depth=0):
+    if isinstance(value, str):
+        def sub(m):
+            name = m.group(1) or m.group(3)
+            mods = m.group(2) or m.group(4)
+            v = expand(settings.get(name, ""), settings, depth + 1) if depth < 16 else ""
+            for mod in (mods.split(",") if mods else []):
+                v = MODIFIERS.get(mod, lambda s: s)(v)
+            return v
+        return VAR.sub(sub, value)
+    if isinstance(value, dict):
+        return {expand(k, settings, depth): expand(v, settings, depth) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand(v, settings, depth) for v in value]
+    return value
+
+
+def merge(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            merge(dst[k], v)
+        else:
+            dst[k] = v
+
+
+def cmd_info_plist(a):
+    sdk = sdk_path(a.sdk)
+    settings_json = json.load(open(f"{sdk}/SDKSettings.json"))
+    sysver = plistlib.load(open(f"{sdk}/System/Library/CoreServices/SystemVersion.plist", "rb"))
+    xcode = plistlib.load(open(f"{APPLE_SDK}/version.plist", "rb"))
+    info = bundle_info()
+    platform_dir = os.path.basename(os.path.realpath(f"{sdk}/../../..")).removesuffix(".platform")
+    platform_name = settings_json["DefaultProperties"]["PLATFORM_NAME"]
+
+    settings = dict(kv.split("=", 1) for kv in a.setting)
+    settings.setdefault("EXECUTABLE_NAME", settings.get("PRODUCT_NAME", ""))
+    plist = expand(plistlib.load(open(a.src, "rb")), settings)
+    for extra in a.merge:
+        merge(plist, plistlib.load(open(extra, "rb")))
+    if plist.get("CFBundleSignature") == "":
+        del plist["CFBundleSignature"]
+
+    bmob = a.build_machine_os_build or info.get("BUILD_MACHINE_OS_BUILD")
+    if bmob:
+        plist["BuildMachineOSBuild"] = bmob
+    plist["CFBundleSupportedPlatforms"] = [platform_dir]
+    plist["DTCompiler"] = "com.apple.compilers.llvm.clang.1_0"
+    plist["DTPlatformBuild"] = sysver["ProductBuildVersion"]
+    plist["DTPlatformName"] = platform_name
+    plist["DTPlatformVersion"] = settings_json["Version"]
+    plist["DTSDKBuild"] = sysver["ProductBuildVersion"]
+    plist["DTSDKName"] = settings_json["CanonicalName"]
+    plist["DTXcode"] = dt_xcode(xcode["CFBundleShortVersionString"])
+    plist["DTXcodeBuild"] = xcode["ProductBuildVersion"]
+    plist["MinimumOSVersion"] = a.min_os
+    plist["UIDeviceFamily"] = [int(x) for x in a.device_family.split(",")]
+
+    fmt = plistlib.FMT_BINARY if a.format == "binary" else plistlib.FMT_XML
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    with open(a.out, "wb") as f:
+        plistlib.dump(plist, f, fmt=fmt, sort_keys=True)
+    if a.pkginfo:
+        with open(a.pkginfo, "w") as f:
+            f.write(plist.get("CFBundlePackageType", "APPL") + plist.get("CFBundleSignature", "????"))
+
+
+def parse_strings(text):
+    """Old-style .strings ("key" = "value"; with comments) to a dict."""
+    out, i, n, toks = {}, 0, len(text), []
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                raise ValueError("unterminated comment")
+            i = j + 2
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif c in "=;":
+            toks.append(c); i += 1
+        elif c == '"':
+            i += 1; s = []
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    i += 1; e = text[i]
+                    if e in "Uu":
+                        s.append(chr(int(text[i + 1:i + 5], 16))); i += 5; continue
+                    s.append({"n": "\n", "t": "\t", "r": "\r", "0": "\0"}.get(e, e))
+                else:
+                    s.append(text[i])
+                i += 1
+            if i >= n:
+                raise ValueError("unterminated string")
+            toks.append(("s", "".join(s))); i += 1
+        else:
+            m = re.match(r"[A-Za-z0-9_.$:/-]+", text[i:])
+            if not m:
+                raise ValueError(f"unexpected character {c!r} at offset {i}")
+            toks.append(("s", m.group(0))); i += m.end()
+    j = 0
+    while j < len(toks):
+        if not (isinstance(toks[j], tuple) and j + 1 < len(toks)):
+            raise ValueError("expected key")
+        if toks[j + 1] == ";":
+            out[toks[j][1]] = toks[j][1]; j += 2; continue
+        if toks[j + 1] != "=" or not isinstance(toks[j + 2], tuple) or toks[j + 3] != ";":
+            raise ValueError("expected \"key\" = \"value\";")
+        out[toks[j][1]] = toks[j + 2][1]; j += 4
+    return out
+
+
+def cmd_strings(a):
+    raw = open(a.src, "rb").read()
+    if raw.startswith(b"bplist"):
+        data = plistlib.loads(raw)
+    else:
+        enc = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+        data = parse_strings(raw.decode(enc))
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    with open(a.out, "wb") as f:
+        plistlib.dump(data, f, fmt=plistlib.FMT_BINARY, sort_keys=True)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="apple-bundle-util")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    ip = sub.add_parser("info-plist")
+    ip.add_argument("--sdk", required=True)
+    ip.add_argument("--src", required=True)
+    ip.add_argument("--out", required=True)
+    ip.add_argument("--pkginfo")
+    ip.add_argument("--setting", action="append", default=[])
+    ip.add_argument("--merge", action="append", default=[])
+    ip.add_argument("--min-os", required=True)
+    ip.add_argument("--device-family", required=True)
+    ip.add_argument("--build-machine-os-build")
+    ip.add_argument("--format", choices=["binary", "xml"], default="binary")
+    sp = sub.add_parser("strings")
+    sp.add_argument("--src", required=True)
+    sp.add_argument("--out", required=True)
+    a = p.parse_args()
+    {"info-plist": cmd_info_plist, "strings": cmd_strings}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

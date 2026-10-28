@@ -1,0 +1,14 @@
+#!/bin/sh
+# fastlane from the image's locked bundle (ruby/Gemfile.lock). The Gemfile is
+# pinned here so a game's own Gemfile can't swap the gems used for store
+# uploads. Run `fastlane` (not `bundle exec fastlane`) in game workflows.
+set -eu
+# Fixed path: a job's UE_HOME must not be able to point the wrapper at another bundle.
+UE_HOME=/opt/universal-export
+export BUNDLE_GEMFILE="$UE_HOME/ruby/Gemfile"
+export BUNDLE_PATH="$UE_HOME/ruby/vendor"
+export BUNDLE_DEPLOYMENT=true
+export BUNDLE_FROZEN=true
+export FASTLANE_SKIP_UPDATE_CHECK="${FASTLANE_SKIP_UPDATE_CHECK:-1}"
+export FASTLANE_OPT_OUT_USAGE="${FASTLANE_OPT_OUT_USAGE:-YES}"
+exec bundle exec fastlane "$@"

@@ -1,0 +1,8 @@
+/logs/
+/.build-lock/
+/.plan.tsv
+/inputs/
+__pycache__/
+*.pyc
+/ruby/vendor/
+/ruby/.bundle/

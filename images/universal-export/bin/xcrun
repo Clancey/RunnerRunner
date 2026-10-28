@@ -1,0 +1,138 @@
+#!/bin/bash
+# shellcheck disable=SC1007,SC2209  # vendored from LogicLand: 'x= y=' empty assignments and string values like action=find are intended
+# xcrun stand-in for the linux-apple-toolchain image.
+#
+#   xcrun --sdk <xros|xrsimulator|iphoneos|iphonesimulator|path> <tool> [args]
+#   xcrun --sdk <sdk> --show-sdk-path|--show-sdk-version|--show-sdk-build-version
+#         |--show-sdk-platform-path|--show-sdk-platform-version
+#   xcrun --find <tool>
+#
+# Tools: swiftc, clang, clang++, cc, c++, ld, libtool, dsymutil, ar, ranlib,
+# nm, objdump, otool, strip, objcopy. The SDK bundle must be mounted at
+# $APPLE_SDK (default /opt/apple-sdk). actool, ibtool and lipo do not exist on
+# Linux and fail with a clear message.
+set -euo pipefail
+A=${APPLE_SDK:-/opt/apple-sdk}
+SR=/opt/linux-apple/swift-resource
+CR=/opt/linux-apple/clang-resource
+DT=/opt/darwin-tools/bin
+die() { echo "xcrun (linux-apple): $*" >&2; exit 64; }
+
+sdk=${SDKROOT:-}
+action=run
+while [ $# -gt 0 ]; do
+  case $1 in
+    --sdk|-sdk) sdk=$2; shift 2 ;;
+    --sdk=*) sdk=${1#*=}; shift ;;
+    --toolchain|-toolchain) shift 2 ;;
+    --show-sdk-path|--show-sdk-version|--show-sdk-build-version|--show-sdk-platform-path|--show-sdk-platform-version)
+      action=${1#--}; shift ;;
+    -f|--find) action=find; shift ;;
+    -r|--run|-v|--verbose|-l|--log|-n|--no-cache|-k|--kill-cache) shift ;;
+    --) shift; break ;;
+    -*) die "unsupported option $1" ;;
+    *) break ;;
+  esac
+done
+
+SDK= PLATDIR= PNAME=
+resolve_sdk() {
+  [ -n "$sdk" ] || die "no SDK: pass --sdk xros|xrsimulator|iphoneos|iphonesimulator or set SDKROOT"
+  if [[ $sdk == */* ]]; then
+    SDK=$sdk
+  else
+    local p
+    case ${sdk%%[0-9]*} in
+      xros) p=XROS ;; xrsimulator) p=XRSimulator ;;
+      iphoneos) p=iPhoneOS ;; iphonesimulator) p=iPhoneSimulator ;;
+      *) die "unsupported SDK '$sdk'" ;;
+    esac
+    SDK=$A/Developer/Platforms/$p.platform/Developer/SDKs/$p.sdk
+  fi
+  [ -f "$SDK/SDKSettings.json" ] || die "SDK not found at $SDK (is the SDK volume mounted at $A?)"
+  PLATDIR=$(cd "$SDK/../../.." && pwd)
+  PNAME=$(sdk_key platform)
+}
+sdk_key() {
+  python3 - "$SDK" "$1" <<'EOF'
+import json, plistlib, sys
+sdk, key = sys.argv[1], sys.argv[2]
+s = json.load(open(f"{sdk}/SDKSettings.json"))
+if key == "platform": print(s["DefaultProperties"]["PLATFORM_NAME"])
+elif key == "version": print(s["Version"])
+elif key == "build":
+    print(plistlib.load(open(f"{sdk}/System/Library/CoreServices/SystemVersion.plist", "rb"))["ProductBuildVersion"])
+EOF
+}
+
+# Default -target from the SDK when the caller gave none (Linux compilers
+# would otherwise target Linux). Honours -arch, -m*-version-min= and the
+# *_DEPLOYMENT_TARGET environment variables.
+target_args() {
+  local a arch=arm64 min= t
+  for a in "$@"; do case $a in -target|--target|--target=*|-target=*) return 0 ;; esac; done
+  local prev=
+  for a in "$@"; do
+    [ "$prev" = -arch ] && arch=$a
+    case $a in -m*-version-min=*|-mtargetos=*) min=set ;; esac
+    prev=$a
+  done
+  case $PNAME in
+    xros) t=xros; [ -n "$min" ] || min=${XROS_DEPLOYMENT_TARGET:-$(sdk_key version)} ;;
+    xrsimulator) t=xros; [ -n "$min" ] || min=${XROS_DEPLOYMENT_TARGET:-$(sdk_key version)} ;;
+    iphoneos|iphonesimulator) t=ios; [ -n "$min" ] || min=${IPHONEOS_DEPLOYMENT_TARGET:-$(sdk_key version)} ;;
+  esac
+  [ "$min" = set ] && min=
+  case $PNAME in *simulator) echo "-target $arch-apple-$t$min-simulator" ;; *) echo "-target $arch-apple-$t$min" ;; esac
+}
+
+is_compile_only() {
+  local a
+  for a in "$@"; do case $a in -c|-S|-E|-M|-MM|-fsyntax-only|-emit-llvm|--version) return 0 ;; esac; done
+  return 1
+}
+
+tool=${1:-}
+case $action in
+  show-sdk-path) resolve_sdk; echo "$SDK"; exit 0 ;;
+  show-sdk-version) resolve_sdk; sdk_key version; exit 0 ;;
+  show-sdk-build-version) resolve_sdk; sdk_key build; exit 0 ;;
+  show-sdk-platform-path) resolve_sdk; echo "$PLATDIR"; exit 0 ;;
+  show-sdk-platform-version) resolve_sdk; sdk_key version; exit 0 ;;
+esac
+[ -n "$tool" ] || die "no tool given"
+shift
+
+case $tool in
+  swiftc|swift) path=$(command -v swiftc) ;;
+  clang|cc|gcc) path=$(command -v clang) ;;
+  clang++|c++|g++) path=$(command -v clang++) ;;
+  ld) path=$DT/ld64.lld ;;
+  libtool|dsymutil) path=$DT/$tool ;;
+  ar|ranlib|nm|objdump|objcopy) path=$(command -v "llvm-$tool") ;;
+  otool) path=/opt/linux-apple/bin/llvm-otool ;;
+  strip) path=/opt/linux-apple/bin/llvm-strip ;;
+  lipo|actool|ibtool|momc|mapc|xcstringstool|codesign|vtool|plutil|metal)
+    die "'$tool' is not available on Linux (see TOOLCHAIN.md: what still needs a Mac / rcodesign for signing)" ;;
+  *) die "unknown tool '$tool'" ;;
+esac
+[ "$action" = find ] && { echo "$path"; exit 0; }
+
+case $tool in
+  swiftc|swift)
+    resolve_sdk
+    # shellcheck disable=SC2046
+    exec "$path" -sdk "$SDK" -resource-dir "$SR" -Xcc -isystem -Xcc "$SDK/usr/lib/swift/shims" $(target_args "$@") "$@" ;;
+  clang|cc|gcc|clang++|c++|g++)
+    resolve_sdk
+    extra=()
+    if ! is_compile_only "$@"; then
+      # ld64 drops autolinked frameworks the product may not link directly
+      # (allowable-clients); lld does not, so SwiftUICore is ignored here.
+      extra=(-fuse-ld=lld "--ld-path=$DT/ld64.lld" "-L$SR/$PNAME" "-L$SDK/usr/lib/swift"
+             -Xlinker --ignore-auto-link-option=SwiftUICore)
+    fi
+    # shellcheck disable=SC2046
+    exec "$path" -isysroot "$SDK" -resource-dir "$CR" $(target_args "$@") "${extra[@]}" "$@" ;;
+  *) exec "$path" "$@" ;;
+esac

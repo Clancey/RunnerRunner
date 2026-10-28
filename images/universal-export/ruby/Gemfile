@@ -1,0 +1,13 @@
+# The image's fastlane (match/gym helpers, pilot, supply). Resolved for
+# Ubuntu noble's Ruby 3.2.3 on x86_64-linux; regenerate with
+# images/universal-export/ruby/relock.sh, never by hand.
+source "https://rubygems.org"
+
+gem "fastlane", "2.241.2"
+
+# Newer releases require Ruby >= 3.3 (checked by relock.sh).
+gem "excon", "1.6.0"
+gem "rdoc", "~> 7.2.0"
+# irb needs prism; 2.x's only linux build requires Ruby >= 3.3, so take the
+# last source-only release (compiled at image build with build-essential).
+gem "prism", "1.9.0"

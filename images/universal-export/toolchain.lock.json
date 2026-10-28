@@ -1,0 +1,283 @@
+{
+  "schema": 1,
+  "image": {
+    "name": "rr-universal-export",
+    "platform": "linux/amd64",
+    "base": "myoung34/github-runner:ubuntu-noble@sha256:e3d489ea48b820ebab501229cd3d62d1abc2ee12935a8783996eb8701049f2b5",
+    "tag_prefix": "ue",
+    "protected_tags": ["current", "latest", "previous", "stable", "canary"]
+  },
+  "inputs": {
+    "swift": {
+      "arg": "SWIFT",
+      "version": "6.4.0",
+      "filename": "swift-6.4.0-RELEASE-ubuntu24.04.tar.gz",
+      "url": "https://download.swift.org/swift-6.4.0-release/ubuntu2404/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE-ubuntu24.04.tar.gz",
+      "sha256": "69f7b2b4dbce6090b6c92194b71149a057e16269093b5a9dded38afc4a05094e",
+      "size": 1124757497
+    },
+    "darwin-tools": {
+      "arg": "DARWIN_TOOLS",
+      "version": "1.1.0",
+      "filename": "toolset-x86_64.tar.gz",
+      "url": "https://github.com/xtool-org/darwin-tools-linux-llvm/releases/download/v1.1.0/toolset-x86_64.tar.gz",
+      "sha256": "a5166f2d56ac45707e5ef2f3c20a41a94af8ef0c0456354224dd08656e874188",
+      "size": 46205054
+    },
+    "rcodesign": {
+      "arg": "RCODESIGN",
+      "version": "0.29.0",
+      "filename": "apple-codesign-0.29.0-x86_64-unknown-linux-musl.tar.gz",
+      "url": "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002",
+      "size": 10704555
+    },
+    "godot-official-editor": {
+      "arg": "GODOT_OFFICIAL_EDITOR",
+      "version": "4.7.2-stable",
+      "filename": "Godot_v4.7.2-stable_linux.x86_64.zip",
+      "url": "https://github.com/godotengine/godot/releases/download/4.7.2-stable/Godot_v4.7.2-stable_linux.x86_64.zip",
+      "sha256": "cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4",
+      "size": 77860424
+    },
+    "godot-official-templates": {
+      "arg": "GODOT_OFFICIAL_TEMPLATES",
+      "version": "4.7.2-stable",
+      "filename": "Godot_v4.7.2-stable_export_templates.tpz",
+      "url": "https://github.com/godotengine/godot/releases/download/4.7.2-stable/Godot_v4.7.2-stable_export_templates.tpz",
+      "sha256": "f298490b8d44d934be425a5a65a51bf15f422428b229a06a6e11d9ffea248011",
+      "size": 1281349702
+    },
+    "godot-fork-c064-editor": {
+      "arg": "GODOT_FORK_C064_EDITOR",
+      "version": "4.8.dev.custom_build.c0643ef9d",
+      "filename": "godot.linuxbsd.editor.x86_64",
+      "url": null,
+      "sha256": "df5cf8c739ae24cceac627221afc00aa5d47367d3b94f401d4651ab26ad71b67",
+      "size": 163819952,
+      "note": "No release publishes the Linux fork editor and the image never rebuilds it: seed the CAS from a retained copy (cas.sh --stage godot-fork-c064-editor=SRC). Catalog id fork-c064-linux-x86_64-editor (JumpChase ci/assets/catalog.json).",
+      "seeds": [
+        "file:/mnt/user/appdata/rr-builds/linux-apple-runner/fork/godot-fork/godot.linuxbsd.editor.x86_64",
+        "file:/mnt/user/appdata/nosaferoom-ci/fork/c0643ef9d8e5c7efbe2893502611a77025cc0a86/godot",
+        "image:<linux-apple-runner-fork tag>:/opt/godot-fork/c064/godot",
+        "image:linux-apple-runner:1.0:/opt/godot-fork/godot"
+      ]
+    },
+    "godot-fork-c064-templates": {
+      "arg": "GODOT_FORK_C064_TEMPLATES",
+      "version": "4.8.dev (c0643ef9d)",
+      "filename": "godot_export_templates.tpz",
+      "url": "https://github.com/Clancey/godot/releases/download/visionos-latest/godot_export_templates.tpz",
+      "rolling": true,
+      "sha256": "67e24cafc97c3a956e8d8a2fe724bf0a154bbd1083430c03b4a25b5b5322db95",
+      "size": 965543617,
+      "note": "visionos-latest is a rolling tag; the URL is a hint and the digest is the pin. Once fetched, the Tower CAS keeps the bytes. Its templates/visionos.zip member is byte-identical (stored, CRC32 and size, checked 2026-10-28) to the separately published visionos.zip, so the image takes visionos.zip from here."
+    },
+    "android-cmdline-tools": {
+      "arg": "ANDROID_CMDLINE_TOOLS",
+      "version": "11076708",
+      "filename": "commandlinetools-linux-11076708_latest.zip",
+      "url": "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip",
+      "sha256": "2d2d50857e4eb553af5a6dc3ad507a17adf43d115264b1afc116f95c92e5e258",
+      "size": 153607504
+    },
+    "gradle": {
+      "arg": "GRADLE",
+      "version": "8.11.1",
+      "filename": "gradle-8.11.1-bin.zip",
+      "url": "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip",
+      "sha256": "f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6",
+      "size": 136920070
+    },
+    "ovr-platform-util": {
+      "arg": "OVR_PLATFORM_UTIL",
+      "version": "208.0.0",
+      "filename": "ovr-platform-util",
+      "url": "https://www.oculus.com/download_app/?id=5159709737372459",
+      "rolling": true,
+      "sha256": "05d9e9dc0772ac2a4949913566bfce6bda165a41646175a060bfe433b6aa6219",
+      "size": null,
+      "note": "The download id is rolling: on 2026-10-28 it served different bytes (27459b5c...). Keep the 208.0.0 binary every game uses today, seeded from a retained image; upgrading is a separate, verified lock change.",
+      "seeds": [
+        "image:<linux-apple-runner tag>:/opt/ovr/ovr-platform-util",
+        "image:ascension-ci:<tag>:/opt/ovr/ovr-platform-util"
+      ]
+    },
+    "steamcmd": {
+      "arg": "STEAMCMD",
+      "version": "steamcmd_linux (2026-10)",
+      "filename": "steamcmd_linux.tar.gz",
+      "url": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
+      "rolling": true,
+      "sha256": "cebf0046bfd08cf45da6bc094ae47aa39ebf4155e5ede41373b579b8f1071e7c",
+      "size": 2428561
+    },
+    "apktool": {
+      "arg": "APKTOOL",
+      "version": "2.12.1",
+      "filename": "apktool_2.12.1.jar",
+      "url": "https://github.com/iBotPeaches/Apktool/releases/download/v2.12.1/apktool_2.12.1.jar",
+      "sha256": "66cf4524a4a45a7f56567d08b2c9b6ec237bcdd78cee69fd4a59c8a0243aeafa",
+      "size": 25926183
+    },
+    "node": {
+      "arg": "NODE",
+      "version": "22.20.0",
+      "filename": "node-v22.20.0-linux-x64.tar.xz",
+      "url": "https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz",
+      "sha256": "00bbd05e306ea68b6e13e17360d0e2f680b493ef95f2fea1c4296ff7437530bc",
+      "size": 30737976
+    },
+    "bundler": {
+      "arg": "BUNDLER",
+      "version": "4.0.20",
+      "filename": "bundler-4.0.20.gem",
+      "url": "https://rubygems.org/downloads/bundler-4.0.20.gem",
+      "sha256": "7978a8ac648767f5e635bc522445b79e80a52b907a39a36c2d8085ed6bc762ae",
+      "size": 467968
+    }
+  },
+  "godot_sets": {
+    "official-4.7.2": {
+      "default": true,
+      "version": "4.7.2.stable",
+      "version_regex": "^4\\.7\\.2\\.stable\\.official\\.ed1daf0bf",
+      "commit": "ed1daf0bf001b61586d9930840f2f1394092c079",
+      "editor": {
+        "input": "godot-official-editor",
+        "member": "Godot_v4.7.2-stable_linux.x86_64",
+        "sha256": "8d106cbe6144c2dc7e881d61d2429c1a8a76e6b22ef48bd5e48dcf934953f71e",
+        "size": 146414384
+      },
+      "templates": {
+        "input": "godot-official-templates",
+        "required": [
+          "version.txt", "android_debug.apk", "android_release.apk", "android_source.zip", "ios.zip", "macos.zip",
+          "linux_debug.x86_64", "linux_release.x86_64", "linux_debug.arm64", "linux_release.arm64",
+          "windows_debug_x86_64.exe", "windows_release_x86_64.exe",
+          "web_nothreads_debug.zip", "web_nothreads_release.zip"
+        ]
+      },
+      "visionos": null,
+      "android": {"gradle": "8.11.1", "agp": "8.6.1", "kotlin": "2.1.21", "build_tools": "36.1.0", "compile_sdk": 36},
+      "smoke_presets": [
+        "linux-x86_64", "linux-arm64", "windows-x86_64", "macos", "web-nothreads",
+        "android-apk-debug", "android-apk-release", "android-aab-release", "ios"
+      ],
+      "legacy": {
+        "editor": ["/opt/godot/official/godot"],
+        "templates": ["/opt/godot-data/godot/export_templates/4.7.2.stable"]
+      }
+    },
+    "fork-c064": {
+      "default": false,
+      "version": "4.8.dev",
+      "version_regex": "^4\\.8\\.dev\\.custom_build\\.c0643ef9d",
+      "commit": "c0643ef9d8e5c7efbe2893502611a77025cc0a86",
+      "editor": {
+        "input": "godot-fork-c064-editor",
+        "member": null,
+        "sha256": "df5cf8c739ae24cceac627221afc00aa5d47367d3b94f401d4651ab26ad71b67",
+        "size": 163819952
+      },
+      "templates": {
+        "input": "godot-fork-c064-templates",
+        "required": [
+          "version.txt", "android_debug.apk", "android_release.apk", "android_source.zip", "ios.zip", "macos.zip",
+          "visionos.zip", "linux_debug.x86_64", "linux_release.x86_64", "linux_debug.arm64", "linux_release.arm64",
+          "windows_debug_x86_64.exe", "windows_release_x86_64.exe",
+          "web_nothreads_debug.zip", "web_nothreads_release.zip"
+        ]
+      },
+      "visionos": {
+        "template": "visionos.zip",
+        "sha256": "1b6183ff63841c23d4f18c6025ac5e20e7a7b7d1cf0aa38390273fb37e93ed8b",
+        "size": 201538600
+      },
+      "android": {"gradle": "8.11.1", "agp": "8.9.1", "kotlin": "2.1.21", "build_tools": "36.1.0", "compile_sdk": 36},
+      "smoke_presets": [
+        "linux-x86_64", "linux-arm64", "windows-x86_64", "macos", "web-nothreads",
+        "android-apk-debug", "android-apk-release", "android-aab-release", "ios", "visionos"
+      ],
+      "legacy": {
+        "editor": ["/opt/godot-fork/c064/godot", "/opt/godot-fork/godot"],
+        "templates": ["/opt/godot-data/godot/export_templates/4.8.dev"],
+        "visionos": ["/opt/godot-fork/c064/visionos.zip", "/opt/godot-fork/visionos.zip"]
+      },
+      "fork_set_id": "c064"
+    }
+  },
+  "android": {
+    "home": "/opt/android-sdk",
+    "packages": [
+      "platform-tools",
+      "platforms;android-34",
+      "platforms;android-35",
+      "platforms;android-36",
+      "build-tools;36.1.0"
+    ],
+    "build_tools": "36.1.0",
+    "maven_prewarm": [
+      "org.godotengine:godot:4.7.2.stable",
+      "com.google.android.gms:play-services-ads:25.5.0",
+      "com.google.android.ump:user-messaging-platform:4.0.0",
+      "com.android.billingclient:billing:8.3.0"
+    ],
+    "plugin_prewarm": {"agp": "8.6.1", "kotlin": "2.1.21", "compile_sdk": 36, "min_sdk": 24},
+    "debug_keystore": {
+      "path": "/opt/android/debug.keystore",
+      "alias": "androiddebugkey",
+      "public_debug_password": "android",
+      "dname": "CN=Android Debug,O=Android,C=US",
+      "validity_days": 10000
+    }
+  },
+  "ruby": {
+    "ruby_version": "3.2.3",
+    "bundler": {"input": "bundler", "version": "4.0.20"},
+    "fastlane": "2.241.2",
+    "gemfile": "ruby/Gemfile",
+    "gemfile_lock": "ruby/Gemfile.lock",
+    "gemfile_lock_sha256": "60812a481f0346b4e7a9e1efca29a0f125e599888ea322f3fec3e45eaa2d2a7a",
+    "install": "/opt/universal-export/ruby"
+  },
+  "apple_sdk": {
+    "mount": "/opt/apple-sdk",
+    "known_packs": {
+      "27A9275": {
+        "format": 1,
+        "xcode_version": "27.1",
+        "clang_resource_version": "21",
+        "tarball_sha256": "59b4cf99b5a201c4c5bf6848fdbecc70226571d0d12bed66e9bf631fa2db3978",
+        "tarball_size": 71354724,
+        "content_sha256": "4fa3bc22b954473564338f47120dd98e3facce00be598118f14046e3ac55a012",
+      "admitted_tree_sha256": "756118df231c83475dc42b07e7a5247c72a73ecb6542e57686f9169d8641dbb1",
+        "unpacked_size": 924768955,
+        "regular_files": 34754,
+        "directories": 5153,
+        "symlinks": 334,
+        "patches_required": ["modulemap-obsolete-v1"],
+        "sdks": {
+          "XROS": "xros27.0 24M361",
+          "XRSimulator": "xrsimulator27.0 24M361",
+          "iPhoneOS": "iphoneos27.1 24A94232",
+          "iPhoneSimulator": "iphonesimulator27.1 24A94232"
+        }
+      }
+    }
+  },
+  "apt": {
+    "packages": [
+      "build-essential", "binutils", "git", "curl", "wget", "ca-certificates", "tzdata", "pkg-config",
+      "libcurl4t64", "libxml2", "libedit2", "libsqlite3-0", "libncurses6", "libz3-4", "zlib1g",
+      "libx11-6", "libxcursor1", "libxinerama1", "libxrandr2", "libxi6", "libgl1", "libegl1",
+      "libfontconfig1", "libudev1", "libasound2t64", "libpulse0",
+      "openjdk-17-jdk-headless", "ruby-full", "ruby-dev", "scons", "python3", "python3-pip",
+      "python3-yaml", "python3-pil", "python-is-python3", "openssl",
+      "unzip", "zip", "xz-utils", "zstd", "file", "jq", "rsync", "xxd", "smbclient"
+    ],
+    "i386_packages": ["lib32gcc-s1", "lib32stdc++6"],
+    "note": "Ubuntu noble archive versions are not pinned (no snapshot mirror yet); the receipt records dpkg -l."
+  },
+  "base_tools": ["pwsh", "git-lfs", "gh", "rsync"]
+}

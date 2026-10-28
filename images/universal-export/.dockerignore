@@ -1,0 +1,15 @@
+# Allow-list: only what the Dockerfile COPYs or bind-mounts.
+*
+!Dockerfile
+!.dockerignore
+!toolchain.lock.json
+!bin
+!lib
+!smoke
+!ruby
+!inputs
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+ruby/vendor
+ruby/.bundle

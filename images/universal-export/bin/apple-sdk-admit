@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+"""Admit a pinned Apple SDK pack into /opt/apple-sdk, or verify an admitted tree.
+
+Pins come ONLY from apple_sdk.known_packs[<XCODE_BUILD>] in the toolchain lock
+next to this script's real location (<bin>/../toolchain.lock.json). There is no
+flag or environment variable that can supply or override a pin (design B3).
+The admission sidecar is never a trust root: for format 1 it carries the
+pre-patch bytes of each patched file, which verify re-hashes against the pinned
+MANIFEST and re-patches to derive the expected content, and the tree structure
+is checked against the lock's admitted_tree_sha256; format 2 records no
+patches and its structure is pinned by tree_sha256 (MANIFEST.tree). Re-running admit on an existing admission fully re-verifies it.
+
+  admit --build B --pack P.tar.zst [--dest D]   hash a private copy, extract, verify, patch, rename
+  verify --build B [--dest D]                   full re-hash of an admitted tree (N11)
+  verify-mounted --build B [--dest D]           verify a read-only format-2 tree; writes nothing
+  status [--dest D]                             print the admission record (exit 1 if none)
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import datetime
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path(os.path.realpath(__file__)).parent.parent
+LOCK = HOME / "toolchain.lock.json"
+MANIFEST = "MANIFEST.sha256"
+TREE = "MANIFEST.tree"
+COUNTS = ("unpacked_size", "regular_files", "directories", "symlinks")
+CHUNK = 1 << 20
+MAX_LINK_HOPS = 40
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_MANIFEST_LINE = re.compile(r"([0-9a-f]{64})  \./(.+)")
+_MEMBER_TYPES = {tarfile.LNKTYPE: "hardlink", tarfile.CHRTYPE: "character device", tarfile.BLKTYPE: "block device",
+                 tarfile.FIFOTYPE: "fifo", tarfile.CONTTYPE: "contiguous file", tarfile.GNUTYPE_SPARSE: "sparse file"}
+
+
+def _load_patches():
+    sys.dont_write_bytecode = True  # never litter <home>/lib with __pycache__
+    spec = importlib.util.spec_from_file_location("apple_sdk_patches", HOME / "lib" / "apple_sdk_patches.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+patches = _load_patches()
+
+
+class AdmitError(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    print(f"apple-sdk-admit: {msg}", file=sys.stderr, flush=True)
+
+
+def preview(items, limit: int = 5) -> str:
+    items = sorted(items)
+    more = f" (+{len(items) - limit} more)" if len(items) > limit else ""
+    return ", ".join(repr(i) for i in items[:limit]) + more
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+# ---------------------------------------------------------------- lock / pins
+
+def load_sdk_lock() -> dict:
+    try:
+        sdk = json.loads(LOCK.read_text()).get("apple_sdk")
+    except (OSError, ValueError, AttributeError) as e:
+        raise AdmitError(f"cannot read {LOCK}: {e}") from None
+    if not isinstance(sdk, dict) or not isinstance(sdk.get("known_packs"), dict):
+        raise AdmitError(f"{LOCK} has no apple_sdk.known_packs")
+    return sdk
+
+
+def pin_for(sdk: dict, build: str) -> dict:
+    pin = sdk["known_packs"].get(build) if re.fullmatch(r"[0-9A-Za-z]+", build) else None
+    if not isinstance(pin, dict):
+        raise AdmitError(f"unknown Xcode build {build!r}: not in apple_sdk.known_packs of {LOCK}")
+    fmt = pin.get("format")
+    if fmt not in (1, 2):
+        raise AdmitError(f"{build}: unsupported pack format {fmt!r}")
+    for key in ("tarball_sha256", "content_sha256") + (("tree_sha256",) if fmt == 2 else ("admitted_tree_sha256",)):
+        if not isinstance(pin.get(key), str) or not _HEX64.fullmatch(pin[key]):
+            raise AdmitError(f"{build}: lock field {key} must be 64 lowercase hex digits")
+    for key in ("tarball_size",) + COUNTS:
+        val = pin.get(key, 0 if key in COUNTS else None)
+        if type(val) is not int or val < 0 or (key == "tarball_size" and val == 0):
+            raise AdmitError(f"{build}: lock field {key} must be a positive integer")
+    names = pin.get("patches_required", [])
+    if not isinstance(names, list) or any(n not in patches.PATCHES for n in names):
+        raise AdmitError(f"{build}: unknown patch in patches_required {names!r}")
+    if fmt == 2 and names:
+        raise AdmitError(f"{build}: format 2 packs are pre-patched; patches_required must be empty")
+    return pin
+
+
+def record_fields(build: str, pin: dict) -> dict:
+    return {"build": build, "format": pin["format"], "tarball_sha256": pin["tarball_sha256"],
+            "content_sha256": pin["content_sha256"], "tree_sha256": pin.get("tree_sha256"),
+            "admitted_tree_sha256": pin.get("admitted_tree_sha256")}
+
+
+# ---------------------------------------------------------------- tree model
+
+class Tree:
+    """Every entry below the root: rel -> (kind, symlink target); kind is d, f, x (exec file) or l."""
+
+    def __init__(self):
+        self.entries, self.hashes, self.size = {}, {}, 0
+
+    def stats(self) -> dict:
+        kinds = [k for k, _ in self.entries.values()]
+        return {"unpacked_size": self.size, "regular_files": kinds.count("f") + kinds.count("x"),
+                "directories": 1 + kinds.count("d"), "symlinks": kinds.count("l")}
+
+
+def _check_chars(text: str, what: str) -> None:
+    if any(ord(c) < 0x20 or ord(c) == 0x7F or 0xD800 <= ord(c) <= 0xDFFF for c in text):
+        raise AdmitError(f"{what}: control or undecodable character in {text!r}")
+
+
+def check_rel(rel: str, what: str) -> str:
+    for part in rel.split("/"):
+        if part in ("", ".", ".."):
+            raise AdmitError(f"{what}: refusing path {rel!r} ('..', '.' and empty components are not allowed)")
+    _check_chars(rel, what)
+    return rel
+
+
+def check_target(rel: str, target: str) -> None:
+    if not target:
+        raise AdmitError(f"symlink {rel!r} has an empty target")
+    if target.startswith("/"):
+        raise AdmitError(f"symlink {rel!r} has an absolute target {target!r}")
+    _check_chars(target, f"symlink {rel!r}")
+
+
+def resolve_link(entries: dict, rel: str) -> None:
+    """Follow rel's target (and any chain of links through the tree's own entries)
+    component by component; fail if it ever leaves the root."""
+    stack = rel.split("/")[:-1]
+    todo = entries[rel][1].split("/")[::-1]
+    hops = 1
+    while todo:
+        part = todo.pop()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not stack:
+                raise AdmitError(f"symlink {rel!r} -> {entries[rel][1]!r} escapes the SDK root")
+            stack.pop()
+            continue
+        kind, target = entries.get("/".join(stack + [part]), (None, None))
+        if kind == "l":
+            hops += 1
+            if hops > MAX_LINK_HOPS:
+                raise AdmitError(f"symlink {rel!r}: symlink loop or more than {MAX_LINK_HOPS} levels")
+            todo.extend(target.split("/")[::-1])
+        else:
+            stack.append(part)
+
+
+def tree_text(entries: dict, exclude=(TREE,)) -> bytes:
+    """MANIFEST.tree: one line per entry below the root, sorted by path:
+    'd|f|x<TAB>./path' or 'l<TAB>./path<TAB>target' (x = regular file with an exec bit)."""
+    lines = []
+    for rel in sorted(entries):
+        if rel not in exclude:
+            kind, target = entries[rel]
+            lines.append(f"{kind}\t./{rel}\t{target}\n" if kind == "l" else f"{kind}\t./{rel}\n")
+    return "".join(lines).encode()
+
+
+def manifest_text(hashes: dict) -> bytes:
+    return "".join(f"{h}  ./{rel}\n" for rel, h in sorted(hashes.items())).encode()
+
+
+def parse_manifest(data: bytes) -> dict:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise AdmitError(f"{MANIFEST} is not UTF-8") from None
+    if text and not text.endswith("\n"):
+        raise AdmitError(f"{MANIFEST} does not end with a newline")
+    listed = {}
+    for n, line in enumerate(text[:-1].split("\n") if text else [], 1):
+        m = _MANIFEST_LINE.fullmatch(line)
+        if not m:
+            raise AdmitError(f"{MANIFEST} line {n} is malformed: {line[:120]!r}")
+        rel = check_rel(m[2], MANIFEST)
+        if rel in (MANIFEST, TREE) or rel in listed:
+            raise AdmitError(f"{MANIFEST} line {n}: duplicate or self-referencing entry {rel!r}")
+        listed[rel] = m[1]
+    return listed
+
+
+def read_regular(path: Path) -> bytes:
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb") as f:
+        return f.read()
+
+
+def hash_file(path) -> str:
+    h = hashlib.sha256()
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb") as f:
+        while chunk := f.read(CHUNK):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def scan_tree(root: Path, *, refuse_writable: bool = False) -> Tree:
+    """Walk an on-disk tree without following symlinks, hashing every regular file."""
+    st = os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode):
+        raise AdmitError(f"{root} is not a directory")
+    if refuse_writable and os.access(root, os.W_OK):
+        raise AdmitError(f"{root} is writable; verify-mounted needs a read-only tree")
+    tree = Tree()
+    pending = [""]
+    while pending:
+        rel_dir = pending.pop()
+        with os.scandir(root / rel_dir) as it:
+            for e in it:
+                rel = f"{rel_dir}/{e.name}" if rel_dir else e.name
+                _check_chars(e.name, "tree")
+                mode = e.stat(follow_symlinks=False).st_mode
+                if stat.S_ISLNK(mode):
+                    target = os.readlink(e.path)
+                    check_target(rel, target)
+                    tree.entries[rel] = ("l", target)
+                    continue
+                if mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+                    raise AdmitError(f"{rel}: setuid/setgid/sticky bit set")
+                if refuse_writable and os.access(e.path, os.W_OK):
+                    raise AdmitError(f"{root / rel} is writable; verify-mounted needs a read-only tree")
+                if stat.S_ISDIR(mode):
+                    tree.entries[rel] = ("d", None)
+                    pending.append(rel)
+                elif stat.S_ISREG(mode):
+                    tree.entries[rel] = ("x" if mode & 0o111 else "f", None)
+                    tree.hashes[rel] = hash_file(e.path)
+                    tree.size += e.stat(follow_symlinks=False).st_size
+                else:
+                    raise AdmitError(f"{rel}: not a regular file, directory or symlink")
+    return tree
+
+
+def expected_hashes(root: Path, listed: dict, pin: dict, originals: dict) -> dict:
+    """Post-patch sha256 per listed file, derived only from the lock: every recorded
+    original must hash to its pinned MANIFEST entry and is re-patched here; every
+    other file a required patch applies to must already be a fixed point of it."""
+    names = pin.get("patches_required", [])
+    if unknown := originals.keys() - listed.keys():
+        raise AdmitError(f"patch record names unlisted file(s): {preview(unknown)}")
+    expected = dict(listed)
+    for rel, orig in originals.items():
+        if sha256(orig) != listed[rel]:
+            raise AdmitError(f"patch record for {rel!r}: recorded original does not match {MANIFEST}")
+        expected[rel] = sha256(patches.patch_bytes(names, rel, orig))
+    for rel in listed.keys() - originals.keys():
+        if any(patches.PATCHES[n][0](rel) for n in names):
+            data = read_regular(root / rel)
+            if patches.patch_bytes(names, rel, data) != data:
+                raise AdmitError(f"{rel!r} is not in its admitted (patched) state")
+    return expected
+
+
+def check_tree(root: Path, tree: Tree, pin: dict, *, originals=None, counts=COUNTS) -> None:
+    """The manifest/tree/link/count checks shared by admit, verify and verify-mounted.
+    originals (rel -> pre-patch bytes) is given only when checking an admitted, patched tree."""
+    fmt = pin["format"]
+    if tree.entries.get(MANIFEST, (None,))[0] not in ("f", "x"):
+        raise AdmitError(f"{MANIFEST} is missing")
+    data = read_regular(root / MANIFEST)
+    if sha256(data) != pin["content_sha256"]:
+        raise AdmitError(f"{MANIFEST} sha256 mismatch: got {sha256(data)}, lock pins {pin['content_sha256']}")
+    listed = parse_manifest(data)
+    meta = {MANIFEST, TREE} if fmt == 2 else {MANIFEST}
+    regular = {rel for rel, (kind, _) in tree.entries.items() if kind in ("f", "x")} - meta
+    if missing := listed.keys() - regular:
+        raise AdmitError(f"{len(missing)} file(s) listed in {MANIFEST} are missing or not regular: {preview(missing)}")
+    if extra := regular - listed.keys():
+        raise AdmitError(f"{len(extra)} regular file(s) not listed in {MANIFEST}: {preview(extra)}")
+    expected = listed if originals is None else expected_hashes(root, listed, pin, originals)
+    bad = [rel for rel, want in expected.items() if tree.hashes[rel] != want]
+    if bad:
+        raise AdmitError(f"{len(bad)} file(s) do not match {MANIFEST}: {preview(bad)}")
+    if fmt == 2:
+        if tree.entries.get(TREE, (None,))[0] not in ("f", "x"):
+            raise AdmitError(f"{TREE} is missing (required for format 2)")
+        tdata = read_regular(root / TREE)
+        if sha256(tdata) != pin["tree_sha256"]:
+            raise AdmitError(f"{TREE} sha256 mismatch: got {sha256(tdata)}, lock pins {pin['tree_sha256']}")
+        actual = tree_text(tree.entries)
+        if tdata != actual:
+            want, got = set(tdata.decode("utf-8", "replace").splitlines()), set(actual.decode().splitlines())
+            raise AdmitError(f"{TREE} does not match the tree: not in {TREE}: {preview(got - want)}; "
+                             f"listed but absent/different: {preview(want - got)}")
+    else:
+        # Format 1 has no MANIFEST.tree; the lock pins the digest of the tree listing
+        # (entries, file types, exec bits, symlink targets), which patching never changes.
+        got = sha256(tree_text(tree.entries, exclude=()))
+        if got != pin["admitted_tree_sha256"]:
+            raise AdmitError(f"tree structure mismatch (entries, file types, exec bits or symlink targets): "
+                             f"got {got}, lock pins admitted_tree_sha256 {pin['admitted_tree_sha256']}")
+    for rel, (kind, _) in tree.entries.items():
+        if kind == "l":
+            resolve_link(tree.entries, rel)
+    stats = tree.stats()
+    for key in counts:
+        if key in pin and pin[key] != stats[key]:
+            raise AdmitError(f"{key} mismatch: got {stats[key]}, lock pins {pin[key]}")
+
+
+# ---------------------------------------------------------------- admission
+
+def copy_private(pack: Path, pin: dict) -> Path:
+    """Copy the pack into a private 0600 temp file, hashing as we go; the copy
+    is what gets extracted, and only once its size and sha256 match the pin."""
+    size, want = pin["tarball_size"], pin["tarball_sha256"]
+    with open(pack, "rb") as src:
+        if not stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+            raise AdmitError(f"{pack} is not a regular file")
+        fd, tmp = tempfile.mkstemp(prefix="apple-sdk-pack-", suffix=".tar.zst")
+        try:
+            h, n = hashlib.sha256(), 0
+            with os.fdopen(fd, "wb") as out:
+                while chunk := src.read(CHUNK):
+                    n += len(chunk)
+                    if n > size:
+                        raise AdmitError(f"tarball size mismatch: {pack} exceeds the pinned {size} bytes")
+                    h.update(chunk)
+                    out.write(chunk)
+            if n != size:
+                raise AdmitError(f"tarball size mismatch: got {n} bytes, lock pins {size}")
+            if h.hexdigest() != want:
+                raise AdmitError(f"tarball sha256 mismatch: got {h.hexdigest()}, lock pins {want}")
+        except BaseException:
+            os.unlink(tmp)
+            raise
+    return Path(tmp)
+
+
+def _write_member(src, path: Path) -> str:
+    h = hashlib.sha256()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        while chunk := src.read(CHUNK):
+            h.update(chunk)
+            out.write(chunk)
+    return h.hexdigest()
+
+
+def _extract_member(m: tarfile.TarInfo, tf: tarfile.TarFile, stage: Path, tree: Tree, implicit: set) -> None:
+    rel = check_rel(m.name.removeprefix("./").rstrip("/"), "member")
+    if rel in tree.entries and not (rel in implicit and m.type == tarfile.DIRTYPE):
+        raise AdmitError(f"duplicate member {rel!r}")
+    parts = rel.split("/")
+    for i in range(1, len(parts)):
+        anc = "/".join(parts[:i])
+        kind = tree.entries.get(anc, (None,))[0]
+        if kind is None:
+            os.mkdir(stage / anc, 0o700)
+            tree.entries[anc] = ("d", None)
+            implicit.add(anc)
+        elif kind != "d":
+            raise AdmitError(f"member {rel!r}: parent {anc!r} is not a directory")
+    path = stage / rel
+    if m.type == tarfile.DIRTYPE:
+        if rel in implicit:
+            implicit.discard(rel)
+        else:
+            os.mkdir(path, 0o700)
+            tree.entries[rel] = ("d", None)
+    elif m.type in (tarfile.REGTYPE, tarfile.AREGTYPE) and m.sparse is None:
+        tree.hashes[rel] = _write_member(tf.extractfile(m), path)
+        tree.entries[rel] = ("x" if m.mode & 0o111 else "f", None)
+        tree.size += m.size
+    elif m.type == tarfile.SYMTYPE:
+        check_target(rel, m.linkname)
+        os.symlink(m.linkname, path)
+        tree.entries[rel] = ("l", m.linkname)
+    else:
+        what = _MEMBER_TYPES.get(m.type, f"type {m.type!r}")
+        raise AdmitError(f"member {rel!r}: {what} not allowed (only regular files, directories and symlinks)")
+
+
+def extract(private: Path, stage: Path) -> Tree:
+    """Stream `zstd -dc` into tarfile, creating entries ourselves (never tarfile.extract*)."""
+    zstd = shutil.which("zstd")
+    if not zstd:
+        raise AdmitError("zstd not found on PATH")
+    proc = subprocess.Popen([zstd, "-dcq", "--", str(private)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    tree, implicit, root_seen = Tree(), set(), False
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
+            for m in tf:
+                if m.name.startswith("/"):
+                    raise AdmitError(f"absolute member name {m.name!r}")
+                if m.name.removeprefix("./").rstrip("/") in ("", "."):
+                    if m.type != tarfile.DIRTYPE or root_seen:
+                        raise AdmitError(f"duplicate or non-directory member for the root ({m.name!r})")
+                    root_seen = True
+                    continue
+                _extract_member(m, tf, stage, tree, implicit)
+        proc.stdout.read()
+        err = proc.stderr.read().decode(errors="replace").strip()
+        if proc.wait() != 0:
+            raise AdmitError(f"zstd -d failed: {err}")
+    except tarfile.TarError as e:
+        raise AdmitError(f"bad tar stream: {e}") from None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
+    return tree
+
+
+def force_rmtree(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+        return
+    for dirpath, _, _ in os.walk(path):
+        os.chmod(dirpath, 0o700)
+    shutil.rmtree(path)
+
+
+def seal(root: Path, tree: Tree) -> None:
+    """Final modes: dirs 0555, files 0444 (0555 with any x bit); special bits never set."""
+    for rel, (kind, _) in tree.entries.items():
+        if kind != "l":
+            os.chmod(root / rel, 0o555 if kind in ("d", "x") else 0o444)
+
+
+def sidecar_path(dest: Path) -> Path:
+    return dest.parent / f".{dest.name}-admission.json"
+
+
+def read_sidecar(dest: Path):
+    try:
+        rec = json.loads(sidecar_path(dest).read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def write_json_atomic(path: Path, obj: dict) -> None:
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    with open(tmp, "x") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def print_env(dest: Path, build: str, fmt: int, content: str) -> None:
+    print(f"APPLE_SDK={dest}\nAPPLE_SDK_BUILD={build}\nAPPLE_SDK_FORMAT={fmt}\nAPPLE_SDK_CONTENT_SHA256={content}")
+
+
+def recorded_originals(rec: dict, pin: dict) -> dict:
+    """rel -> pre-patch bytes from the sidecar. These are not trusted: check_tree
+    re-hashes each against the pinned MANIFEST before deriving the patched hash."""
+    patched = rec.get("patched")
+    if not isinstance(patched, list):
+        raise AdmitError("admission record: malformed patched list")
+    if pin["format"] == 2 and patched:
+        raise AdmitError("admission record: format 2 packs are pre-patched; patched must be empty")
+    originals = {}
+    for p in patched:
+        if not (isinstance(p, dict) and isinstance(p.get("path"), str) and isinstance(p.get("original_b64"), str)):
+            raise AdmitError("admission record: malformed patched entry")
+        if p["path"] in originals:
+            raise AdmitError(f"admission record: duplicate patched entry {p['path']!r}")
+        try:
+            originals[p["path"]] = base64.b64decode(p["original_b64"], validate=True)
+        except (binascii.Error, ValueError):
+            raise AdmitError(f"admission record: bad original_b64 for {p['path']!r}") from None
+    return originals
+
+
+def verify_admitted(dest: Path, build: str, pin: dict, rec: dict) -> Tree:
+    """Full re-hash of an admitted tree; the lock is the only trust root for content."""
+    if differ := [k for k, v in record_fields(build, pin).items() if rec.get(k) != v]:
+        raise AdmitError(f"{dest} is not an admission of build {build} under the current lock ({', '.join(differ)} differ)")
+    originals = recorded_originals(rec, pin)
+    tree = scan_tree(dest)
+    check_tree(dest, tree, pin, originals=originals, counts=COUNTS[1:])
+    return tree
+
+
+def already_admitted(dest: Path, build: str, pin: dict) -> bool:
+    rec = read_sidecar(dest)
+    if rec is None or any(rec.get(k) != v for k, v in record_fields(build, pin).items()):
+        return False
+    try:
+        verify_admitted(dest, build, pin, rec)
+    except (AdmitError, OSError) as e:
+        raise AdmitError(f"{dest} claims admission of {build} but fails verification ({e}); "
+                         "refusing (remove it first)") from None
+    return True
+
+
+def admit(sdk: dict, build: str, pack: Path, dest: Path) -> None:
+    started = time.monotonic()
+    pin = pin_for(sdk, build)
+    if not dest.parent.is_dir():
+        raise AdmitError(f"parent directory {dest.parent} does not exist")
+    if os.path.lexists(dest):
+        if dest.is_symlink():
+            raise AdmitError(f"{dest} is a symlink; refusing")
+        if dest.is_dir() and already_admitted(dest, build, pin):
+            log(f"{build} already admitted at {dest}; nothing to do")
+            print_env(dest, build, pin["format"], pin["content_sha256"])
+            return
+        if not dest.is_dir() or any(dest.iterdir()):
+            raise AdmitError(f"{dest} already holds a different or unknown admission; refusing (remove it first)")
+        # An empty placeholder dir is fine: rename(2) atomically replaces an empty directory.
+    stage = dest.parent / f".{dest.name}.stage-{os.getpid()}"
+    side = sidecar_path(dest)
+    private, wrote_sidecar, committed = None, False, False
+    try:
+        log(f"hashing {pack}")
+        private = copy_private(pack, pin)
+        force_rmtree(stage)
+        os.mkdir(stage, 0o700)
+        log(f"extracting into {stage}")
+        tree = extract(private, stage)
+        log(f"verifying {len(tree.hashes)} files against {MANIFEST}")
+        check_tree(stage, tree, pin)
+        names = pin.get("patches_required", [])
+        before = {rel: read_regular(stage / rel) for rel in tree.hashes
+                  if any(patches.PATCHES[n][0](rel) for n in names)}
+        patched = patches.apply(stage, names)
+        for p in patched:
+            p["original_b64"] = base64.b64encode(before[p["path"]]).decode("ascii")
+            log(f"patched {p['path']}")
+        seal(stage, tree)
+        record = {"schema": 2, **record_fields(build, pin), "patched": patched,
+                  "admitted_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        write_json_atomic(side, record)
+        wrote_sidecar = True
+        os.rename(stage, dest)
+        committed = True
+        os.chmod(dest, 0o555)
+    finally:
+        if private:
+            os.unlink(private)
+        if not committed:
+            force_rmtree(stage)
+            if wrote_sidecar:
+                side.unlink(missing_ok=True)
+    log(f"admitted {build} (format {pin['format']}, {len(tree.hashes)} files, {len(patched)} patched) "
+        f"at {dest} in {time.monotonic() - started:.1f}s")
+    print_env(dest, build, pin["format"], pin["content_sha256"])
+
+
+def verify(sdk: dict, build: str, dest: Path) -> None:
+    pin = pin_for(sdk, build)
+    rec = read_sidecar(dest)
+    if rec is None or dest.is_symlink() or not dest.is_dir():
+        raise AdmitError(f"no admission record for {dest} ({sidecar_path(dest)})")
+    tree = verify_admitted(dest, build, pin, rec)
+    log(f"verified {build} at {dest}: {len(tree.hashes)} files re-hashed")
+
+
+def verify_mounted(sdk: dict, build: str, dest: Path) -> None:
+    pin = pin_for(sdk, build)
+    if pin["format"] != 2:
+        raise AdmitError(f"verify-mounted requires a format 2 pack; {build} is format {pin['format']}")
+    if dest.is_symlink():
+        raise AdmitError(f"{dest} is a symlink; refusing")
+    tree = scan_tree(dest, refuse_writable=True)
+    check_tree(dest, tree, pin)
+    log(f"verified mounted {build} at {dest}: {len(tree.hashes)} files re-hashed")
+
+
+def status(sdk: dict, dest: Path) -> int:
+    rec = read_sidecar(dest)
+    if rec is None or dest.is_symlink() or not dest.is_dir():
+        log(f"no admitted Apple SDK at {dest}")
+        return 1
+    print_env(dest, rec.get("build"), rec.get("format"), rec.get("content_sha256"))
+    print(f"APPLE_SDK_ADMITTED_AT={rec.get('admitted_at')}")
+    pin = sdk["known_packs"].get(rec.get("build"))
+    if not isinstance(pin, dict) or any(rec.get(k) != v for k, v in record_fields(rec.get("build"), pin).items()):
+        log(f"admission record at {sidecar_path(dest)} does not match the lock")
+        return 1
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="apple-sdk-admit", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("admit", help="verify and admit a pinned pack")
+    p.add_argument("--build", required=True)
+    p.add_argument("--pack", required=True, type=Path)
+    p.add_argument("--dest")
+    for name in ("verify", "verify-mounted"):
+        p = sub.add_parser(name)
+        p.add_argument("--build", required=True)
+        p.add_argument("--dest")
+    sub.add_parser("status").add_argument("--dest")
+    args = ap.parse_args(argv)
+    try:
+        sdk = load_sdk_lock()
+        dest = Path(os.path.abspath(args.dest or sdk.get("mount") or "/opt/apple-sdk"))
+        if args.cmd == "status":
+            return status(sdk, dest)
+        {"admit": lambda: admit(sdk, args.build, args.pack, dest),
+         "verify": lambda: verify(sdk, args.build, dest),
+         "verify-mounted": lambda: verify_mounted(sdk, args.build, dest)}[args.cmd]()
+    except (AdmitError, OSError) as e:
+        log(f"error: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

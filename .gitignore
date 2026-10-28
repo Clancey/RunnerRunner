@@ -1,5 +1,6 @@
 ## .NET
 bin/
+!images/universal-export/bin/
 obj/
 *.user
 *.suo
